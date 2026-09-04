@@ -139,6 +139,11 @@ jobs:
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
         run: |
+          if ! command -v ssh >/dev/null 2>&1; then
+            if command -v sudo >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get update -qq && sudo apt-get install -y -qq openssh-client
+            fi
+          fi
           install -m 700 -d ~/.ssh
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
