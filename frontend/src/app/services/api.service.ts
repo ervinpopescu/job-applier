@@ -46,9 +46,7 @@ export class ApiService {
     );
   }
 
-  regenerateCv(
-    appId: string,
-  ): Observable<{
+  regenerateCv(appId: string): Observable<{
     status: string;
     cv_filename: string;
     cv_pdf_url: string;

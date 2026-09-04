@@ -88,7 +88,9 @@ import { CommonModule } from '@angular/common';
       <g *ngSwitchCase="'globe'">
         <circle cx="12" cy="12" r="10" />
         <line x1="2" y1="12" x2="22" y2="12" />
-        <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
+        <path
+          d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"
+        />
       </g>
 
       <!-- copy -->
@@ -173,17 +175,21 @@ import { CommonModule } from '@angular/common';
       <!-- inbox -->
       <g *ngSwitchCase="'inbox'">
         <polyline points="22 12 16 12 14 15 10 15 8 12 2 12" />
-        <path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
+        <path
+          d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"
+        />
       </g>
     </svg>
   `,
-  styles: [`
-    :host {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-    }
-  `]
+  styles: [
+    `
+      :host {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+      }
+    `,
+  ],
 })
 export class IconComponent {
   @Input({ required: true }) name!: string;

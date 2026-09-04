@@ -100,10 +100,10 @@ lint:
     uv run ruff check
     uv run mypy src/ --ignore-missing-imports
 
-# Format code with ruff
+# Format Python code with ruff and frontend with Prettier
 format:
     uv run ruff format
-    cd frontend && npm run build
+    cd frontend && npm run format
 
 # Run all quality checks: lint, test, and frontend build
 check:
