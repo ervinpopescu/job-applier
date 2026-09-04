@@ -103,9 +103,14 @@ Do not proxy the dashboard publicly without access control. It can expose resume
 
 ## Automatic private-host deployment
 
-The CI/CD workflow can update one private production host after publishing the immutable commit image. Host details are read exclusively from the GitHub `production` Environment.
+The CI/CD workflow supports updating a host either through containerized Docker Compose or through a native systemd user service via an internal runner (such as Actions Runner Controller). Host details are read exclusively from GitHub Secrets and Variables, keeping the repository completely anonymous.
 
-### 1. Prepare the server
+### 1. Host Target Models
+
+- **Systemd User Service (default in CI)**: Runs directly on the server (e.g. `systemctl --user restart job-applier.service`), pulling the latest code, rebuilding the Angular frontend, and verifying `/api/health`.
+- **Docker Compose**: Pulls the published container image and updates the Compose service stack.
+
+### 2. Prepare the server
 
 Deploy once using the steps above. The deployment user must:
 
