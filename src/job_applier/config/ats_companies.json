@@ -1,0 +1,24 @@
+{
+  "greenhouse": [
+    "cloudflare",
+    "datadog",
+    "gitlab",
+    "canonical",
+    "stripe",
+    "figma",
+    "github",
+    "elastic",
+    "mongodb"
+  ],
+  "lever": [
+    "spotify",
+    "palantir"
+  ],
+  "workday": [
+    "pwc",
+    "deloitte",
+    "kpmg",
+    "accenture",
+    "ey"
+  ]
+}
