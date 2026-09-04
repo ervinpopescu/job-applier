@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# Project Specific
+output/
+data/scraped_jobs/
+data/processed_jobs.txt
+data/applications_tracker.csv
+data/job_applier.db*
+data/_imported*
+.browser_profile/
+*.txt
+*.json
+!data/master_resume.example.json
+!data/candidate_profile.example.json
+!deploy/defaults/**/*.json
+!pyproject.toml
+!uv.lock
+!pyrightconfig.json
+!src/job_applier/config/*.json
+!frontend/**/*.json
+!frontend/**/tsconfig*.json
+!frontend/package.json
+!frontend/package-lock.json
+!frontend/angular.json
+!frontend/proxy.conf.json
+.env
+/job-applier-deploy
+/job-applier-deploy.pub
+/known_hosts
+/known_hosts.old
+
+# Frontend & Node
+frontend/node_modules/
+frontend/.angular/
+frontend/dist/
+
+# IDEs
+.vscode/
+.idea/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Agent
+.pi/
+
+# Logs
+*.log
