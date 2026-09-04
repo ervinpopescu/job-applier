@@ -1,0 +1,364 @@
+:host {
+  display: block;
+  min-height: 100%;
+}
+
+.app-shell {
+  min-height: 100dvh;
+}
+
+.primary-nav {
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+
+.primary-nav::-webkit-scrollbar {
+  display: none;
+}
+
+.primary-nav button,
+.header-actions > button,
+.header-actions > a,
+.header-actions > label {
+  min-height: 40px;
+  touch-action: manipulation;
+}
+
+@media (max-width: 1023px) {
+  .primary-nav button {
+    flex: 1 0 auto;
+    justify-content: center;
+    min-width: max-content;
+    padding-inline: 0.75rem;
+  }
+}
+
+@media (max-width: 767px) {
+  .topbar-inner {
+    align-content: center;
+  }
+
+  .brand {
+    max-width: calc(100% - 8.75rem);
+  }
+
+  .action-label,
+  .action-divider {
+    display: none;
+  }
+
+  .header-actions > button,
+  .header-actions > a,
+  .header-actions > label {
+    width: 40px;
+    justify-content: center;
+    padding-inline: 0;
+  }
+
+  .primary-nav button {
+    min-height: 42px;
+    padding-inline: 0.625rem;
+  }
+
+  .dashboard-main {
+    padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+  }
+
+  .hud-summary {
+    align-items: flex-start;
+  }
+
+  .queue-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
+
+  .queue-actions > button {
+    justify-content: center;
+    min-height: 42px;
+    width: 100%;
+  }
+
+  .card-actions > div {
+    display: flex;
+    flex: 1 1 auto;
+    flex-wrap: wrap;
+  }
+
+  .tracker-table-wrap {
+    overflow: visible;
+    padding: 0.75rem;
+  }
+
+  .tracker-table,
+  .tracker-table tbody {
+    display: block;
+    width: 100%;
+  }
+
+  .tracker-table thead {
+    display: none;
+  }
+
+  .tracker-table tbody {
+    border: 0;
+  }
+
+  .tracker-table tbody tr {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    margin-bottom: 0.75rem;
+    overflow: hidden;
+    border: 1px solid rgb(51 65 85 / 0.8);
+    border-radius: 0.875rem;
+    background: rgb(15 23 42 / 0.65);
+  }
+
+  .tracker-table tbody tr:last-child {
+    margin-bottom: 0;
+  }
+
+  .tracker-table tbody td {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.25rem;
+    border-bottom: 1px solid rgb(51 65 85 / 0.45);
+    padding: 0.625rem 0.75rem;
+    text-align: left;
+    white-space: normal;
+  }
+
+  .tracker-table tbody td::before {
+    content: attr(data-label);
+    color: rgb(100 116 139);
+    font-size: 0.625rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    line-height: 1;
+    text-transform: uppercase;
+  }
+
+  .tracker-table tbody td:nth-child(3),
+  .tracker-table tbody td:nth-child(7),
+  .tracker-table tbody td[colspan] {
+    grid-column: 1 / -1;
+  }
+
+  .tracker-table tbody td:nth-child(3) {
+    max-width: none;
+    overflow: visible;
+    text-overflow: clip;
+  }
+
+  .tracker-table tbody td:nth-child(7) {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    border-bottom: 0;
+  }
+
+  .tracker-table tbody td:nth-child(7)::before {
+    flex-basis: 100%;
+  }
+
+  .tracker-table tbody td[colspan] {
+    display: block;
+    padding: 2rem 1rem;
+    text-align: center;
+  }
+
+  .tracker-table tbody td[colspan]::before {
+    display: none;
+  }
+
+  .console-panel {
+    min-height: 32rem;
+    height: calc(100dvh - 10.5rem);
+  }
+
+  .console-log > span:last-child {
+    flex-basis: 100%;
+    padding-left: 0;
+  }
+
+  .responsive-panel,
+  .console-panel {
+    border-radius: 0.875rem;
+  }
+
+  .modal-header h3 {
+    display: block;
+    line-height: 1.25rem;
+  }
+
+  .modal-header > div:first-child,
+  .auth-header > div:first-child {
+    min-width: 0;
+  }
+
+  .modal-action-label {
+    display: none;
+  }
+
+  .pdf-panel > div:first-child,
+  .bookmark-heading {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .auth-provider > div:first-child {
+    min-width: 0;
+    flex: 1 1 13rem;
+  }
+
+  .auth-provider > button {
+    min-height: 40px;
+    flex: 1 1 9rem;
+  }
+}
+
+@media (max-width: 420px) {
+  .brand-subtitle {
+    display: none;
+  }
+
+  .brand {
+    max-width: calc(100% - 8rem);
+  }
+
+  .primary-nav {
+    gap: 0.125rem;
+  }
+
+  .primary-nav button {
+    padding-inline: 0.5rem;
+  }
+
+  .queue-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .queue-actions > button:last-child {
+    min-height: 44px;
+  }
+
+  .verification-form {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .tracker-table tbody tr {
+    grid-template-columns: 1fr;
+  }
+
+  .tracker-table tbody td,
+  .tracker-table tbody td:nth-child(3),
+  .tracker-table tbody td:nth-child(7) {
+    grid-column: 1;
+  }
+
+  .tracker-table tbody td:nth-child(7) {
+    border-bottom: 0;
+  }
+
+  .card-actions,
+  .card-actions > div {
+    align-items: stretch;
+    width: 100%;
+  }
+
+  .card-actions > div:first-child > button {
+    flex: 1 1 auto;
+  }
+}
+
+@media (orientation: landscape) and (min-width: 560px) and (max-width: 900px) and (max-height: 600px) {
+  .topbar-inner {
+    min-height: 56px;
+    flex-wrap: nowrap;
+    gap: 0.5rem;
+    padding-block: 0.375rem;
+  }
+
+  .brand {
+    max-width: none;
+  }
+
+  .brand-subtitle,
+  .primary-nav button > span,
+  .action-label,
+  .action-divider {
+    display: none;
+  }
+
+  .primary-nav {
+    order: initial;
+    width: auto;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .primary-nav button {
+    min-width: 38px;
+    min-height: 38px;
+    padding: 0.5rem;
+  }
+
+  .header-actions > button,
+  .header-actions > a,
+  .header-actions > label {
+    width: 38px;
+    min-height: 38px;
+  }
+
+  .dashboard-main {
+    padding: 0.75rem;
+  }
+
+  .applications-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .application-card {
+    padding: 1rem;
+  }
+
+  .console-panel {
+    min-height: 20rem;
+    height: calc(100dvh - 5rem);
+  }
+
+  .review-dialog,
+  .diagnostics-dialog {
+    height: 100dvh;
+    max-height: 100dvh;
+    border-radius: 0;
+  }
+
+  .modal-header {
+    padding: 0.625rem 0.875rem;
+  }
+
+  .review-body {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.75rem;
+    overflow: hidden;
+    padding: 0.75rem;
+  }
+
+  .pdf-panel,
+  .letter-panel {
+    height: 100%;
+    min-height: 0;
+  }
+
+  .bookmark-heading > span,
+  .bookmark-heading a {
+    display: none;
+  }
+}
