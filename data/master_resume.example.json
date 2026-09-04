@@ -1,0 +1,32 @@
+{
+  "contact": {
+    "name": "Your Name",
+    "phone": "",
+    "email": "you@example.com",
+    "linkedin": "",
+    "github": "",
+    "location": "City, Country",
+    "languages": ""
+  },
+  "summary": "Replace this text with your professional summary.",
+  "experience": [
+    {
+      "role": "Your Role",
+      "company": "Your Company",
+      "dates": "Start - Present",
+      "details": [
+        "Describe a measurable achievement.",
+        "Describe your responsibilities and technologies."
+      ]
+    }
+  ],
+  "skills": [
+    "Add your skills here"
+  ],
+  "education": {
+    "institution": "Your Institution",
+    "degree": "Your Degree",
+    "details": ""
+  },
+  "projects": []
+}
