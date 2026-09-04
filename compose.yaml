@@ -1,0 +1,39 @@
+name: job-applier
+
+services:
+  app:
+    image: ${JOB_APPLIER_IMAGE:-ghcr.io/ervinpopescu/job-applier:latest}
+    build:
+      context: .
+    restart: unless-stopped
+    init: true
+    environment:
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.8-flash}
+      JOOBLE_API_KEY: ${JOOBLE_API_KEY:-}
+      JOB_APPLIER_DB_PATH: /app/data/job_applier.db
+      JOB_APPLIER_TRACKER_PATH: /app/data/applications_tracker.csv
+    ports:
+      - "${JOB_APPLIER_BIND_ADDRESS:-127.0.0.1}:${JOB_APPLIER_PORT:-8000}:8000"
+    volumes:
+      - job-applier-data:/app/data
+      - job-applier-output:/app/output
+      - job-applier-browser-profile:/app/.browser_profile
+    shm_size: "1gb"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "/app/.venv/bin/python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5)",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  job-applier-data:
+  job-applier-output:
+  job-applier-browser-profile:
