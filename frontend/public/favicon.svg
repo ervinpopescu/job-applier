@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="zap-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#34d399" />
+      <stop offset="100%" stop-color="#14b8a6" />
+    </linearGradient>
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a" />
+      <stop offset="100%" stop-color="#020617" />
+    </linearGradient>
+  </defs>
+
+  <!-- Outer Rounded Badge -->
+  <rect width="64" height="64" rx="16" fill="url(#bg-grad)" stroke="#10b981" stroke-width="2.5" stroke-opacity="0.4" />
+
+  <!-- Electric Lightning Bolt -->
+  <path d="M35 8 L14 36 L32 36 L29 56 L50 28 L32 28 Z" fill="url(#zap-grad)" filter="drop-shadow(0 2px 6px rgba(16,185,129,0.5))" />
+</svg>
