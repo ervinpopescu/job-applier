@@ -1,0 +1,49 @@
+{
+  "default_sites": [
+    "linkedin",
+    "indeed",
+    "ejobs",
+    "bestjobs",
+    "hipo",
+    "undelucram",
+    "jooble",
+    "google",
+    "greenhouse",
+    "lever",
+    "remote",
+    "glassdoor"
+  ],
+  "default_search_roles": [
+    "Software Engineer",
+    "Solutions Architect",
+    "DevOps Engineer",
+    "Cloud Architect",
+    "Python Dev"
+  ],
+  "login_urls": {
+    "linkedin": "https://www.linkedin.com/login",
+    "bestjobs": "https://www.bestjobs.eu/login",
+    "ejobs": "https://www.ejobs.ro/login",
+    "google": "https://accounts.google.com"
+  },
+  "tracking_query_params": [
+    "source",
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "utm_term",
+    "utm_content",
+    "refid",
+    "trackingid",
+    "ref",
+    "gh_src",
+    "lever-source",
+    "feedid",
+    "tcsource",
+    "codes",
+    "from",
+    "originalsubdomain",
+    "trk",
+    "trkinfo"
+  ]
+}
