@@ -1,0 +1,1517 @@
+<div
+  class="app-shell min-h-full flex flex-col overflow-x-hidden bg-slate-950 text-slate-100 selection:bg-emerald-500 selection:text-white"
+>
+  <!-- Top Navigation Bar -->
+  <header
+    class="topbar bg-slate-900/90 backdrop-blur-md border-b border-slate-800/80 sticky top-0 z-40 shadow-sm"
+  >
+    <div class="max-w-7xl mx-auto px-3 sm:px-6 lg:px-8">
+      <div
+        class="topbar-inner flex flex-wrap items-center justify-between min-h-16 py-2 gap-2 lg:flex-nowrap lg:gap-6"
+      >
+        <!-- Logo & Brand -->
+        <div
+          class="brand flex min-w-0 items-center space-x-2.5 sm:space-x-3.5 flex-shrink-0 cursor-pointer select-none"
+          (click)="activeTab.set('queue')"
+        >
+          <div
+            class="w-9 h-9 rounded-xl bg-gradient-to-tr from-emerald-600 to-teal-400 flex items-center justify-center shadow-md shadow-emerald-950/60 ring-1 ring-emerald-400/30"
+          >
+            <app-icon name="zap" className="w-4 h-4 text-white fill-white"></app-icon>
+          </div>
+          <div class="flex flex-col">
+            <span
+              class="font-bold text-base tracking-tight text-white flex items-center gap-1.5 leading-none"
+            >
+              JobApplier
+              <span
+                class="text-[10px] font-semibold px-1.5 py-0.5 rounded-md bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 font-mono"
+                >NG-21</span
+              >
+            </span>
+            <span class="brand-subtitle text-[11px] text-slate-400 mt-1 font-medium"
+              >Autonomous Application Suite</span
+            >
+          </div>
+        </div>
+
+        <!-- Center: Navigation Tabs -->
+        <nav
+          class="primary-nav order-3 flex w-full items-center gap-1 overflow-x-auto bg-slate-950/70 p-1 rounded-xl border border-slate-800/80 shadow-inner lg:order-none lg:w-auto lg:gap-1.5 lg:p-1.5"
+          aria-label="Dashboard sections"
+        >
+          <!-- Queue Tab -->
+          <button
+            type="button"
+            title="Application queue"
+            aria-label="Application queue"
+            (click)="activeTab.set('queue')"
+            [class]="
+              activeTab() === 'queue'
+                ? 'bg-slate-800 text-emerald-400 shadow-sm font-semibold'
+                : 'text-slate-400 hover:text-slate-200'
+            "
+            class="px-4 py-1.5 text-xs rounded-lg transition-all flex items-center gap-2 select-none"
+          >
+            <app-icon name="layers" className="w-3.5 h-3.5"></app-icon>
+            <span>Queue</span>
+            <span
+              class="px-1.5 py-0.2 rounded-full text-[10px] bg-slate-900 border border-slate-700 text-slate-300 font-mono font-bold"
+            >
+              {{ stats()?.pending || 0 }}
+            </span>
+          </button>
+
+          <!-- Tracker Tab -->
+          <button
+            type="button"
+            title="Application tracker"
+            aria-label="Application tracker"
+            (click)="activeTab.set('tracker')"
+            [class]="
+              activeTab() === 'tracker'
+                ? 'bg-slate-800 text-emerald-400 shadow-sm font-semibold'
+                : 'text-slate-400 hover:text-slate-200'
+            "
+            class="px-4 py-1.5 text-xs rounded-lg transition-all flex items-center gap-2 select-none"
+          >
+            <app-icon name="activity" className="w-3.5 h-3.5"></app-icon>
+            <span>Tracker</span>
+          </button>
+
+          <!-- Scraper Tab -->
+          <button
+            type="button"
+            title="Scraper configuration"
+            aria-label="Scraper configuration"
+            (click)="activeTab.set('scraper')"
+            [class]="
+              activeTab() === 'scraper'
+                ? 'bg-slate-800 text-emerald-400 shadow-sm font-semibold'
+                : 'text-slate-400 hover:text-slate-200'
+            "
+            class="px-4 py-1.5 text-xs rounded-lg transition-all flex items-center gap-2 select-none"
+          >
+            <app-icon name="play-circle" className="w-3.5 h-3.5"></app-icon>
+            <span>Scraper</span>
+          </button>
+
+          <!-- Console Tab -->
+          <button
+            type="button"
+            title="Execution console"
+            aria-label="Execution console"
+            (click)="activeTab.set('console')"
+            [class]="
+              activeTab() === 'console'
+                ? 'bg-slate-800 text-emerald-400 shadow-sm font-semibold'
+                : 'text-slate-400 hover:text-slate-200'
+            "
+            class="px-4 py-1.5 text-xs rounded-lg transition-all flex items-center gap-2 relative select-none"
+          >
+            <app-icon name="terminal" className="w-3.5 h-3.5"></app-icon>
+            <span>Console</span>
+            <span
+              *ngIf="pipelineStatus()?.is_running || automationStatus()?.is_active"
+              class="w-2 h-2 rounded-full bg-emerald-400 animate-ping absolute top-2 right-1.5"
+            ></span>
+          </button>
+
+          <!-- Profile Tab -->
+          <button
+            type="button"
+            title="Candidate profile"
+            aria-label="Candidate profile"
+            (click)="activeTab.set('profile')"
+            [class]="
+              activeTab() === 'profile'
+                ? 'bg-slate-800 text-emerald-400 shadow-sm font-semibold'
+                : 'text-slate-400 hover:text-slate-200'
+            "
+            class="px-4 py-1.5 text-xs rounded-lg transition-all flex items-center gap-2 select-none"
+          >
+            <app-icon name="user" className="w-3.5 h-3.5"></app-icon>
+            <span>Profile</span>
+          </button>
+        </nav>
+
+        <!-- Right: Action Controls -->
+        <div class="header-actions flex items-center gap-1.5 sm:gap-2 flex-shrink-0">
+          <button
+            (click)="openAuthModal()"
+            class="px-3.5 py-1.5 bg-slate-950/70 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-800 hover:border-slate-700 rounded-xl text-xs font-medium flex items-center gap-2 transition shadow-sm"
+            title="Manage platform logins and session cookies"
+          >
+            <app-icon name="key" className="w-3.5 h-3.5 text-amber-400"></app-icon>
+            <span class="action-label">Logins & Auth</span>
+            <span
+              class="w-1.5 h-1.5 rounded-full"
+              [class]="
+                authStatus()?.platforms?.['linkedin']?.status === 'logged_in'
+                  ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]'
+                  : 'bg-amber-500'
+              "
+            ></span>
+          </button>
+
+          <div class="action-divider h-4 w-px bg-slate-800"></div>
+
+          <!-- Export -->
+          <a
+            href="/api/export"
+            download
+            class="px-3 py-1.5 bg-slate-950/70 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-800 hover:border-slate-700 rounded-xl text-xs font-medium flex items-center gap-1.5 transition shadow-sm"
+            title="Export all applications and database mappings as a portable .zip backup"
+          >
+            <app-icon name="download" className="w-3.5 h-3.5 text-emerald-400"></app-icon>
+            <span class="action-label">Export</span>
+          </a>
+
+          <!-- Import -->
+          <label
+            class="px-3 py-1.5 bg-slate-950/70 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-800 hover:border-slate-700 rounded-xl text-xs font-medium flex items-center gap-1.5 transition shadow-sm cursor-pointer"
+            title="Import and merge a backup .zip bundle from another machine"
+          >
+            <app-icon name="upload" className="w-3.5 h-3.5 text-teal-400"></app-icon>
+            <span class="action-label">Import</span>
+            <input type="file" accept=".zip" class="hidden" (change)="uploadBackup($event)" />
+          </label>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- Content Area -->
+  <main
+    class="dashboard-main flex-1 w-full min-w-0 mx-auto p-3 sm:p-6 lg:p-8"
+    [ngClass]="activeTab() === 'tracker' ? 'max-w-none' : 'max-w-7xl'"
+  >
+    <!-- Toast Notification -->
+    <div
+      *ngIf="toast().visible"
+      class="toast fixed bottom-4 left-3 right-3 sm:bottom-6 sm:left-auto sm:right-6 sm:max-w-md z-50 transition transform duration-300 p-4 rounded-2xl border shadow-2xl flex items-center gap-3 text-xs font-semibold backdrop-blur-xl"
+      [ngClass]="{
+        'bg-emerald-950/90 border-emerald-700/80 text-emerald-200 shadow-emerald-950/50':
+          toast().type === 'success',
+        'bg-rose-950/90 border-rose-700/80 text-rose-200 shadow-rose-950/50':
+          toast().type === 'error',
+        'bg-slate-900/95 border-slate-700/80 text-slate-200': toast().type === 'info',
+      }"
+    >
+      <app-icon
+        [name]="toast().type === 'error' ? 'alert-circle' : 'check'"
+        className="w-4 h-4 shrink-0"
+      ></app-icon>
+      <span>{{ toast().message }}</span>
+    </div>
+
+    <!-- Live Browser Automation HUD Monitor -->
+    <div
+      class="mb-6 p-4 rounded-2xl border transition-all duration-300 shadow-lg"
+      [class]="
+        automationStatus()?.is_active
+          ? 'bg-slate-900/90 border-emerald-500/50 shadow-emerald-950/40 ring-1 ring-emerald-500/20'
+          : 'bg-slate-900/60 border-slate-800/80 text-slate-400'
+      "
+    >
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-2.5">
+        <div class="hud-summary flex min-w-0 items-center space-x-3">
+          <div
+            class="w-9 h-9 rounded-xl flex items-center justify-center border transition-colors"
+            [class]="
+              automationStatus()?.is_active
+                ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-400 shadow-sm'
+                : 'bg-slate-800/60 border-slate-700/60 text-slate-400'
+            "
+          >
+            <app-icon
+              name="activity"
+              className="w-4 h-4"
+              [class.animate-pulse]="automationStatus()?.is_active"
+            ></app-icon>
+          </div>
+          <div class="min-w-0">
+            <div class="hud-title flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+              <span
+                class="text-xs font-bold uppercase tracking-wider"
+                [class]="automationStatus()?.is_active ? 'text-emerald-400' : 'text-slate-300'"
+              >
+                Live Browser Automator HUD
+              </span>
+              <span class="text-slate-600">•</span>
+              <span
+                class="text-xs font-semibold"
+                [class]="automationStatus()?.is_active ? 'text-slate-100' : 'text-slate-400'"
+              >
+                {{
+                  automationStatus()?.is_active
+                    ? automationStatus()?.company + ' — ' + automationStatus()?.title
+                    : 'Status: Idle / Ready'
+                }}
+              </span>
+            </div>
+            <p
+              class="text-xs mt-0.5"
+              [class]="automationStatus()?.is_active ? 'text-slate-300' : 'text-slate-500'"
+            >
+              {{
+                automationStatus()?.is_active
+                  ? automationStatus()?.message
+                  : 'Ready for job applications. Click Auto-Apply on any card below or Auto-Apply Next 5 to run.'
+              }}
+            </p>
+          </div>
+        </div>
+        <div class="flex items-center space-x-3 text-xs">
+          <span
+            class="px-2.5 py-1 rounded-md border font-mono font-semibold"
+            [class]="
+              automationStatus()?.is_active
+                ? 'bg-slate-800 text-emerald-300 border-emerald-500/30 shadow-sm'
+                : 'bg-slate-950 text-slate-500 border-slate-800'
+            "
+          >
+            {{ automationStatus()?.is_active ? 'Step: ' + automationStatus()?.step : 'Standby' }}
+          </span>
+          <span
+            class="font-mono font-bold text-sm"
+            [class]="automationStatus()?.is_active ? 'text-emerald-400' : 'text-slate-600'"
+          >
+            {{ automationStatus()?.progress_pct || 0 }}%
+          </span>
+        </div>
+      </div>
+      <div
+        class="w-full h-1.5 bg-slate-950 rounded-full overflow-hidden border border-slate-800/40"
+      >
+        <div
+          class="h-full transition-all duration-500 ease-out"
+          [class]="
+            automationStatus()?.is_active
+              ? 'bg-gradient-to-r from-emerald-500 via-teal-400 to-cyan-400'
+              : 'bg-slate-800'
+          "
+          [style.width.%]="automationStatus()?.is_active ? automationStatus()?.progress_pct : 0"
+        ></div>
+      </div>
+    </div>
+
+    <!-- Live Verification Code / 2FA Challenge Banner -->
+    <div
+      *ngIf="automationStatus()?.is_waiting_for_code"
+      class="mb-6 p-4 rounded-2xl bg-amber-950/40 border border-amber-500/60 shadow-lg shadow-amber-950/40 text-amber-200 ring-1 ring-amber-500/30 animate-pulse"
+    >
+      <div class="flex flex-col md:flex-row items-center justify-between gap-4">
+        <div class="flex items-center space-x-3">
+          <div
+            class="w-10 h-10 rounded-xl bg-amber-500/20 border border-amber-500/40 flex items-center justify-center text-amber-400 flex-shrink-0"
+          >
+            <app-icon name="key" className="w-5 h-5"></app-icon>
+          </div>
+          <div>
+            <h4 class="text-sm font-bold text-amber-300">Email / SMS Verification Code Required</h4>
+            <p class="text-xs text-amber-200/80">
+              A security verification code was sent to your email or phone to confirm the
+              application submission.
+            </p>
+          </div>
+        </div>
+        <form
+          (ngSubmit)="submitCode()"
+          class="verification-form flex items-center gap-2 w-full md:w-auto"
+        >
+          <input
+            type="text"
+            [(ngModel)]="verificationCode"
+            name="vCode"
+            placeholder="Enter code"
+            class="min-w-0 flex-1 md:flex-none bg-slate-950 border border-amber-500/40 rounded-xl px-3 py-2 text-sm text-white font-mono placeholder:text-slate-600 focus:outline-none focus:border-amber-400 md:w-40 text-center tracking-widest font-bold"
+            autofocus
+            required
+          />
+          <button
+            type="submit"
+            class="px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-xl text-xs font-bold transition shadow whitespace-nowrap"
+          >
+            Submit Code
+          </button>
+        </form>
+      </div>
+    </div>
+
+    <!-- TAB 1: APPLICATIONS QUEUE -->
+    <section *ngIf="activeTab() === 'queue'">
+      <!-- Toolbar -->
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
+        <div class="relative flex-1 max-w-md">
+          <app-icon
+            name="search"
+            className="w-4 h-4 text-slate-500 absolute left-3.5 top-3"
+          ></app-icon>
+          <input
+            type="text"
+            [ngModel]="searchQuery()"
+            (ngModelChange)="searchQuery.set($event); loadApplications()"
+            placeholder="Search queue by role or company..."
+            class="w-full bg-slate-900 border border-slate-800 rounded-xl pl-10 pr-4 py-2 text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-emerald-500 transition shadow-sm"
+          />
+        </div>
+
+        <div class="queue-actions flex items-center flex-wrap gap-2">
+          <!-- Batch Next 5 -->
+          <button
+            (click)="triggerBatchApply()"
+            [disabled]="isBatchRunning() || applications().length === 0"
+            class="px-3.5 py-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 shadow-md shadow-emerald-950/40"
+          >
+            <app-icon name="zap" className="w-3.5 h-3.5 fill-white"></app-icon>
+            <span>Auto-Apply Next 5</span>
+          </button>
+
+          <!-- Prune Duplicates -->
+          <button
+            (click)="pruneDuplicates()"
+            [disabled]="isPruningDupes() || applications().length === 0"
+            class="px-3 py-2 bg-purple-950/40 border border-purple-800/80 hover:bg-purple-900/60 text-purple-300 rounded-xl text-xs font-medium transition flex items-center gap-1.5"
+            title="Purge duplicate application packages with matching roles or URLs"
+          >
+            <app-icon
+              name="copy-check"
+              className="w-3.5 h-3.5"
+              [class.animate-spin]="isPruningDupes()"
+            ></app-icon>
+            <span>{{ isPruningDupes() ? 'Deduplicating...' : 'Prune Duplicates' }}</span>
+          </button>
+
+          <!-- Prune Expired -->
+          <button
+            (click)="pruneInactive()"
+            [disabled]="isPruning() || applications().length === 0"
+            class="px-3 py-2 bg-amber-950/40 border border-amber-800/80 hover:bg-amber-900/60 text-amber-300 rounded-xl text-xs font-medium transition flex items-center gap-1.5"
+            title="Purge closed/expired job postings"
+          >
+            <app-icon
+              name="filter-x"
+              className="w-3.5 h-3.5"
+              [class.animate-spin]="isPruning()"
+            ></app-icon>
+            <span>{{ isPruning() ? 'Pruning...' : 'Prune Expired' }}</span>
+          </button>
+
+          <!-- EMEA Only Filter -->
+          <button
+            (click)="pruneNonEmea()"
+            [disabled]="isPruningEmea() || applications().length === 0"
+            class="px-3 py-2 bg-blue-950/40 border border-blue-800/80 hover:bg-blue-900/60 text-blue-300 rounded-xl text-xs font-medium transition flex items-center gap-1.5"
+            title="Prune applications with US/non-EMEA residency restrictions"
+          >
+            <app-icon
+              name="globe"
+              className="w-3.5 h-3.5"
+              [class.animate-spin]="isPruningEmea()"
+            ></app-icon>
+            <span>{{ isPruningEmea() ? 'Filtering...' : 'EMEA Only Filter' }}</span>
+          </button>
+
+          <!-- Clear Failed -->
+          <button
+            (click)="clearFailed()"
+            class="px-3 py-2 bg-rose-950/40 border border-rose-800/80 hover:bg-rose-900/60 text-rose-300 rounded-xl text-xs font-medium transition flex items-center gap-1.5"
+          >
+            <app-icon name="alert-triangle" className="w-3.5 h-3.5"></app-icon>
+            <span>Clear Failed</span>
+          </button>
+
+          <!-- Refresh -->
+          <button
+            (click)="loadInitialData()"
+            class="p-2 bg-slate-900 border border-slate-800 hover:border-slate-700 rounded-xl text-slate-400 hover:text-slate-200 transition"
+            title="Refresh dashboard"
+          >
+            <app-icon
+              name="refresh-cw"
+              className="w-4 h-4"
+              [class.animate-spin]="isLoading()"
+            ></app-icon>
+          </button>
+        </div>
+      </div>
+
+      <!-- Empty State -->
+      <div
+        *ngIf="!isLoading() && applications().length === 0"
+        class="text-center py-20 bg-slate-900/40 rounded-2xl border border-dashed border-slate-800"
+      >
+        <app-icon name="inbox" className="w-12 h-12 text-slate-600 mx-auto mb-3"></app-icon>
+        <h3 class="text-base font-semibold text-slate-300">No applications in queue</h3>
+        <p class="text-sm text-slate-500 max-w-sm mx-auto mt-1">
+          Switch to the Scraper tab to search for open roles and automatically tailor resumes.
+        </p>
+      </div>
+
+      <!-- Applications Grid -->
+      <div class="applications-grid grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 lg:gap-5">
+        <div
+          *ngFor="let app of applications()"
+          class="application-card bg-slate-900/90 border border-slate-800 hover:border-emerald-500/40 rounded-2xl p-4 sm:p-5 transition-all duration-300 flex flex-col justify-between shadow-sm hover:shadow-lg hover:shadow-emerald-950/20 group"
+        >
+          <div>
+            <div class="flex items-start justify-between gap-3 mb-2">
+              <div>
+                <h3
+                  class="font-bold text-white text-base leading-snug line-clamp-1 group-hover:text-emerald-300 transition-colors"
+                >
+                  {{ app.company }}
+                </h3>
+                <h4 class="text-xs font-medium text-slate-300 mt-0.5 line-clamp-1">
+                  {{ app.title }}
+                </h4>
+              </div>
+              <span
+                class="text-[10px] font-mono px-2 py-0.5 rounded-md bg-slate-950 border border-slate-800 text-slate-400 shrink-0"
+              >
+                {{ app.created_at }}
+              </span>
+            </div>
+
+            <!-- Job URL -->
+            <a
+              [href]="app.job_url"
+              target="_blank"
+              class="text-xs text-emerald-400 hover:text-emerald-300 truncate flex items-center gap-1 mb-3 hover:underline"
+            >
+              <span class="truncate">{{ app.job_url }}</span>
+              <app-icon name="external-link" className="w-3 h-3 shrink-0"></app-icon>
+            </a>
+
+            <!-- Cover Letter Snippet -->
+            <div
+              *ngIf="app.cover_letter_preview"
+              class="p-3 bg-slate-950/60 rounded-xl border border-slate-800/80 text-[11px] text-slate-400 leading-relaxed line-clamp-3 mb-4"
+            >
+              "{{ app.cover_letter_preview }}"
+            </div>
+          </div>
+
+          <div
+            class="card-actions pt-4 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2"
+          >
+            <div class="flex items-center gap-1.5">
+              <button
+                (click)="openReviewModal(app.id)"
+                class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-semibold transition"
+              >
+                Review CV
+              </button>
+
+              <button
+                *ngIf="!app.pdf_url || app.cv_filename === 'None'"
+                (click)="retriggerCvGeneration(app.id)"
+                [disabled]="isRegeneratingCv()[app.id]"
+                class="px-2.5 py-1.5 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/30 rounded-xl text-xs font-semibold transition flex items-center gap-1"
+                title="Generate tailored CV PDF with Gemini"
+              >
+                <app-icon
+                  name="refresh-cw"
+                  className="w-3 h-3"
+                  [class.animate-spin]="isRegeneratingCv()[app.id]"
+                ></app-icon>
+                <span>{{ isRegeneratingCv()[app.id] ? 'Generating...' : 'Generate CV' }}</span>
+              </button>
+            </div>
+
+            <div class="flex items-center gap-1.5">
+              <button
+                (click)="applyForJob(app.id, 'assisted')"
+                [disabled]="isApplying()[app.id]"
+                class="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition flex items-center gap-1 shadow"
+              >
+                <app-icon name="zap" className="w-3 h-3 fill-white"></app-icon>
+                <span>Auto-Apply</span>
+              </button>
+
+              <button
+                (click)="markDone(app.id)"
+                class="p-2 bg-slate-950 hover:bg-slate-800 text-slate-400 hover:text-emerald-400 rounded-xl border border-slate-800 transition"
+                title="Mark as Done and move to applied"
+              >
+                <app-icon name="check" className="w-3.5 h-3.5"></app-icon>
+              </button>
+
+              <button
+                (click)="deleteApp(app.id)"
+                class="p-2 bg-slate-950 hover:bg-rose-950/50 text-slate-400 hover:text-rose-400 rounded-xl border border-slate-800 transition"
+                title="Dismiss application"
+              >
+                <app-icon name="trash-2" className="w-3.5 h-3.5"></app-icon>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 2: APPLICATION TRACKER -->
+    <section *ngIf="activeTab() === 'tracker'">
+      <div class="bg-slate-900/90 border border-slate-800 rounded-2xl overflow-hidden shadow-sm">
+        <div
+          class="p-4 border-b border-slate-800 flex items-center justify-between flex-wrap gap-4"
+        >
+          <div>
+            <h3 class="text-base font-bold text-white flex items-center gap-2">
+              <app-icon name="activity" className="w-4 h-4 text-emerald-400"></app-icon>
+              <span>Application Pipeline History</span>
+            </h3>
+            <p class="text-xs text-slate-400">
+              Track statuses, dates, platforms, and submission proofs.
+            </p>
+          </div>
+          <div class="flex items-center gap-3">
+            <select
+              [ngModel]="trackerFilter()"
+              (ngModelChange)="trackerFilter.set($event); loadTracker()"
+              class="bg-slate-950 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-slate-300 focus:outline-none"
+            >
+              <option value="">All Statuses</option>
+              <option value="applied">Applied</option>
+              <option value="auto_filled">Auto-filled</option>
+              <option value="interviewing">Interviewing</option>
+              <option value="skipped">Skipped</option>
+              <option value="failed">Failed</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="tracker-table-wrap overflow-x-auto">
+          <table class="tracker-table w-full text-left border-collapse text-xs">
+            <thead>
+              <tr
+                class="border-b border-slate-800 bg-slate-950/60 text-slate-400 uppercase tracking-wider text-[10px]"
+              >
+                <th
+                  (click)="toggleSort('timestamp')"
+                  class="py-3.5 px-4 cursor-pointer hover:text-white select-none"
+                >
+                  Date & Time ⇅
+                </th>
+                <th
+                  (click)="toggleSort('company')"
+                  class="py-3.5 px-4 cursor-pointer hover:text-white select-none"
+                >
+                  Company ⇅
+                </th>
+                <th
+                  (click)="toggleSort('title')"
+                  class="py-3.5 px-4 cursor-pointer hover:text-white select-none"
+                >
+                  Role ⇅
+                </th>
+                <th
+                  (click)="toggleSort('platform')"
+                  class="py-3.5 px-4 cursor-pointer hover:text-white select-none"
+                >
+                  Platform ⇅
+                </th>
+                <th
+                  (click)="toggleSort('status')"
+                  class="py-3.5 px-4 cursor-pointer hover:text-white select-none"
+                >
+                  Status ⇅
+                </th>
+                <th
+                  (click)="toggleSort('submission_type')"
+                  class="py-3.5 px-4 cursor-pointer hover:text-white select-none"
+                >
+                  Submission ⇅
+                </th>
+                <th class="py-3.5 px-4 text-right select-none">Actions</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-800/60">
+              <tr
+                *ngFor="let rec of filteredTrackerRecords()"
+                class="hover:bg-slate-800/40 transition"
+              >
+                <td data-label="Date" class="py-3 px-4 font-mono text-slate-400 text-[11px]">
+                  {{ rec.timestamp }}
+                </td>
+                <td data-label="Company" class="py-3 px-4 font-bold text-white">
+                  {{ rec.company || '—' }}
+                </td>
+                <td data-label="Role" class="py-3 px-4 text-slate-300 max-w-xs truncate">
+                  {{ rec.title || '—' }}
+                </td>
+                <td data-label="Platform" class="py-3 px-4">
+                  <span
+                    class="px-2 py-0.5 rounded-full text-[10px] font-semibold"
+                    [class]="getPlatformBadgeClass(rec.platform)"
+                  >
+                    {{ rec.platform || 'Generic' }}
+                  </span>
+                </td>
+                <td data-label="Status" class="py-3 px-4">
+                  <select
+                    [ngModel]="rec.status"
+                    (ngModelChange)="updateTrackerStatus(rec.job_url, $event)"
+                    class="bg-slate-950 border border-slate-800 rounded-lg px-2 py-1 text-[11px] text-slate-300 focus:outline-none"
+                  >
+                    <option value="applied">Applied</option>
+                    <option value="auto_filled">Auto-filled</option>
+                    <option value="interviewing">Interviewing</option>
+                    <option value="offered">Offered</option>
+                    <option value="rejected">Rejected</option>
+                    <option value="skipped">Skipped</option>
+                  </select>
+                </td>
+                <td data-label="Submission" class="py-3 px-4 text-slate-400 text-[11px]">
+                  {{ rec.submission_type || 'manual' }}
+                </td>
+                <td data-label="Actions" class="py-3 px-4 text-right space-x-2 whitespace-nowrap">
+                  <button
+                    *ngIf="rec.folder_name"
+                    (click)="openDiagnostics(rec.folder_name)"
+                    class="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-[11px] transition"
+                  >
+                    Diagnostics
+                  </button>
+                  <button
+                    (click)="requeueApp(rec)"
+                    class="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-[11px] transition"
+                  >
+                    Send to Queue
+                  </button>
+                </td>
+              </tr>
+              <tr *ngIf="filteredTrackerRecords().length === 0">
+                <td colspan="7" class="py-8 text-center text-slate-500">
+                  No applications recorded in tracker.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 3: SCRAPER CONFIGURATION -->
+    <section *ngIf="activeTab() === 'scraper'" class="max-w-4xl mx-auto">
+      <div
+        class="responsive-panel bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 shadow-sm mb-6"
+      >
+        <h3 class="text-base font-bold text-white mb-1 flex items-center gap-2">
+          <app-icon name="play-circle" className="w-4 h-4 text-emerald-400"></app-icon>
+          <span>Scraper & Application Pipeline</span>
+        </h3>
+        <p class="text-xs text-slate-400 mb-5">
+          Search jobs across multiple platforms, tailor resumes with Gemini 3.8-Flash, and queue
+          packages.
+        </p>
+
+        <div class="space-y-4">
+          <!-- Roles -->
+          <div>
+            <label class="block text-xs font-semibold text-slate-300 mb-1.5"
+              >Target Job Roles (Comma-Separated)</label
+            >
+            <input
+              type="text"
+              [(ngModel)]="scraperTerms"
+              class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-emerald-500 transition"
+            />
+          </div>
+
+          <!-- Locations & Limit -->
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <div class="sm:col-span-2">
+              <label class="block text-xs font-semibold text-slate-300 mb-1.5"
+                >Locations (Comma-Separated)</label
+              >
+              <input
+                type="text"
+                [(ngModel)]="scraperLocations"
+                class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-emerald-500 transition"
+              />
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-slate-300 mb-1.5"
+                >Results Per Term</label
+              >
+              <input
+                type="number"
+                [(ngModel)]="scraperLimit"
+                class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-emerald-500 transition"
+              />
+            </div>
+          </div>
+
+          <!-- Region & Country Scope -->
+          <div class="pt-3 border-t border-slate-800 space-y-3">
+            <div class="flex items-center justify-between">
+              <label class="block text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                <app-icon name="map-pin" className="w-3.5 h-3.5 text-emerald-400"></app-icon>
+                <span>Geographic Scope & Regional Filter</span>
+              </label>
+              <span class="text-[10px] text-slate-500 font-mono"
+                >Filters out non-matching regions & residency restrictions</span
+              >
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <select
+                [(ngModel)]="scraperRegion"
+                class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-emerald-500"
+              >
+                <option value="EMEA">🌍 EMEA & Global Remote (Default)</option>
+                <option value="EUROPE">🇪🇺 Europe & UK Only</option>
+                <option value="ROMANIA">🇷🇴 Romania Only</option>
+                <option value="USA">🇺🇸 United States & Canada</option>
+                <option value="GLOBAL">🌐 Worldwide / Any Region</option>
+                <option value="CUSTOM">⚙️ Custom Country Selection</option>
+              </select>
+
+              <input
+                type="text"
+                [(ngModel)]="scraperCountries"
+                placeholder="Optional countries: Romania, Germany, UK, Switzerland..."
+                class="sm:col-span-2 w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-emerald-500 placeholder:text-slate-600"
+              />
+            </div>
+          </div>
+
+          <!-- Platforms -->
+          <div class="pt-3 border-t border-slate-800">
+            <label class="block text-xs font-semibold text-slate-300 mb-2"
+              >Job Boards & ATS Sources</label
+            >
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+              <label
+                *ngFor="
+                  let s of [
+                    'linkedin',
+                    'indeed',
+                    'glassdoor',
+                    'ejobs',
+                    'bestjobs',
+                    'hipo',
+                    'undelucram',
+                    'jooble',
+                    'google',
+                    'greenhouse',
+                    'lever',
+                    'remote',
+                  ]
+                "
+                class="flex items-center space-x-2 bg-slate-950 p-2 rounded-lg border border-slate-800 cursor-pointer hover:border-slate-700 transition"
+              >
+                <input
+                  type="checkbox"
+                  [checked]="scraperSites().includes(s)"
+                  (change)="toggleSite(s)"
+                  class="rounded text-emerald-500 bg-slate-900 border-slate-700 focus:ring-0"
+                />
+                <span class="capitalize font-medium text-slate-300">{{ s }}</span>
+              </label>
+            </div>
+          </div>
+
+          <!-- Options -->
+          <div
+            class="pt-3 border-t border-slate-800 flex flex-wrap items-center gap-6 text-xs text-slate-300"
+          >
+            <label class="flex items-center space-x-2 cursor-pointer">
+              <input
+                type="checkbox"
+                [(ngModel)]="scraperRemote"
+                class="rounded border-slate-800 bg-slate-950 text-teal-400 focus:ring-teal-500"
+              />
+              <span class="text-teal-300 font-medium flex items-center gap-1.5">
+                <app-icon name="globe" className="w-3.5 h-3.5"></app-icon>
+                <span>Remote positions only</span>
+              </span>
+            </label>
+            <label class="flex items-center space-x-2 cursor-pointer">
+              <input
+                type="checkbox"
+                [(ngModel)]="scraperAutoApply"
+                class="rounded border-slate-800 bg-slate-950 text-emerald-500 focus:ring-emerald-500"
+              />
+              <span>⚡ Auto-Apply browser immediately as packages are generated</span>
+            </label>
+          </div>
+
+          <button
+            (click)="startPipeline()"
+            [disabled]="pipelineStatus()?.is_running"
+            class="w-full py-2.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white rounded-xl text-sm font-semibold transition shadow-lg shadow-emerald-950/40 flex items-center justify-center gap-2 disabled:opacity-50 mt-4"
+          >
+            <span>{{
+              pipelineStatus()?.is_running
+                ? 'Pipeline Running in Background...'
+                : 'Start Scraping & Application Pipeline'
+            }}</span>
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 4: CONSOLE -->
+    <section *ngIf="activeTab() === 'console'" class="max-w-6xl mx-auto">
+      <div
+        class="console-panel bg-slate-900 border border-slate-800 rounded-2xl p-3 sm:p-5 shadow-lg flex flex-col h-[75dvh]"
+      >
+        <!-- Console Header & Filters -->
+        <div
+          class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-800"
+        >
+          <div class="flex items-center space-x-3">
+            <div class="flex items-center space-x-1.5 px-1 py-1">
+              <span class="w-3 h-3 rounded-full bg-rose-500/80"></span>
+              <span class="w-3 h-3 rounded-full bg-amber-500/80"></span>
+              <span class="w-3 h-3 rounded-full bg-emerald-500/80"></span>
+            </div>
+            <div>
+              <div class="flex items-center space-x-2">
+                <h3 class="text-sm font-bold text-white tracking-wide">Live Execution Console</h3>
+                <span
+                  class="px-2 py-0.5 rounded text-[10px] font-semibold border font-mono"
+                  [class]="
+                    pipelineStatus()?.is_running || automationStatus()?.is_active
+                      ? 'bg-emerald-950 text-emerald-300 border-emerald-800'
+                      : 'bg-slate-950 text-slate-500 border-slate-800'
+                  "
+                >
+                  {{
+                    pipelineStatus()?.is_running
+                      ? 'Pipeline: Running'
+                      : automationStatus()?.is_active
+                        ? 'Automator: Active'
+                        : 'System: Idle'
+                  }}
+                </span>
+              </div>
+              <p class="text-xs text-slate-500">
+                Real-time events, AI tailoring status, browser actions, and diagnostic traces
+              </p>
+            </div>
+          </div>
+
+          <div class="flex flex-wrap items-center gap-2 text-xs">
+            <select
+              [(ngModel)]="consoleCategory"
+              class="bg-slate-950 border border-slate-800 rounded-xl px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none"
+            >
+              <option value="">All Categories</option>
+              <option value="Pipeline">Pipeline</option>
+              <option value="Auto-Apply">Auto-Apply</option>
+              <option value="Auth">Auth & Sessions</option>
+              <option value="Scraper">Scrapers</option>
+              <option value="System">System</option>
+            </select>
+
+            <select
+              [(ngModel)]="consoleLevel"
+              class="bg-slate-950 border border-slate-800 rounded-xl px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none"
+            >
+              <option value="">All Levels</option>
+              <option value="INFO">Info</option>
+              <option value="SUCCESS">Success</option>
+              <option value="WARN">Warnings</option>
+              <option value="ERROR">Errors</option>
+            </select>
+
+            <label
+              class="flex items-center space-x-1.5 px-2.5 py-1.5 bg-slate-950 border border-slate-800 rounded-xl text-slate-400 cursor-pointer"
+            >
+              <input
+                type="checkbox"
+                [(ngModel)]="consoleAutoScroll"
+                class="rounded text-emerald-500 bg-slate-900 border-slate-700 w-3.5 h-3.5"
+              />
+              <span class="text-[11px]">Auto-scroll</span>
+            </label>
+
+            <button
+              (click)="clearConsoleLogs()"
+              class="px-3 py-1.5 bg-slate-950 hover:bg-slate-800 border border-slate-800 text-slate-400 hover:text-white rounded-xl text-xs font-medium transition flex items-center gap-1.5"
+            >
+              <app-icon name="trash-2" className="w-3.5 h-3.5"></app-icon>
+              <span>Clear</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Terminal Body -->
+        <div
+          #consoleContainer
+          class="flex-1 bg-slate-950 font-mono text-xs text-slate-300 p-4 rounded-xl border border-slate-800/80 overflow-y-auto space-y-1.5 mt-4"
+        >
+          <div
+            *ngFor="let log of filteredLogs()"
+            class="console-log flex flex-wrap sm:flex-nowrap items-start gap-x-2.5 gap-y-1 leading-relaxed text-[11px] hover:bg-slate-900/60 p-0.5 rounded transition-colors"
+          >
+            <span class="text-slate-600 text-[10px] shrink-0 pt-0.5 select-none">{{
+              log.time
+            }}</span>
+            <span
+              class="px-1.5 py-0.2 rounded text-[9px] font-bold uppercase tracking-wider shrink-0 select-none"
+              [class]="
+                log.level === 'SUCCESS'
+                  ? 'bg-emerald-950 text-emerald-300 border border-emerald-800'
+                  : log.level === 'ERROR'
+                    ? 'bg-rose-950 text-rose-300 border border-rose-800'
+                    : log.level === 'WARN'
+                      ? 'bg-amber-950 text-amber-300 border border-amber-800'
+                      : 'bg-slate-800 text-sky-300 border border-slate-700'
+              "
+            >
+              {{ log.level }}
+            </span>
+            <span class="text-slate-400 font-semibold shrink-0"
+              >[{{ log.category || 'System' }}]</span
+            >
+            <span class="text-slate-200 flex-1 break-words select-text">{{ log.message }}</span>
+          </div>
+
+          <div
+            *ngIf="filteredLogs().length === 0"
+            class="text-slate-600 italic text-[11px] p-6 text-center"
+          >
+            No recent activity matching filter.
+          </div>
+        </div>
+
+        <!-- Footer -->
+        <div class="pt-3 flex items-center justify-between text-[11px] text-slate-500 font-mono">
+          <span>Showing {{ filteredLogs().length }} log events</span>
+          <span
+            >Live Stream:
+            {{
+              pipelineStatus()?.is_running || automationStatus()?.is_active ? 'Active' : 'Polling'
+            }}</span
+          >
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 5: PROFILE -->
+    <section *ngIf="activeTab() === 'profile'" class="max-w-3xl mx-auto">
+      <div
+        *ngIf="profile()"
+        class="responsive-panel bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 shadow-sm"
+      >
+        <div
+          class="profile-heading flex flex-wrap items-start justify-between gap-3 mb-5 pb-4 border-b border-slate-800"
+        >
+          <div>
+            <h3 class="text-base font-bold text-white flex items-center gap-2">
+              <app-icon name="user" className="w-4 h-4 text-emerald-400"></app-icon>
+              <span>Candidate Autofill Profile</span>
+            </h3>
+            <p class="text-xs text-slate-400 mt-0.5">
+              Customize your contact details, URLs, and automated screening answers.
+            </p>
+          </div>
+          <button
+            (click)="saveProfile()"
+            class="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-semibold transition shadow"
+          >
+            Save Profile
+          </button>
+        </div>
+
+        <div class="space-y-4 text-xs">
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label class="block text-slate-400 mb-1">Full Name</label>
+              <input
+                type="text"
+                [(ngModel)]="profile()!.full_name"
+                class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+              />
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">Email</label>
+              <input
+                type="email"
+                [(ngModel)]="profile()!.email"
+                class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+              />
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label class="block text-slate-400 mb-1">Phone</label>
+              <input
+                type="text"
+                [(ngModel)]="profile()!.phone"
+                class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+              />
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">City</label>
+              <input
+                type="text"
+                [(ngModel)]="profile()!.city"
+                class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+              />
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label class="block text-slate-400 mb-1">LinkedIn URL</label>
+              <input
+                type="text"
+                [(ngModel)]="profile()!.linkedin_url"
+                class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+              />
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">GitHub URL</label>
+              <input
+                type="text"
+                [(ngModel)]="profile()!.github_url"
+                class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+              />
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label class="block text-slate-400 mb-1">Current Company</label>
+              <input
+                type="text"
+                [(ngModel)]="profile()!.current_company"
+                class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+              />
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">Current Title</label>
+              <input
+                type="text"
+                [(ngModel)]="profile()!.current_title"
+                class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+              />
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label class="block text-slate-400 mb-1">Notice Period</label>
+              <input
+                type="text"
+                [(ngModel)]="profile()!.notice_period"
+                class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+              />
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">Salary Expectation</label>
+              <input
+                type="text"
+                [(ngModel)]="profile()!.salary_expectation"
+                class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white focus:outline-none"
+              />
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- SIDE-BY-SIDE REVIEW MODAL -->
+  <div
+    *ngIf="selectedApp()"
+    class="modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-0 sm:p-4 bg-slate-950/80 backdrop-blur-md"
+  >
+    <div
+      class="review-dialog bg-slate-900 border border-slate-800 w-full max-w-6xl h-[100dvh] sm:h-auto sm:max-h-[92dvh] rounded-none sm:rounded-3xl overflow-hidden shadow-2xl flex flex-col"
+    >
+      <!-- Modal Header -->
+      <div
+        class="modal-header p-3 sm:p-5 border-b border-slate-800 flex items-start sm:items-center justify-between gap-3"
+      >
+        <div>
+          <h3 class="text-base font-bold text-white flex items-center gap-2">
+            <span>{{ selectedApp()?.company }}</span> —
+            <span class="text-slate-400">{{ selectedApp()?.title }}</span>
+          </h3>
+          <a
+            [href]="selectedApp()?.job_url"
+            target="_blank"
+            class="text-xs text-emerald-400 hover:underline flex items-center gap-1 truncate block max-w-xl mt-0.5"
+          >
+            <span class="truncate">{{ selectedApp()?.job_url }}</span>
+            <app-icon name="external-link" className="w-3 h-3 shrink-0"></app-icon>
+          </a>
+        </div>
+        <div class="flex items-center gap-2">
+          <button
+            (click)="applyForJob(selectedApp()!.id, 'assisted')"
+            class="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold transition shadow flex items-center gap-1.5"
+          >
+            <app-icon name="zap" className="w-3.5 h-3.5 fill-white"></app-icon>
+            <span class="modal-action-label">Auto-Apply Now</span>
+          </button>
+          <button
+            (click)="closeReviewModal()"
+            class="p-2 text-slate-400 hover:text-white rounded-xl hover:bg-slate-800 transition"
+          >
+            <app-icon name="x" className="w-5 h-5"></app-icon>
+          </button>
+        </div>
+      </div>
+
+      <!-- Modal Body -->
+      <div
+        class="review-body flex-1 grid grid-cols-1 lg:grid-cols-2 gap-3 sm:gap-6 p-3 sm:p-6 overflow-y-auto"
+      >
+        <!-- Left: PDF Preview -->
+        <div
+          class="pdf-panel flex flex-col h-[60dvh] sm:h-[600px] border border-slate-800 rounded-2xl overflow-hidden bg-slate-950"
+        >
+          <div
+            class="p-3 bg-slate-900 border-b border-slate-800 flex items-center justify-between text-xs"
+          >
+            <span class="font-semibold text-slate-300">📄 Tailored Resume PDF Preview</span>
+            <div class="flex items-center gap-2">
+              <button
+                (click)="retriggerCvGeneration(selectedApp()!.id)"
+                [disabled]="isRegeneratingCv()[selectedApp()!.id]"
+                class="px-2.5 py-1 bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/30 rounded-lg text-xs font-semibold transition flex items-center gap-1.5"
+                title="Re-tailor resume and generate a fresh PDF using Gemini 3.8-Flash"
+              >
+                <app-icon
+                  name="refresh-cw"
+                  className="w-3 h-3"
+                  [class.animate-spin]="isRegeneratingCv()[selectedApp()!.id]"
+                ></app-icon>
+                <span>{{
+                  isRegeneratingCv()[selectedApp()!.id]
+                    ? 'Generating...'
+                    : selectedApp()?.cv_pdf_url
+                      ? 'Regenerate CV'
+                      : 'Generate CV Now'
+                }}</span>
+              </button>
+              <a
+                *ngIf="selectedApp()?.cv_pdf_url"
+                [href]="selectedApp()?.cv_pdf_url"
+                target="_blank"
+                class="text-emerald-400 hover:underline font-mono flex items-center gap-1 text-[11px]"
+              >
+                <span>Open in new tab</span>
+                <app-icon name="external-link" className="w-3 h-3"></app-icon>
+              </a>
+            </div>
+          </div>
+          <iframe
+            *ngIf="selectedApp()?.cv_pdf_url"
+            [src]="selectedApp()?.cv_pdf_url"
+            class="w-full h-full border-none"
+          ></iframe>
+          <div
+            *ngIf="!selectedApp()?.cv_pdf_url"
+            class="flex-1 flex flex-col items-center justify-center p-6 text-center space-y-3"
+          >
+            <span class="text-4xl">📄</span>
+            <p class="text-sm font-semibold text-slate-300">No CV PDF generated yet</p>
+            <p class="text-xs text-slate-500 max-w-sm">
+              The application package does not have a compiled PDF resume. Click below to analyze
+              the job description and generate a tailored resume with Gemini 3.8-Flash.
+            </p>
+            <button
+              (click)="retriggerCvGeneration(selectedApp()!.id)"
+              [disabled]="isRegeneratingCv()[selectedApp()!.id]"
+              class="px-4 py-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white rounded-xl text-xs font-bold transition shadow flex items-center gap-2"
+            >
+              <app-icon name="zap" className="w-3.5 h-3.5 fill-white"></app-icon>
+              <span>{{
+                isRegeneratingCv()[selectedApp()!.id]
+                  ? 'Generating CV...'
+                  : '⚡ Generate Tailored CV'
+              }}</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Right: Cover Letter & Bookmarklet -->
+        <div class="letter-panel flex flex-col h-[70dvh] sm:h-[600px] space-y-4">
+          <!-- Cover Letter -->
+          <div
+            class="flex-1 flex flex-col border border-slate-800 rounded-2xl overflow-hidden bg-slate-950"
+          >
+            <div
+              class="p-3 bg-slate-900 border-b border-slate-800 flex items-center justify-between text-xs"
+            >
+              <span class="font-semibold text-slate-300 flex items-center gap-1.5">
+                <app-icon name="mail" className="w-3.5 h-3.5 text-cyan-400"></app-icon>
+                <span>Tailored Cover Letter</span>
+              </span>
+              <div class="space-x-2">
+                <button
+                  (click)="copyText(selectedApp()?.cover_letter, 'Cover letter copied!')"
+                  class="text-slate-300 hover:text-white transition"
+                >
+                  Copy
+                </button>
+                <button
+                  (click)="saveCoverLetter()"
+                  class="text-emerald-400 hover:text-emerald-300 font-semibold transition"
+                >
+                  Save
+                </button>
+              </div>
+            </div>
+            <textarea
+              [(ngModel)]="selectedApp()!.cover_letter"
+              class="flex-1 p-4 bg-slate-950 text-slate-300 font-mono text-xs leading-relaxed focus:outline-none resize-none"
+            ></textarea>
+          </div>
+
+          <!-- Bookmarklet Box -->
+          <div class="p-4 bg-slate-950 border border-slate-800 rounded-2xl">
+            <div
+              class="bookmark-heading flex flex-wrap items-center justify-between gap-2 mb-2 text-xs"
+            >
+              <span class="font-bold text-slate-200 flex items-center gap-1.5">
+                <app-icon name="bookmark" className="w-3.5 h-3.5 text-amber-400"></app-icon>
+                <span>1-Click In-Browser Bookmarklet</span>
+              </span>
+              <div class="flex items-center gap-2">
+                <a
+                  [href]="selectedApp()?.bookmarklet"
+                  (click)="
+                    $event.preventDefault();
+                    copyText(
+                      selectedApp()?.bookmarklet,
+                      'Bookmarklet copied! Or drag to bookmarks bar.'
+                    )
+                  "
+                  class="px-2.5 py-1 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 rounded-lg border border-amber-500/30 text-xs font-semibold cursor-grab"
+                >
+                  ⚡ Drag to Bookmarks
+                </a>
+                <button
+                  (click)="copyText(selectedApp()?.bookmarklet, 'Bookmarklet copied!')"
+                  class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs transition"
+                >
+                  Copy Code
+                </button>
+              </div>
+            </div>
+            <input
+              type="text"
+              readonly
+              [value]="selectedApp()?.bookmarklet"
+              (click)="copyText(selectedApp()?.bookmarklet, 'Bookmarklet copied!')"
+              class="w-full bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1 text-[10px] font-mono text-slate-400 select-all"
+            />
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- AUTHENTICATION & SESSIONS MODAL -->
+  <div
+    *ngIf="authModalOpen()"
+    class="modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-0 sm:p-4 bg-slate-950/80 backdrop-blur-md"
+  >
+    <div
+      class="auth-dialog bg-slate-900 border border-slate-800 w-full max-w-xl max-h-[100dvh] sm:max-h-[92dvh] rounded-none sm:rounded-3xl overflow-hidden shadow-2xl flex flex-col"
+    >
+      <div
+        class="auth-header p-4 sm:p-6 border-b border-slate-800 flex items-start justify-between gap-3"
+      >
+        <div class="flex items-center space-x-3">
+          <div
+            class="w-10 h-10 rounded-2xl bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-400"
+          >
+            <app-icon name="shield-check" className="w-5 h-5"></app-icon>
+          </div>
+          <div>
+            <h3 class="text-base font-bold text-white">Platform Authentication & Sessions</h3>
+            <p class="text-xs text-slate-400">
+              Log in once to store session tokens in .browser_profile/
+            </p>
+          </div>
+        </div>
+        <button
+          (click)="authModalOpen.set(false)"
+          class="p-2 text-slate-400 hover:text-white rounded-xl hover:bg-slate-800 transition"
+        >
+          <app-icon name="x" className="w-5 h-5"></app-icon>
+        </button>
+      </div>
+
+      <div class="auth-body p-4 sm:p-6 space-y-4 overflow-y-auto">
+        <button
+          (click)="syncDesktopChrome()"
+          [disabled]="isSyncingAuth()"
+          class="w-full py-2.5 bg-gradient-to-r from-teal-700 to-emerald-700 hover:from-teal-600 hover:to-emerald-600 text-white rounded-2xl text-xs font-bold transition shadow flex items-center justify-center gap-2"
+        >
+          <app-icon
+            name="refresh-cw"
+            className="w-3.5 h-3.5"
+            [class.animate-spin]="isSyncingAuth()"
+          ></app-icon>
+          <span>{{
+            isSyncingAuth()
+              ? 'Importing Desktop Sessions...'
+              : '1-Click Sync Sessions from Desktop Chrome'
+          }}</span>
+        </button>
+
+        <div class="space-y-3">
+          <!-- LinkedIn -->
+          <div
+            class="auth-provider p-4 rounded-2xl bg-slate-950/60 border border-slate-800 flex flex-wrap items-center justify-between gap-3"
+          >
+            <div class="flex items-center space-x-3">
+              <div
+                class="w-9 h-9 rounded-xl bg-blue-500/20 border border-blue-500/30 flex items-center justify-center text-blue-400 font-bold text-xs"
+              >
+                LI
+              </div>
+              <div>
+                <div class="flex items-center space-x-2">
+                  <h4 class="text-sm font-semibold text-white">LinkedIn</h4>
+                  <span
+                    class="px-1.5 py-0.2 rounded text-[10px] font-bold"
+                    [class]="
+                      authStatus()?.platforms?.['linkedin']?.status === 'logged_in'
+                        ? 'bg-emerald-950 text-emerald-300 border border-emerald-800'
+                        : 'bg-slate-800 text-slate-400 border border-slate-700'
+                    "
+                  >
+                    {{
+                      authStatus()?.platforms?.['linkedin']?.status === 'logged_in'
+                        ? 'Connected'
+                        : 'Not Connected'
+                    }}
+                  </span>
+                </div>
+                <p class="text-xs text-slate-400">Required for LinkedIn Easy Apply</p>
+              </div>
+            </div>
+            <button
+              (click)="launchPlatformLogin('linkedin')"
+              [disabled]="launchingPlatform() === 'linkedin'"
+              class="px-3.5 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded-xl text-xs font-semibold transition"
+            >
+              {{ launchingPlatform() === 'linkedin' ? 'Opening...' : 'Connect / Log In' }}
+            </button>
+          </div>
+
+          <!-- BestJobs -->
+          <div
+            class="auth-provider p-4 rounded-2xl bg-slate-950/60 border border-slate-800 flex flex-wrap items-center justify-between gap-3"
+          >
+            <div class="flex items-center space-x-3">
+              <div
+                class="w-9 h-9 rounded-xl bg-emerald-500/20 border border-emerald-500/30 flex items-center justify-center text-emerald-400 font-bold text-xs"
+              >
+                BJ
+              </div>
+              <div>
+                <div class="flex items-center space-x-2">
+                  <h4 class="text-sm font-semibold text-white">BestJobs</h4>
+                  <span
+                    class="px-1.5 py-0.2 rounded text-[10px] font-bold"
+                    [class]="
+                      authStatus()?.platforms?.['bestjobs']?.status === 'logged_in'
+                        ? 'bg-emerald-950 text-emerald-300 border border-emerald-800'
+                        : 'bg-slate-800 text-slate-400 border border-slate-700'
+                    "
+                  >
+                    {{
+                      authStatus()?.platforms?.['bestjobs']?.status === 'logged_in'
+                        ? 'Connected'
+                        : 'Not Connected'
+                    }}
+                  </span>
+                </div>
+                <p class="text-xs text-slate-400">Required for direct BestJobs applications</p>
+              </div>
+            </div>
+            <button
+              (click)="launchPlatformLogin('bestjobs')"
+              [disabled]="launchingPlatform() === 'bestjobs'"
+              class="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-xl text-xs font-semibold transition"
+            >
+              {{ launchingPlatform() === 'bestjobs' ? 'Opening...' : 'Connect / Log In' }}
+            </button>
+          </div>
+
+          <!-- Google -->
+          <div
+            class="auth-provider p-4 rounded-2xl bg-slate-950/60 border border-slate-800 flex flex-wrap items-center justify-between gap-3"
+          >
+            <div class="flex items-center space-x-3">
+              <div
+                class="w-9 h-9 rounded-xl bg-rose-500/20 border border-rose-500/30 flex items-center justify-center text-rose-400 font-bold text-xs"
+              >
+                G
+              </div>
+              <div>
+                <div class="flex items-center space-x-2">
+                  <h4 class="text-sm font-semibold text-white">Google Account</h4>
+                  <span
+                    class="px-1.5 py-0.2 rounded text-[10px] font-bold"
+                    [class]="
+                      authStatus()?.platforms?.['google']?.status === 'logged_in'
+                        ? 'bg-emerald-950 text-emerald-300 border border-emerald-800'
+                        : 'bg-slate-800 text-slate-400 border border-slate-700'
+                    "
+                  >
+                    {{
+                      authStatus()?.platforms?.['google']?.status === 'logged_in'
+                        ? 'Connected'
+                        : 'Not Connected'
+                    }}
+                  </span>
+                </div>
+                <p class="text-xs text-slate-400">For 1-Click Sign in with Google on ATSs</p>
+              </div>
+            </div>
+            <button
+              (click)="launchPlatformLogin('google')"
+              [disabled]="launchingPlatform() === 'google'"
+              class="px-3.5 py-1.5 bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white rounded-xl text-xs font-semibold transition"
+            >
+              {{ launchingPlatform() === 'google' ? 'Opening...' : 'Connect / Log In' }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- DIAGNOSTICS MODAL -->
+  <div
+    *ngIf="diagModalOpen()"
+    class="modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-0 sm:p-4 bg-slate-950/80 backdrop-blur-md"
+  >
+    <div
+      class="diagnostics-dialog bg-slate-900 border border-slate-800 w-full max-w-4xl h-[100dvh] sm:h-auto sm:max-h-[90dvh] rounded-none sm:rounded-3xl overflow-hidden shadow-2xl flex flex-col"
+    >
+      <div class="p-4 sm:px-6 border-b border-slate-800 flex items-center justify-between gap-3">
+        <h3 class="text-base font-bold text-white flex items-center gap-2">
+          <app-icon name="alert-triangle" className="w-4 h-4 text-rose-400"></app-icon>
+          <span>Application Diagnostics</span>
+        </h3>
+        <button
+          (click)="diagModalOpen.set(false)"
+          class="p-2 text-slate-400 hover:text-white rounded-xl hover:bg-slate-800 transition"
+        >
+          <app-icon name="x" className="w-5 h-5"></app-icon>
+        </button>
+      </div>
+      <div class="p-3 sm:p-6 overflow-y-auto space-y-4 text-xs">
+        <pre
+          class="bg-slate-950 p-4 rounded-xl font-mono text-slate-300 overflow-x-auto border border-slate-800"
+          >{{ diagData() | json }}</pre>
+      </div>
+    </div>
+  </div>
+</div>
