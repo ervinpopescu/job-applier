@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dynamic_resume_builder"
+version = "0.1.0"
+description = "A tool to dynamically generate and tailor resumes for job applications."
+authors = [
+    { name = "ervinpopescu" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "fpdf",
+    "google-genai",
+    "python-dotenv",
+    "python-jobspy>=0.31.0",
+    "pandas>=2.3.3",
+    "playwright>=1.62.0",
+    "pyperclip>=1.11.0",
+    "fastapi>=0.141.1",
+    "uvicorn>=0.52.4",
+    "jinja2>=3.1.6",
+    "python-multipart>=0.0.32",
+    "playwright-stealth>=2.0.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "python-jobspy"
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q"
+testpaths = [
+    "tests",
+]
+pythonpath = [
+    "src",
+]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.6.0",
+    "ruff>=0.15.0",
+]
