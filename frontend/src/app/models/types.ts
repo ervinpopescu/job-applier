@@ -126,3 +126,126 @@ export interface AuthStatusReport {
   profile_dir: string;
   platforms: Record<string, PlatformInfo>;
 }
+
+export type ResourceStateStatus = 'idle' | 'loading' | 'ready' | 'error';
+
+export type ResourceKey =
+  'stats' | 'applications' | 'tracker' | 'profile' | 'auth' | 'pipeline' | 'automation';
+
+export interface ClassifiedError {
+  category: 'network' | 'auth' | 'routing' | 'server' | 'client';
+  status: number;
+  title: string;
+  message: string;
+  help?: string;
+  rawMessage?: string;
+}
+
+export interface ResourceState {
+  status: ResourceStateStatus;
+  error: ClassifiedError | null;
+  lastSuccess: Date | null;
+}
+
+export interface ToastNotification {
+  visible: boolean;
+  message: string;
+  type: 'success' | 'error' | 'info' | 'warning';
+}
+
+export interface ImportReport {
+  imported_applications: number;
+  imported_applied: number;
+  merged_db_records: number;
+  manifest?: Record<string, unknown>;
+}
+
+export function classifyHttpError(err: unknown, endpoint = ''): ClassifiedError {
+  const errorObj = err as {
+    status?: number;
+    error?: { detail?: string; message?: string };
+    message?: string;
+  };
+  const status = typeof errorObj?.status === 'number' ? errorObj.status : 0;
+  let detail = '';
+
+  if (typeof errorObj?.error?.detail === 'string') {
+    detail = errorObj.error.detail;
+  } else if (typeof errorObj?.error?.message === 'string') {
+    detail = errorObj.error.message;
+  } else if (
+    typeof errorObj?.message === 'string' &&
+    !errorObj.message.includes('Http failure response')
+  ) {
+    detail = errorObj.message;
+  }
+
+  // Sanitize: never expose raw HTML responses, doctypes, or tracebacks
+  const detailLower = detail.toLowerCase();
+  if (
+    detailLower.includes('<html') ||
+    detailLower.includes('<!doctype') ||
+    detailLower.includes('traceback')
+  ) {
+    detail = '';
+  }
+
+  if (status === 0) {
+    return {
+      category: 'network',
+      status: 0,
+      title: 'Backend Unreachable',
+      message:
+        'Cannot connect to the server. Check your network or ensure the backend service is running.',
+      rawMessage: detail,
+    };
+  }
+
+  if (status === 401 || status === 403) {
+    return {
+      category: 'auth',
+      status,
+      title: 'Access Denied',
+      message: detail || 'Authentication or proxy permission is required to access this resource.',
+      rawMessage: detail,
+    };
+  }
+
+  if (status === 404) {
+    const isSubpath =
+      typeof document !== 'undefined' &&
+      typeof window !== 'undefined' &&
+      Boolean(document.baseURI && document.baseURI !== window.location.origin + '/');
+
+    return {
+      category: 'routing',
+      status: 404,
+      title: 'Endpoint Not Found (404)',
+      message: isSubpath
+        ? 'The backend endpoint was not found. If running behind a reverse proxy subpath (e.g. /job-applier/), verify that API requests are routed correctly.'
+        : detail || 'The requested resource was not found on the server.',
+      help: isSubpath
+        ? `Reverse proxy routing check recommended${endpoint ? ` for ${endpoint}` : ''}`
+        : undefined,
+      rawMessage: detail,
+    };
+  }
+
+  if (status >= 500) {
+    return {
+      category: 'server',
+      status,
+      title: `Server Error (${status})`,
+      message: detail || 'An internal server error occurred on the backend. Check service logs.',
+      rawMessage: detail,
+    };
+  }
+
+  return {
+    category: 'client',
+    status,
+    title: `Request Failed (${status})`,
+    message: detail || 'The request could not be completed.',
+    rawMessage: detail,
+  };
+}
