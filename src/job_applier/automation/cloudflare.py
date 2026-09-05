@@ -1,111 +1,13 @@
 from __future__ import annotations
 
-import os
 import re
-import shutil
-import subprocess
-import sys
 import time
 from typing import Any
 
-
-class VirtualDisplayManager:
-    """Manages an in-process Xvfb virtual display on Linux for headed stealth browsing."""
-
-    _process: subprocess.Popen[Any] | None = None
-    _display_num: int = 99
-
-    @classmethod
-    def ensure_display(cls) -> str | None:
-        """
-        Returns active display if set.
-        If running headless on Linux and Xvfb is available, starts Xvfb and sets $DISPLAY.
-        """
-        existing = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
-        if existing:
-            return existing
-
-        # Probe for active graphical displays (such as user desktop on :20 or :0)
-        for cand in [":20", ":0", ":1"]:
-            if shutil.which("xdpyinfo"):
-                try:
-                    res = subprocess.run(
-                        ["xdpyinfo", "-display", cand],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=1,
-                        check=False,
-                    )
-                    if res.returncode == 0:
-                        os.environ["DISPLAY"] = cand
-                        return cand
-                except Exception:
-                    pass
-
-        if not sys.platform.startswith("linux") or not shutil.which("Xvfb"):
-            return None
-
-        display = f":{cls._display_num}"
-
-        # If Xvfb is already running on this display, reuse it
-        try:
-            res = subprocess.run(
-                ["Xvfb", display, "-help"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=1,
-                check=False,
-            )
-            if res.returncode == 0:
-                os.environ["DISPLAY"] = display
-                return display
-        except (subprocess.SubprocessError, OSError):
-            # Display probe is best-effort
-            pass
-
-        if cls._process is None or cls._process.poll() is not None:
-            try:
-                cls._process = subprocess.Popen(
-                    [
-                        "Xvfb",
-                        display,
-                        "-screen",
-                        "0",
-                        "1920x1080x24",
-                        "-nolisten",
-                        "tcp",
-                        "-ac",
-                    ],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                time.sleep(0.5)
-                os.environ["DISPLAY"] = display
-                print(
-                    f"🛡️ Started virtual Xvfb display on {display} for headed stealth browsing."
-                )
-                return display
-            except Exception as e:
-                print(f"Notice: Could not start Xvfb: {e}")
-                return None
-
-        os.environ["DISPLAY"] = display
-        return display
-
-    @classmethod
-    def stop(cls) -> None:
-        """Terminates the virtual Xvfb process if managed by this instance."""
-        if cls._process is not None and cls._process.poll() is None:
-            try:
-                cls._process.terminate()
-                cls._process.wait(timeout=2)
-            except Exception:
-                try:
-                    cls._process.kill()
-                except Exception:
-                    pass
-            finally:
-                cls._process = None
+from job_applier.automation.browser_runtime import (
+    VirtualDisplayManager as VirtualDisplayManager,
+    is_display_available as is_display_available,
+)
 
 
 def extract_ray_id(page: Any) -> str:
