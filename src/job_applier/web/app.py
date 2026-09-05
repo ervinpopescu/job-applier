@@ -10,11 +10,21 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    FastAPI,
+    File,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.middleware.sessions import SessionMiddleware
 
 from job_applier.automation.autofill_script import (  # type: ignore[import-not-found]
     save_autofill_assets,
@@ -45,26 +55,14 @@ from job_applier.tracker import (  # type: ignore[import-not-found]
     record_application,
 )
 from job_applier.utils import get_project_root, parse_app_folder_info
+from job_applier.web.auth import (
+    DashboardAuthConfig,
+    DashboardAuthMiddleware,
+    create_auth_router,
+    create_oauth,
+)
 
 load_dotenv()
-
-app = FastAPI(
-    title="Job Applier Web Dashboard",
-    description="Unified Web App for Scraping, AI Tailoring, and Automated Job Application",
-    version="1.0.0",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:8000",
-        "http://127.0.0.1:8000",
-        "http://localhost:3000",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 project_root = get_project_root()
 output_apps_dir = project_root / "output" / "applications"
@@ -72,17 +70,7 @@ output_applied_dir = project_root / "output" / "applied"
 output_apps_dir.mkdir(parents=True, exist_ok=True)
 output_applied_dir.mkdir(parents=True, exist_ok=True)
 
-# Mount files directories
-app.mount(
-    "/files/applications",
-    StaticFiles(directory=str(output_apps_dir)),
-    name="applications_files",
-)
-app.mount(
-    "/files/applied",
-    StaticFiles(directory=str(output_applied_dir)),
-    name="applied_files",
-)
+api_router = APIRouter()
 
 # Global pipeline run state
 PIPELINE_STATE = {
@@ -237,13 +225,16 @@ def get_safe_app_folder(app_id: str) -> Path:
     return folder
 
 
-@app.get("/api/health", include_in_schema=False)
+@api_router.get("/api/health", include_in_schema=False)
+@api_router.get("/job-applier/api/health", include_in_schema=False)
 def get_health() -> dict[str, str]:
     """Returns a lightweight liveness response for containers and load balancers."""
     return {"status": "ok", "service": "job-applier"}
 
 
-@app.get("/", response_class=HTMLResponse)
+@api_router.get("/", response_class=HTMLResponse)
+@api_router.get("/job-applier", response_class=HTMLResponse)
+@api_router.get("/job-applier/", response_class=HTMLResponse)
 def get_dashboard() -> HTMLResponse:
     """Renders the main single-page web dashboard (prefers compiled Angular SPA if built)."""
     angular_dist = (
@@ -270,7 +261,7 @@ def get_dashboard() -> HTMLResponse:
         ) from e
 
 
-@app.get("/favicon.ico", include_in_schema=False)
+@api_router.get("/favicon.ico", include_in_schema=False)
 def get_favicon_ico() -> FileResponse:
     ico_path = (project_root / "frontend" / "public" / "favicon.ico").resolve()
     if ico_path.is_file():
@@ -278,7 +269,7 @@ def get_favicon_ico() -> FileResponse:
     raise HTTPException(status_code=404, detail="Favicon not found")
 
 
-@app.get("/favicon.svg", include_in_schema=False)
+@api_router.get("/favicon.svg", include_in_schema=False)
 def get_favicon_svg() -> FileResponse:
     svg_path = (project_root / "frontend" / "public" / "favicon.svg").resolve()
     if svg_path.is_file():
@@ -286,7 +277,7 @@ def get_favicon_svg() -> FileResponse:
     raise HTTPException(status_code=404, detail="Favicon not found")
 
 
-@app.get("/api/stats")
+@api_router.get("/api/stats")
 def get_stats() -> dict[str, Any]:
     """Returns aggregated pipeline and application metrics."""
     tracker_stats = get_tracker_stats()
@@ -309,7 +300,7 @@ def get_stats() -> dict[str, Any]:
     }
 
 
-@app.get("/api/applications")
+@api_router.get("/api/applications")
 def list_applications(
     search: str | None = Query(None, description="Search keyword"),
     limit: int = Query(50, ge=1, le=500),
@@ -363,7 +354,7 @@ def list_applications(
     }
 
 
-@app.get("/api/applications/{app_id}")
+@api_router.get("/api/applications/{app_id}")
 def get_application(app_id: str) -> dict[str, Any]:
     """Retrieves full details and file contents for a specific pending application."""
     app_folder = get_safe_app_folder(app_id)
@@ -430,7 +421,7 @@ def get_application(app_id: str) -> dict[str, Any]:
     }
 
 
-@app.post("/api/applications/{app_id}/update-cover-letter")
+@api_router.post("/api/applications/{app_id}/update-cover-letter")
 def update_cover_letter(app_id: str, body: CoverLetterUpdate) -> dict[str, str]:
     """Updates the cover letter text for an application."""
     app_folder = get_safe_app_folder(app_id)
@@ -450,7 +441,7 @@ def update_cover_letter(app_id: str, body: CoverLetterUpdate) -> dict[str, str]:
         ) from e
 
 
-@app.post("/api/applications/{app_id}/regenerate-cv")
+@api_router.post("/api/applications/{app_id}/regenerate-cv")
 def regenerate_application_cv(app_id: str) -> dict[str, Any]:
     """Re-triggers AI resume tailoring and PDF generation for an application package."""
     import requests
@@ -563,7 +554,7 @@ def regenerate_application_cv(app_id: str) -> dict[str, Any]:
     }
 
 
-@app.post("/api/applications/{app_id}/apply")
+@api_router.post("/api/applications/{app_id}/apply")
 def run_auto_apply_for_job(
     app_id: str,
     body: ApplyRequest,
@@ -674,7 +665,7 @@ def run_auto_apply_for_job(
     }
 
 
-@app.post("/api/applications/{app_id}/mark-done")
+@api_router.post("/api/applications/{app_id}/mark-done")
 def mark_application_done(app_id: str) -> dict[str, str]:
     """Moves application folder to applied and records status in tracker."""
     app_folder = get_safe_app_folder(app_id)
@@ -699,7 +690,7 @@ def mark_application_done(app_id: str) -> dict[str, str]:
         ) from e
 
 
-@app.delete("/api/applications/{app_id}")
+@api_router.delete("/api/applications/{app_id}")
 def delete_application(app_id: str) -> dict[str, str]:
     """Deletes or dismisses a pending application."""
     app_folder = get_safe_app_folder(app_id)
@@ -713,7 +704,7 @@ def delete_application(app_id: str) -> dict[str, str]:
         ) from e
 
 
-@app.post("/api/applications/cleanup")
+@api_router.post("/api/applications/cleanup")
 def cleanup_applications(body: CleanupRequest) -> dict[str, Any]:
     """Archives and cleans up old pending applications from output/applications/."""
     if not output_apps_dir.exists():
@@ -758,7 +749,7 @@ def cleanup_applications(body: CleanupRequest) -> dict[str, Any]:
     }
 
 
-@app.post("/api/applications/clear-failed")
+@api_router.post("/api/applications/clear-failed")
 def clear_failed_applications() -> dict[str, Any]:
     """Removes all application packages that failed submission from the queue and tracker CSV."""
     if not output_apps_dir.exists():
@@ -849,7 +840,7 @@ def clear_failed_applications() -> dict[str, Any]:
     }
 
 
-@app.post("/api/applications/prune-inactive")
+@api_router.post("/api/applications/prune-inactive")
 def prune_inactive_applications() -> dict[str, Any]:
     """Scans all queued applications, verifies live active status, and removes expired/closed jobs."""
     from job_applier.scrapers.activity_checker import is_job_active
@@ -898,7 +889,7 @@ def prune_inactive_applications() -> dict[str, Any]:
     }
 
 
-@app.post("/api/applications/prune-by-region")
+@api_router.post("/api/applications/prune-by-region")
 def prune_by_region(body: PruneRegionRequest) -> dict[str, Any]:
     """Prunes queued applications that do not match the specified region or country scope."""
     from job_applier.scrapers.region_config import RegionScope
@@ -981,7 +972,7 @@ def prune_by_region(body: PruneRegionRequest) -> dict[str, Any]:
     }
 
 
-@app.post("/api/applications/prune-duplicates")
+@api_router.post("/api/applications/prune-duplicates")
 def prune_duplicates_endpoint() -> dict[str, Any]:
     """Scans pending applications and removes duplicate packages matching canonical URLs or identical roles."""
     from job_applier.dedup import prune_duplicate_applications
@@ -989,7 +980,7 @@ def prune_duplicates_endpoint() -> dict[str, Any]:
     return prune_duplicate_applications()
 
 
-@app.get("/api/automation/status")
+@api_router.get("/api/automation/status")
 def get_automation_status() -> dict[str, Any]:
     """Returns real-time browser automation HUD monitoring status."""
     from job_applier.automation.browser_automator import get_active_automator
@@ -1010,7 +1001,7 @@ def get_automation_status() -> dict[str, Any]:
     return state
 
 
-@app.post("/api/automation/submit-code")
+@api_router.post("/api/automation/submit-code")
 def submit_verification_code(body: SubmitCodeRequest) -> dict[str, Any]:
     """Submits a 2FA or email verification code to the active browser automation session."""
     from job_applier.automation.browser_automator import get_active_automator
@@ -1029,7 +1020,7 @@ def submit_verification_code(body: SubmitCodeRequest) -> dict[str, Any]:
     }
 
 
-@app.get("/api/auth/status")
+@api_router.get("/api/auth/status")
 def get_auth_status() -> dict[str, Any]:
     """Returns platform authentication status for LinkedIn, BestJobs, eJobs, and Google."""
     from job_applier.automation.auth_manager import AuthManager
@@ -1038,7 +1029,7 @@ def get_auth_status() -> dict[str, Any]:
     return manager.check_auth_status()
 
 
-@app.post("/api/auth/login")
+@api_router.post("/api/auth/login")
 def launch_auth_login(
     body: AuthLoginRequest, background_tasks: BackgroundTasks
 ) -> dict[str, Any]:
@@ -1066,7 +1057,7 @@ def launch_auth_login(
     }
 
 
-@app.post("/api/auth/sync-chrome")
+@api_router.post("/api/auth/sync-chrome")
 def sync_chrome_cookies() -> dict[str, Any]:
     """Syncs existing authenticated sessions from desktop Chrome into the persistent profile."""
     from job_applier.automation.auth_manager import AuthManager
@@ -1075,7 +1066,7 @@ def sync_chrome_cookies() -> dict[str, Any]:
     return manager.sync_desktop_cookies()
 
 
-@app.get("/api/applications/{app_id}/diagnostics")
+@api_router.get("/api/applications/{app_id}/diagnostics")
 def get_application_diagnostics(app_id: str) -> dict[str, Any]:
     """Retrieves full diagnostic logs, failure screenshots, and DOM inspection for an application."""
     safe_name = Path(app_id).name
@@ -1132,7 +1123,7 @@ def get_application_diagnostics(app_id: str) -> dict[str, Any]:
     }
 
 
-@app.post("/api/batch-apply")
+@api_router.post("/api/batch-apply")
 def batch_apply(
     body: BatchApplyRequest, background_tasks: BackgroundTasks
 ) -> dict[str, Any]:
@@ -1195,7 +1186,7 @@ def batch_apply(
     }
 
 
-@app.get("/api/tracker")
+@api_router.get("/api/tracker")
 def get_tracker_data(status: str | None = Query(None)) -> dict[str, Any]:
     """Returns applications from the tracker CSV with optional status filtering and folders in applied/."""
     df = load_tracker()
@@ -1262,7 +1253,7 @@ def get_tracker_data(status: str | None = Query(None)) -> dict[str, Any]:
     }
 
 
-@app.post("/api/tracker/update-status")
+@api_router.post("/api/tracker/update-status")
 def update_tracker_job_status(body: StatusUpdateRequest) -> dict[str, str]:
     """Updates status for a tracked job (e.g. interviewing, offered, rejected)."""
     record_application(
@@ -1275,7 +1266,7 @@ def update_tracker_job_status(body: StatusUpdateRequest) -> dict[str, str]:
     return {"status": "success", "message": f"Updated {body.job_url} to {body.status}"}
 
 
-@app.get("/api/export")
+@api_router.get("/api/export")
 def export_applications_bundle() -> FileResponse:
     """Creates and downloads a portable .zip backup containing all applications, database mappings, and profile."""
     try:
@@ -1289,7 +1280,7 @@ def export_applications_bundle() -> FileResponse:
         raise HTTPException(status_code=500, detail=f"Export failed: {e}") from e
 
 
-@app.post("/api/import")
+@api_router.post("/api/import")
 def import_applications_bundle(file: UploadFile = File(...)) -> dict[str, Any]:
     """Uploads and merges a portable backup .zip bundle from another machine."""
     if not file.filename or not file.filename.endswith(".zip"):
@@ -1319,7 +1310,7 @@ def import_applications_bundle(file: UploadFile = File(...)) -> dict[str, Any]:
             temp_zip.unlink(missing_ok=True)
 
 
-@app.post("/api/tracker/requeue")
+@api_router.post("/api/tracker/requeue")
 def requeue_application(body: RequeueRequest) -> dict[str, str]:
     """Moves an application from output/applied back to output/applications and updates tracker."""
     found_folder: Path | None = None
@@ -1387,14 +1378,14 @@ def requeue_application(body: RequeueRequest) -> dict[str, str]:
     }
 
 
-@app.get("/api/profile")
+@api_router.get("/api/profile")
 def get_profile() -> dict[str, Any]:
     """Returns candidate profile data."""
     profile = load_candidate_profile()
     return profile.to_dict()
 
 
-@app.post("/api/profile")
+@api_router.post("/api/profile")
 def update_profile(body: dict[str, Any]) -> dict[str, Any]:
     """Updates candidate profile in data/candidate_profile.json preserving unmentioned fields."""
     profile = load_candidate_profile()
@@ -1405,7 +1396,7 @@ def update_profile(body: dict[str, Any]) -> dict[str, Any]:
     return {"status": "success", "profile": profile.to_dict()}
 
 
-@app.post("/api/pipeline/run")
+@api_router.post("/api/pipeline/run")
 def trigger_pipeline(
     body: PipelineRunRequest, background_tasks: BackgroundTasks
 ) -> dict[str, Any]:
@@ -1478,7 +1469,7 @@ def trigger_pipeline(
     }
 
 
-@app.get("/api/pipeline/status")
+@api_router.get("/api/pipeline/status")
 def get_pipeline_status() -> dict[str, Any]:
     """Returns live status and log output of the scraping/tailoring pipeline."""
     state = dict(PIPELINE_STATE)
@@ -1486,18 +1477,143 @@ def get_pipeline_status() -> dict[str, Any]:
     return state
 
 
-@app.post("/api/logs/clear")
+@api_router.post("/api/logs/clear")
 def clear_system_logs() -> dict[str, str]:
     """Clears in-memory log buffer."""
     clear_logs()
     return {"status": "success", "message": "Console logs cleared successfully"}
 
 
-# Mount compiled Angular single-page application if built
-angular_browser_dist = project_root / "frontend" / "dist" / "frontend" / "browser"
-if angular_browser_dist.exists() and (angular_browser_dist / "index.html").exists():
-    app.mount(
-        "/",
-        StaticFiles(directory=str(angular_browser_dist), html=True),
-        name="angular_app",
+@api_router.get("/api/auth/session")
+def get_dashboard_session(request: Request) -> dict[str, Any]:
+    """Returns dashboard authentication state and user identity for session validation."""
+    user = request.session.get("user") if hasattr(request, "session") else None
+    is_authenticated = bool(user and isinstance(user, dict) and user.get("id"))
+    return {
+        "auth_enabled": True,
+        "authenticated": is_authenticated,
+        "user": user if is_authenticated else None,
+    }
+
+
+def create_app(config: DashboardAuthConfig | None = None) -> FastAPI:
+    """Initializes and returns a configured FastAPI application instance."""
+    if config is None:
+        config = DashboardAuthConfig.from_env()
+    config.validate()
+
+    app_instance = FastAPI(
+        title="Job Applier Web Dashboard",
+        description="Unified Web App for Scraping, AI Tailoring, and Automated Job Application",
+        version="1.0.0",
     )
+
+    # Middleware execution in Starlette wraps from outer to inner.
+    # CORSMiddleware -> SessionMiddleware -> DashboardAuthMiddleware -> Route handlers
+    app_instance.add_middleware(
+        DashboardAuthMiddleware,
+        config=config,
+    )
+    app_instance.add_middleware(
+        SessionMiddleware,
+        secret_key=(
+            config.session_secret
+            if config.auth_enabled
+            else "job-applier-fallback-secret-at-least-32chars"
+        ),
+        session_cookie=config.session_cookie_name,
+        max_age=config.session_max_age,
+        same_site=config.session_cookie_same_site,
+        https_only=config.session_cookie_secure,
+    )
+    app_instance.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "http://localhost:8000",
+            "http://127.0.0.1:8000",
+            "http://localhost:3000",
+            "http://localhost:4200",
+        ],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # Include dashboard OAuth router
+    oauth = create_oauth(config)
+    auth_router = create_auth_router(config, oauth)
+    app_instance.include_router(auth_router, prefix="/auth", tags=["dashboard-auth"])
+    app_instance.include_router(
+        auth_router, prefix="/job-applier/auth", tags=["dashboard-auth"]
+    )
+    base_path = config.get_base_path()
+    if base_path and base_path != "/job-applier":
+        app_instance.include_router(
+            auth_router, prefix=f"{base_path}/auth", tags=["dashboard-auth"]
+        )
+
+    # Include core API router at root and subpaths
+    app_instance.include_router(api_router)
+    app_instance.include_router(api_router, prefix="/job-applier")
+    if base_path and base_path != "/job-applier":
+        app_instance.include_router(api_router, prefix=base_path)
+
+    # Mount files directories
+    output_apps_dir.mkdir(parents=True, exist_ok=True)
+    output_applied_dir.mkdir(parents=True, exist_ok=True)
+    app_instance.mount(
+        "/files/applications",
+        StaticFiles(directory=str(output_apps_dir)),
+        name="applications_files",
+    )
+    app_instance.mount(
+        "/files/applied",
+        StaticFiles(directory=str(output_applied_dir)),
+        name="applied_files",
+    )
+    app_instance.mount(
+        "/job-applier/files/applications",
+        StaticFiles(directory=str(output_apps_dir)),
+        name="job_applier_applications_files",
+    )
+    app_instance.mount(
+        "/job-applier/files/applied",
+        StaticFiles(directory=str(output_applied_dir)),
+        name="job_applier_applied_files",
+    )
+    if base_path and base_path != "/job-applier":
+        app_instance.mount(
+            f"{base_path}/files/applications",
+            StaticFiles(directory=str(output_apps_dir)),
+            name="custom_applications_files",
+        )
+        app_instance.mount(
+            f"{base_path}/files/applied",
+            StaticFiles(directory=str(output_applied_dir)),
+            name="custom_applied_files",
+        )
+
+    # Mount compiled Angular single-page application if built
+    angular_browser_dist = project_root / "frontend" / "dist" / "frontend" / "browser"
+    if angular_browser_dist.exists() and (angular_browser_dist / "index.html").exists():
+        app_instance.mount(
+            "/job-applier",
+            StaticFiles(directory=str(angular_browser_dist), html=True),
+            name="job_applier_angular_app",
+        )
+        if base_path and base_path != "/job-applier":
+            app_instance.mount(
+                base_path,
+                StaticFiles(directory=str(angular_browser_dist), html=True),
+                name="custom_angular_app",
+            )
+        app_instance.mount(
+            "/",
+            StaticFiles(directory=str(angular_browser_dist), html=True),
+            name="angular_app",
+        )
+
+    return app_instance
+
+
+app = create_app()
