@@ -16,6 +16,8 @@ import { catchError, tap } from 'rxjs/operators';
 import { IconComponent } from './components/icon.component';
 import { ApiService, resolveFileUrl } from './services/api.service';
 import {
+  type AppAuthState,
+  type AppUser,
   type ApplicationDetail,
   type ApplicationItem,
   type AuthStatusReport,
@@ -59,6 +61,22 @@ export class App implements OnInit, OnDestroy {
   automationStatus = signal<AutomationStatus | null>(null);
   profile = signal<CandidateProfile | null>(null);
   authStatus = signal<AuthStatusReport | null>(null);
+
+  // Dashboard Application Auth
+  appAuthState = signal<AppAuthState>({
+    checked: false,
+    auth_enabled: false,
+    authenticated: false,
+    user: null,
+    providers: { google: false, github: false },
+    error: null,
+  });
+  authErrorMessage = signal<string | null>(null);
+
+  showLoginGate = computed(() => {
+    const state = this.appAuthState();
+    return state.checked && state.auth_enabled && !state.authenticated;
+  });
 
   // Per-Resource State Tracking
   resourceStates = signal<Record<ResourceKey, ResourceState>>({
@@ -223,19 +241,139 @@ export class App implements OnInit, OnDestroy {
   });
 
   ngOnInit() {
-    this.loadInitialData();
-    // Periodic background poll
+    this.checkUrlAuthError();
+    this.checkAppAuth();
+  }
+
+  ngOnDestroy() {
+    this.stopPolling();
+    this.stopCountdownTimer();
+  }
+
+  checkUrlAuthError() {
+    if (typeof window !== 'undefined' && window.location && window.location.search) {
+      try {
+        const params = new URLSearchParams(window.location.search);
+        const authError = params.get('auth_error');
+        if (authError) {
+          this.authErrorMessage.set(this.formatAuthErrorMessage(authError));
+        }
+      } catch {
+        // Safe query parsing fallback
+      }
+    }
+  }
+
+  formatAuthErrorMessage(code: string): string {
+    const safeCode = code.replace(/[^a-zA-Z0-9_\-]/g, '').toLowerCase();
+    const messages: Record<string, string> = {
+      access_denied: 'Access was denied by the OAuth provider.',
+      invalid_state: 'Session state validation failed or expired. Please try signing in again.',
+      missing_email: 'Unable to resolve an email address from your account.',
+      unverified_email: 'Your account email address is not verified by the provider.',
+      unauthorized_user: 'Your account is not authorized to access this dashboard.',
+      provider_error: 'An error occurred while communicating with the OAuth provider.',
+      provider_disabled: 'The requested authentication provider is not configured on this server.',
+      config_error: 'Dashboard authentication is misconfigured.',
+      auth_failed: 'Authentication failed. Please try signing in again.',
+    };
+    return messages[safeCode] || 'Authentication failed. Please try signing in again.';
+  }
+
+  checkAppAuth() {
+    this.api.getAppAuthStatus().subscribe({
+      next: (data) => {
+        this.appAuthState.set({
+          checked: true,
+          auth_enabled: data.auth_enabled,
+          authenticated: data.authenticated,
+          user: data.user,
+          providers: data.providers,
+          error: null,
+        });
+        // Start dashboard loading and background polling only if authenticated or auth disabled
+        if (!data.auth_enabled || data.authenticated) {
+          this.loadInitialData();
+          this.startPolling();
+        }
+      },
+      error: (err) => {
+        const classified = classifyHttpError(err, '/auth/status');
+        this.appAuthState.set({
+          checked: true,
+          auth_enabled: true,
+          authenticated: false,
+          user: null,
+          providers: { google: false, github: false },
+          error: classified,
+        });
+      },
+    });
+  }
+
+  startPolling() {
+    if (this.pollIntervalId) return;
     this.pollIntervalId = setInterval(() => {
       this.refreshPoll();
     }, 2000);
   }
 
-  ngOnDestroy() {
+  stopPolling() {
     if (this.pollIntervalId) {
       clearInterval(this.pollIntervalId);
       this.pollIntervalId = null;
     }
-    this.stopCountdownTimer();
+  }
+
+  loginWithGoogle() {
+    if (typeof window !== 'undefined') {
+      window.location.href = this.api.getGoogleLoginUrl();
+    }
+  }
+
+  loginWithGithub() {
+    if (typeof window !== 'undefined') {
+      window.location.href = this.api.getGithubLoginUrl();
+    }
+  }
+
+  logout() {
+    this.stopPolling();
+    this.api.logout().subscribe({
+      next: () => {
+        this.appAuthState.update((s) => ({
+          ...s,
+          authenticated: false,
+          user: null,
+        }));
+        if (typeof window !== 'undefined') {
+          window.location.href = this.api.getLogoutUrl();
+        }
+      },
+      error: () => {
+        if (typeof window !== 'undefined') {
+          window.location.href = this.api.getLogoutUrl();
+        }
+      },
+    });
+  }
+
+  dismissAuthError() {
+    this.authErrorMessage.set(null);
+    if (typeof window !== 'undefined' && window.history && window.location) {
+      try {
+        const url = new URL(window.location.href);
+        url.searchParams.delete('auth_error');
+        window.history.replaceState({}, '', url.pathname + url.search + url.hash);
+      } catch {
+        // ignore history state failure
+      }
+    }
+  }
+
+  retryAuthStatus() {
+    this.appAuthState.update((s) => ({ ...s, checked: false, error: null }));
+    this.checkAppAuth();
   }
 
   setResourceStatus(

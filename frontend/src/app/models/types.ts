@@ -127,6 +127,36 @@ export interface AuthStatusReport {
   platforms: Record<string, PlatformInfo>;
 }
 
+export interface AppUser {
+  provider: string;
+  id: string;
+  email: string;
+  name: string;
+  username: string;
+  avatar_url?: string;
+}
+
+export interface AppAuthProviders {
+  google: boolean;
+  github: boolean;
+}
+
+export interface AppAuthResponse {
+  auth_enabled: boolean;
+  authenticated: boolean;
+  user: AppUser | null;
+  providers: AppAuthProviders;
+}
+
+export interface AppAuthState {
+  checked: boolean;
+  auth_enabled: boolean;
+  authenticated: boolean;
+  user: AppUser | null;
+  providers: AppAuthProviders;
+  error: ClassifiedError | null;
+}
+
 export type ResourceStateStatus = 'idle' | 'loading' | 'ready' | 'error';
 
 export type ResourceKey =

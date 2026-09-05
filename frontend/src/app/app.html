@@ -37,6 +37,7 @@
 
         <!-- Center: Navigation Tabs -->
         <nav
+          *ngIf="!showLoginGate()"
           class="primary-nav order-3 flex w-full items-center gap-1 overflow-x-auto bg-slate-950/70 p-1 rounded-xl border border-slate-800/80 shadow-inner lg:order-none lg:w-auto lg:gap-1.5 lg:p-1.5"
           aria-label="Dashboard sections"
         >
@@ -169,6 +170,7 @@
 
           <!-- Import -->
           <label
+            *ngIf="!showLoginGate()"
             [class.pointer-events-none]="isImporting()"
             [class.opacity-50]="isImporting()"
             class="px-3 py-1.5 bg-slate-950/70 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-800 hover:border-slate-700 rounded-xl text-xs font-medium flex items-center gap-1.5 transition shadow-sm cursor-pointer"
@@ -188,13 +190,177 @@
               (change)="uploadBackup($event)"
             />
           </label>
+
+          <!-- Authenticated User & Logout -->
+          <div
+            *ngIf="appAuthState().authenticated && appAuthState().user"
+            class="user-controls flex items-center gap-1.5 sm:gap-2 ml-0.5"
+          >
+            <div class="action-divider h-4 w-px bg-slate-800"></div>
+            <div
+              class="user-badge flex items-center gap-1.5 px-2.5 py-1 bg-slate-950/70 border border-slate-800 rounded-xl text-xs text-slate-300 select-none shadow-sm"
+              [title]="
+                'Logged in as ' + (appAuthState().user?.email || appAuthState().user?.username)
+              "
+            >
+              <img
+                *ngIf="appAuthState().user?.avatar_url"
+                [src]="appAuthState().user?.avatar_url"
+                alt="Avatar"
+                class="w-4 h-4 rounded-full object-cover"
+              />
+              <app-icon
+                *ngIf="!appAuthState().user?.avatar_url"
+                name="user"
+                className="w-3.5 h-3.5 text-slate-400"
+              ></app-icon>
+              <span class="max-w-[120px] truncate text-[11px] font-medium hidden md:inline">
+                {{ appAuthState().user?.name || appAuthState().user?.username }}
+              </span>
+            </div>
+
+            <button
+              type="button"
+              (click)="logout()"
+              class="logout-button px-2.5 py-1.5 bg-slate-950/70 hover:bg-rose-950/40 text-slate-400 hover:text-rose-300 border border-slate-800 hover:border-rose-900/50 rounded-xl text-xs font-medium flex items-center gap-1.5 transition shadow-sm"
+              title="Sign out of dashboard"
+            >
+              <app-icon name="log-out" className="w-3.5 h-3.5"></app-icon>
+              <span class="action-label hidden sm:inline">Logout</span>
+            </button>
+          </div>
         </div>
       </div>
     </div>
   </header>
 
+  <!-- Login Gate (when APP_AUTH_ENABLED=true and unauthenticated) -->
+  <div
+    *ngIf="showLoginGate()"
+    class="login-gate flex-1 flex items-center justify-center p-4 sm:p-6 my-auto"
+  >
+    <div
+      class="login-card w-full max-w-md bg-slate-900/90 border border-slate-800/90 rounded-3xl p-6 sm:p-8 shadow-2xl backdrop-blur-md flex flex-col items-center text-center space-y-6"
+    >
+      <!-- Logo & Title -->
+      <div class="flex flex-col items-center space-y-3">
+        <div
+          class="w-14 h-14 rounded-2xl bg-gradient-to-tr from-emerald-600 to-teal-400 flex items-center justify-center shadow-lg shadow-emerald-950/80 ring-1 ring-emerald-400/40"
+        >
+          <app-icon name="zap" className="w-7 h-7 text-white fill-white"></app-icon>
+        </div>
+        <div>
+          <h1
+            class="text-xl sm:text-2xl font-bold tracking-tight text-white flex items-center justify-center gap-2"
+          >
+            JobApplier
+            <span
+              class="text-xs font-semibold px-2 py-0.5 rounded-md bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 font-mono"
+            >
+              NG-21
+            </span>
+          </h1>
+          <p class="text-xs text-slate-400 mt-1">
+            Sign in to access your dashboard, queue, and automation suite.
+          </p>
+        </div>
+      </div>
+
+      <!-- OAuth Error Alert (from query params) -->
+      <div
+        *ngIf="authErrorMessage()"
+        class="auth-error-alert w-full p-3.5 bg-rose-950/50 border border-rose-800/80 rounded-2xl text-left text-xs text-rose-200 flex items-start justify-between gap-2.5 animate-fadeIn"
+      >
+        <div class="flex items-start gap-2">
+          <app-icon
+            name="alert-circle"
+            className="w-4 h-4 text-rose-400 mt-0.5 flex-shrink-0"
+          ></app-icon>
+          <span class="auth-error-text leading-relaxed">{{ authErrorMessage() }}</span>
+        </div>
+        <button
+          type="button"
+          (click)="dismissAuthError()"
+          class="dismiss-error-btn text-rose-400 hover:text-rose-100 p-0.5"
+          title="Dismiss error message"
+        >
+          <app-icon name="x" className="w-3.5 h-3.5"></app-icon>
+        </button>
+      </div>
+
+      <!-- Auth Status Connection Failure Alert -->
+      <div
+        *ngIf="appAuthState().error"
+        class="auth-status-error w-full p-3.5 bg-amber-950/40 border border-amber-800/70 rounded-2xl text-left text-xs text-amber-200 flex flex-col gap-2"
+      >
+        <div class="flex items-start gap-2">
+          <app-icon
+            name="alert-triangle"
+            className="w-4 h-4 text-amber-400 mt-0.5 flex-shrink-0"
+          ></app-icon>
+          <div>
+            <span class="font-semibold block text-amber-300">Connection Failed</span>
+            <span class="text-[11px] text-amber-200/90 leading-relaxed">
+              {{ appAuthState().error?.message || 'Unable to check server authentication status.' }}
+            </span>
+          </div>
+        </div>
+        <button
+          type="button"
+          (click)="retryAuthStatus()"
+          class="retry-auth-btn self-end px-3 py-1 bg-amber-900/50 hover:bg-amber-800/60 text-amber-200 border border-amber-700/60 rounded-lg text-xs font-medium transition"
+        >
+          Retry Connection
+        </button>
+      </div>
+
+      <!-- Provider Buttons -->
+      <div class="providers-container w-full space-y-3 pt-2">
+        <!-- Google Button -->
+        <button
+          *ngIf="appAuthState().providers.google"
+          type="button"
+          (click)="loginWithGoogle()"
+          class="google-login-btn w-full py-3 px-4 bg-slate-950/80 hover:bg-slate-800 text-white font-medium text-xs sm:text-sm rounded-2xl border border-slate-800 hover:border-slate-700 transition flex items-center justify-center gap-3 shadow-sm hover:shadow active:scale-[0.99]"
+        >
+          <app-icon name="google" className="w-4 h-4 text-rose-400"></app-icon>
+          <span>Continue with Google</span>
+        </button>
+
+        <!-- GitHub Button -->
+        <button
+          *ngIf="appAuthState().providers.github"
+          type="button"
+          (click)="loginWithGithub()"
+          class="github-login-btn w-full py-3 px-4 bg-slate-950/80 hover:bg-slate-800 text-white font-medium text-xs sm:text-sm rounded-2xl border border-slate-800 hover:border-slate-700 transition flex items-center justify-center gap-3 shadow-sm hover:shadow active:scale-[0.99]"
+        >
+          <app-icon name="github" className="w-4 h-4 text-slate-200"></app-icon>
+          <span>Continue with GitHub</span>
+        </button>
+
+        <!-- No Providers Warning -->
+        <div
+          *ngIf="
+            !appAuthState().providers.google &&
+            !appAuthState().providers.github &&
+            !appAuthState().error
+          "
+          class="no-providers-warning p-4 bg-slate-950/50 border border-slate-800 rounded-2xl text-xs text-slate-400 text-center"
+        >
+          No OAuth providers are configured on this server. Please configure GOOGLE_CLIENT_ID or
+          GITHUB_CLIENT_ID.
+        </div>
+      </div>
+
+      <div class="text-[11px] text-slate-400 pt-2 border-t border-slate-800/60 w-full">
+        Protected JobApplier Environment &bull; Signed Session Cookies
+      </div>
+    </div>
+  </div>
+
   <!-- Content Area -->
   <main
+    *ngIf="!showLoginGate()"
     class="dashboard-main flex-1 w-full min-w-0 mx-auto p-3 sm:p-6 lg:p-8"
     [ngClass]="activeTab() === 'tracker' ? 'max-w-none' : 'max-w-7xl'"
   >

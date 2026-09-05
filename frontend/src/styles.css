@@ -377,3 +377,12 @@
     transform: translateY(0);
   }
 }
+
+/* Dashboard Login Gate */
+.login-gate {
+  min-height: calc(100vh - 6rem);
+}
+
+.login-card {
+  animation: fadeIn 0.25s ease-out;
+}

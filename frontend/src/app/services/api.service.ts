@@ -2,6 +2,7 @@ import { Injectable, inject } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import type { Observable } from 'rxjs';
 import type {
+  AppAuthResponse,
   ApplicationDetail,
   ApplicationItem,
   AuthStatusReport,
@@ -275,5 +276,25 @@ export class ApiService {
 
   importBackup(formData: FormData): Observable<Record<string, unknown>> {
     return this.http.post<Record<string, unknown>>(this.resolveUrl('/api/import'), formData);
+  }
+
+  getAppAuthStatus(): Observable<AppAuthResponse> {
+    return this.http.get<AppAuthResponse>(this.resolveUrl('/auth/status'));
+  }
+
+  getGoogleLoginUrl(): string {
+    return this.resolveUrl('/auth/login/google');
+  }
+
+  getGithubLoginUrl(): string {
+    return this.resolveUrl('/auth/login/github');
+  }
+
+  logout(): Observable<Record<string, unknown>> {
+    return this.http.post<Record<string, unknown>>(this.resolveUrl('/auth/logout'), {});
+  }
+
+  getLogoutUrl(): string {
+    return this.resolveUrl('/auth/logout');
   }
 }
