@@ -62,6 +62,22 @@ describe('ApiService - URL Resolution', () => {
       expect(resolved).toBe('/job-applier/api/applications?limit=20&offset=10');
     });
 
+    it('resolves auth routes correctly with root and subpath baseURI', () => {
+      expect(resolveApiUrl('/auth/status', 'http://127.0.0.1:8000/')).toBe('/auth/status');
+      expect(resolveApiUrl('/auth/status', 'https://host.example/job-applier/')).toBe(
+        '/job-applier/auth/status',
+      );
+      expect(resolveApiUrl('/auth/login/google', 'https://host.example/job-applier/')).toBe(
+        '/job-applier/auth/login/google',
+      );
+      expect(resolveApiUrl('/auth/login/github', 'https://host.example/job-applier/')).toBe(
+        '/job-applier/auth/login/github',
+      );
+      expect(resolveApiUrl('/auth/logout', 'https://host.example/job-applier/')).toBe(
+        '/job-applier/auth/logout',
+      );
+    });
+
     it('returns empty string for empty input', () => {
       expect(resolveApiUrl('')).toBe('');
     });
@@ -112,5 +128,37 @@ describe('ApiService - HTTP Requests', () => {
     expect(req.request.method).toBe('POST');
     req.flush({ status: 'success', imported_applications: 3 });
     httpMock.verify();
+  });
+
+  it('getAppAuthStatus requests resolved /auth/status endpoint', () => {
+    service.getAppAuthStatus().subscribe((res) => {
+      expect(res.auth_enabled).toBe(true);
+      expect(res.authenticated).toBe(false);
+    });
+    const req = httpMock.expectOne((r) => r.url.endsWith('/auth/status'));
+    expect(req.request.method).toBe('GET');
+    req.flush({
+      auth_enabled: true,
+      authenticated: false,
+      user: null,
+      providers: { google: true, github: true },
+    });
+    httpMock.verify();
+  });
+
+  it('logout posts to resolved /auth/logout endpoint', () => {
+    service.logout().subscribe((res) => {
+      expect(res['status']).toBe('success');
+    });
+    const req = httpMock.expectOne((r) => r.url.endsWith('/auth/logout'));
+    expect(req.request.method).toBe('POST');
+    req.flush({ status: 'success', message: 'Logged out' });
+    httpMock.verify();
+  });
+
+  it('login and logout helper URLs resolve properly', () => {
+    expect(service.getGoogleLoginUrl().endsWith('/auth/login/google')).toBe(true);
+    expect(service.getGithubLoginUrl().endsWith('/auth/login/github')).toBe(true);
+    expect(service.getLogoutUrl().endsWith('/auth/logout')).toBe(true);
   });
 });

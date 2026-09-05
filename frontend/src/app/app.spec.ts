@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { TestBed } from '@angular/core/testing';
+import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { of, throwError } from 'rxjs';
 import { App } from './app';
 import { ApiService } from './services/api.service';
@@ -61,12 +61,25 @@ describe('Error Classification - classifyHttpError', () => {
 
 describe('App Component - State & Degraded Mode Recovery', () => {
   let app: App;
+  let fixture: ComponentFixture<App>;
   let mockApi: Partial<ApiService>;
 
   beforeEach(() => {
     vi.useFakeTimers();
 
     mockApi = {
+      getAppAuthStatus: vi.fn().mockReturnValue(
+        of({
+          auth_enabled: false,
+          authenticated: true,
+          user: null,
+          providers: { google: false, github: false },
+        }),
+      ),
+      getGoogleLoginUrl: vi.fn().mockReturnValue('/auth/login/google'),
+      getGithubLoginUrl: vi.fn().mockReturnValue('/auth/login/github'),
+      logout: vi.fn().mockReturnValue(of({ status: 'success' })),
+      getLogoutUrl: vi.fn().mockReturnValue('/auth/logout'),
       getStats: vi
         .fn()
         .mockReturnValue(of({ pending: 10, applied_folders: 2, tracker: { total_records: 5 } })),
@@ -101,7 +114,7 @@ describe('App Component - State & Degraded Mode Recovery', () => {
       providers: [{ provide: ApiService, useValue: mockApi }],
     });
 
-    const fixture = TestBed.createComponent(App);
+    fixture = TestBed.createComponent(App);
     app = fixture.componentInstance;
   });
 
@@ -327,6 +340,186 @@ describe('App Component - State & Degraded Mode Recovery', () => {
       expect(app.resourceStates().applications.status).toBe('error');
       expect(app.toast().type).toBe('warning');
       expect(app.toast().message).toContain('dashboard refresh failed');
+    });
+  });
+
+  describe('Dashboard Authentication & Login Gate', () => {
+    it('shows login gate and prevents loading protected dashboard data when unauthenticated', () => {
+      mockApi.getAppAuthStatus = vi.fn().mockReturnValue(
+        of({
+          auth_enabled: true,
+          authenticated: false,
+          user: null,
+          providers: { google: true, github: true },
+        }),
+      );
+
+      app.ngOnInit();
+
+      expect(app.showLoginGate()).toBe(true);
+      expect(mockApi.getStats).not.toHaveBeenCalled();
+      expect(mockApi.getApplications).not.toHaveBeenCalled();
+
+      fixture.detectChanges();
+      const compiled = fixture.nativeElement as HTMLElement;
+      expect(compiled.querySelector('.login-gate')).not.toBeNull();
+      expect(compiled.querySelector('.dashboard-main')).toBeNull();
+    });
+
+    it('renders provider buttons conditionally based on server configuration', () => {
+      // Only Google configured
+      mockApi.getAppAuthStatus = vi.fn().mockReturnValue(
+        of({
+          auth_enabled: true,
+          authenticated: false,
+          user: null,
+          providers: { google: true, github: false },
+        }),
+      );
+      app.ngOnInit();
+      fixture.detectChanges();
+
+      const compiled = fixture.nativeElement as HTMLElement;
+      expect(compiled.querySelector('.google-login-btn')).not.toBeNull();
+      expect(compiled.querySelector('.github-login-btn')).toBeNull();
+
+      // Only GitHub configured
+      mockApi.getAppAuthStatus = vi.fn().mockReturnValue(
+        of({
+          auth_enabled: true,
+          authenticated: false,
+          user: null,
+          providers: { google: false, github: true },
+        }),
+      );
+      app.checkAppAuth();
+      fixture.detectChanges();
+
+      expect(compiled.querySelector('.google-login-btn')).toBeNull();
+      expect(compiled.querySelector('.github-login-btn')).not.toBeNull();
+
+      // Neither provider configured
+      mockApi.getAppAuthStatus = vi.fn().mockReturnValue(
+        of({
+          auth_enabled: true,
+          authenticated: false,
+          user: null,
+          providers: { google: false, github: false },
+        }),
+      );
+      app.checkAppAuth();
+      fixture.detectChanges();
+
+      expect(compiled.querySelector('.no-providers-warning')).not.toBeNull();
+    });
+
+    it('safely parses and displays OAuth callback error query parameters', () => {
+      mockApi.getAppAuthStatus = vi.fn().mockReturnValue(
+        of({
+          auth_enabled: true,
+          authenticated: false,
+          user: null,
+          providers: { google: true, github: true },
+        }),
+      );
+
+      expect(app.formatAuthErrorMessage('access_denied')).toBe(
+        'Access was denied by the OAuth provider.',
+      );
+      expect(app.formatAuthErrorMessage('unverified_email')).toBe(
+        'Your account email address is not verified by the provider.',
+      );
+      expect(app.formatAuthErrorMessage('unauthorized_user')).toBe(
+        'Your account is not authorized to access this dashboard.',
+      );
+
+      app.authErrorMessage.set(app.formatAuthErrorMessage('access_denied'));
+      app.ngOnInit();
+      fixture.detectChanges();
+
+      const compiled = fixture.nativeElement as HTMLElement;
+      const errorAlert = compiled.querySelector('.auth-error-alert');
+      expect(errorAlert).not.toBeNull();
+      expect(compiled.querySelector('.auth-error-text')?.textContent).toContain(
+        'Access was denied by the OAuth provider.',
+      );
+
+      app.dismissAuthError();
+      expect(app.authErrorMessage()).toBeNull();
+    });
+
+    it('handles auth status request failure with classified error and retry action', () => {
+      mockApi.getAppAuthStatus = vi
+        .fn()
+        .mockReturnValue(throwError(() => ({ status: 0, message: 'Connection refused' })));
+
+      app.checkAppAuth();
+
+      expect(app.appAuthState().error).not.toBeNull();
+      expect(app.appAuthState().error?.category).toBe('network');
+
+      fixture.detectChanges();
+      const compiled = fixture.nativeElement as HTMLElement;
+      expect(compiled.querySelector('.auth-status-error')).not.toBeNull();
+      expect(compiled.querySelector('.retry-auth-btn')).not.toBeNull();
+
+      // Retrying re-invokes checkAppAuth
+      const retrySpy = vi.spyOn(app, 'checkAppAuth');
+      app.retryAuthStatus();
+      expect(retrySpy).toHaveBeenCalled();
+    });
+
+    it('displays user badge and executes logout when authenticated', () => {
+      mockApi.getAppAuthStatus = vi.fn().mockReturnValue(
+        of({
+          auth_enabled: true,
+          authenticated: true,
+          user: {
+            id: 'usr-1',
+            name: 'Alice DevOps',
+            email: 'alice@devops.example',
+            username: 'alice-dev',
+            provider: 'google',
+            avatar_url: '',
+          },
+          providers: { google: true, github: false },
+        }),
+      );
+
+      app.ngOnInit();
+      fixture.detectChanges();
+
+      const compiled = fixture.nativeElement as HTMLElement;
+      const userBadge = compiled.querySelector('.user-badge');
+      expect(userBadge).not.toBeNull();
+      expect(userBadge?.textContent).toContain('Alice DevOps');
+
+      const logoutBtn = compiled.querySelector('.logout-button') as HTMLButtonElement;
+      expect(logoutBtn).not.toBeNull();
+
+      app.logout();
+      expect(mockApi.logout).toHaveBeenCalled();
+      expect(app.appAuthState().authenticated).toBe(false);
+    });
+
+    it('loads protected dashboard data and starts polling when auth is disabled', () => {
+      mockApi.getAppAuthStatus = vi.fn().mockReturnValue(
+        of({
+          auth_enabled: false,
+          authenticated: true,
+          user: null,
+          providers: { google: false, github: false },
+        }),
+      );
+
+      const loadSpy = vi.spyOn(app, 'loadInitialData');
+      const pollSpy = vi.spyOn(app, 'startPolling');
+
+      app.ngOnInit();
+
+      expect(app.showLoginGate()).toBe(false);
+      expect(loadSpy).toHaveBeenCalled();
+      expect(pollSpy).toHaveBeenCalled();
     });
   });
 });
