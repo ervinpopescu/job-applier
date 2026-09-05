@@ -12,13 +12,17 @@ repos:
         args: ["--pytest-test-first"]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.4.3
+    rev: v0.15.0
     hooks:
       # Run the linter.
       - id: ruff
-        args: [ --fix ]
+        args: [--fix]
       # Run the formatter.
       - id: ruff-format
+      # Check formatting without modifying files.
+      - id: ruff-format
+        alias: ruff-format-check
+        args: [--check]
 
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.10.0
