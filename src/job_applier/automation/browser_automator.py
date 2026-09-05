@@ -9,12 +9,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from job_applier.automation.browser_runtime import (
+    VirtualDisplayManager,
+    get_default_profile_dir,
+    is_display_available,
+    resolve_browser_engine,
+    validate_browser_engine,
+)
 from job_applier.automation.candidate_profile import (  # type: ignore[import-not-found]
     CandidateProfile,
     load_candidate_profile,
 )
 from job_applier.automation.cloudflare import (  # type: ignore[import-not-found]
-    VirtualDisplayManager,
     extract_ray_id,
     is_cloudflare_challenge,
     solve_cloudflare_turnstile,
@@ -27,14 +33,6 @@ from job_applier.scrapers.activity_checker import (  # type: ignore[import-not-f
     is_job_active,
 )
 from job_applier.tracker import record_application  # type: ignore[import-not-found]
-from job_applier.utils import get_project_root
-
-
-def is_display_available() -> bool:
-    """Checks if a graphical display server (X11 or Wayland) is available."""
-    if sys.platform.startswith("linux"):
-        return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-    return True
 
 
 def clean_stale_chrome_locks(profile_dir: Path) -> None:
@@ -88,26 +86,33 @@ class BrowserAutomator:
         profile_dir: Path | None = None,
         api_key: str | None = None,
         status_callback: Callable[[str, str, str, dict[str, Any]], None] | None = None,
+        browser: str | None = None,
     ):
         self.profile = profile or load_candidate_profile()
         self.status_callback = status_callback
 
-        # Auto-detect display: check if an X11 display is available or can be provided by Xvfb
+        self.raw_browser = validate_browser_engine(browser)
+        self.engine, self.executable_path = resolve_browser_engine(self.raw_browser)
+
+        # Auto-detect display: check if an X11/Wayland/native display is available or can be provided by Xvfb
         display_ok = is_display_available()
         if not display_ok:
-            disp = VirtualDisplayManager.ensure_display()
+            disp = VirtualDisplayManager.ensure_display(allow_xvfb=True)
             if disp:
                 display_ok = True
 
         if headless is None:
             self.headless = not display_ok
-        elif not headless and not display_ok:
-            print(
-                "Notice: No graphical display detected ($DISPLAY not set). Running in headless mode."
-            )
-            self.headless = True
+        elif not headless:
+            if not display_ok:
+                raise RuntimeError(
+                    "Headed mode requested (headless=False), but no graphical display server "
+                    "(DISPLAY or WAYLAND_DISPLAY) was detected and virtual display is unavailable. "
+                    "Run in headless mode or ensure a display server is running."
+                )
+            self.headless = False
         else:
-            self.headless = headless
+            self.headless = True
 
         self.use_persistent_profile = use_persistent_profile
         self.api_key = api_key
@@ -115,8 +120,7 @@ class BrowserAutomator:
         self.waiting_for_code: bool = False
         self.provided_code: str | None = None
 
-        project_root = get_project_root()
-        self.profile_dir = profile_dir or (project_root / ".browser_profile")
+        self.profile_dir = profile_dir or get_default_profile_dir(self.engine)
 
         self.playwright: Any = None
         self.browser: Any = None
@@ -152,66 +156,87 @@ class BrowserAutomator:
             global ACTIVE_AUTOMATOR
             ACTIVE_AUTOMATOR = self
 
-            # Prefer installed Google Chrome
-            chrome_path = "/usr/bin/google-chrome"
-            launch_args = [
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--start-maximized",
-            ]
-
-            if self.use_persistent_profile:
-                self.profile_dir.mkdir(parents=True, exist_ok=True)
-                clean_stale_chrome_locks(self.profile_dir)
-                kwargs: dict[str, Any] = {
-                    "user_data_dir": str(self.profile_dir),
-                    "headless": self.headless,
-                    "args": launch_args,
-                    "viewport": {"width": 1280, "height": 900}
-                    if not self.headless
-                    else {"width": 1920, "height": 1080},
-                }
-                if Path(chrome_path).exists():
-                    kwargs["executable_path"] = chrome_path
-
-                try:
-                    self.context = self.playwright.chromium.launch_persistent_context(
-                        **kwargs
+            if self.engine == "firefox":
+                browser_type = self.playwright.firefox
+                if self.use_persistent_profile:
+                    self.profile_dir.mkdir(parents=True, exist_ok=True)
+                    kwargs: dict[str, Any] = {
+                        "user_data_dir": str(self.profile_dir),
+                        "headless": self.headless,
+                        "viewport": {"width": 1280, "height": 900}
+                        if not self.headless
+                        else {"width": 1920, "height": 1080},
+                    }
+                    self.context = browser_type.launch_persistent_context(**kwargs)
+                    self.page = (
+                        self.context.pages[0]
+                        if self.context.pages
+                        else self.context.new_page()
                     )
-                except Exception as pe:
-                    print(
-                        f"Notice: Persistent browser launch failed ({pe}). Cleaning locks and retrying..."
+                else:
+                    self.browser = browser_type.launch(headless=self.headless)
+                    self.context = self.browser.new_context(
+                        viewport={"width": 1280, "height": 900}
+                        if not self.headless
+                        else {"width": 1920, "height": 1080},
                     )
-                    clean_stale_chrome_locks(self.profile_dir)
-                    time.sleep(1)
-                    # Retry with persistent context to preserve authenticated cookies
-                    self.context = self.playwright.chromium.launch_persistent_context(
-                        **kwargs
-                    )
-
-                self.page = (
-                    self.context.pages[0]
-                    if self.context.pages
-                    else self.context.new_page()
-                )
+                    self.page = self.context.new_page()
             else:
-                kwargs = {
-                    "headless": self.headless,
-                    "args": launch_args,
-                }
-                if Path(chrome_path).exists():
-                    kwargs["executable_path"] = chrome_path
+                browser_type = self.playwright.chromium
+                launch_args = [
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--start-maximized",
+                ]
 
-                self.browser = self.playwright.chromium.launch(**kwargs)
-                self.context = self.browser.new_context(
-                    viewport={"width": 1280, "height": 900}
-                    if not self.headless
-                    else {"width": 1920, "height": 1080},
-                    user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-                )
-                self.page = self.context.new_page()
+                if self.use_persistent_profile:
+                    self.profile_dir.mkdir(parents=True, exist_ok=True)
+                    clean_stale_chrome_locks(self.profile_dir)
+                    kwargs = {
+                        "user_data_dir": str(self.profile_dir),
+                        "headless": self.headless,
+                        "args": launch_args,
+                        "viewport": {"width": 1280, "height": 900}
+                        if not self.headless
+                        else {"width": 1920, "height": 1080},
+                    }
+                    if self.executable_path and Path(self.executable_path).exists():
+                        kwargs["executable_path"] = self.executable_path
+
+                    try:
+                        self.context = browser_type.launch_persistent_context(**kwargs)
+                    except Exception as pe:
+                        print(
+                            f"Notice: Persistent browser launch failed ({pe}). Cleaning locks and retrying..."
+                        )
+                        clean_stale_chrome_locks(self.profile_dir)
+                        time.sleep(1)
+                        # Retry with persistent context to preserve authenticated cookies
+                        self.context = browser_type.launch_persistent_context(**kwargs)
+
+                    self.page = (
+                        self.context.pages[0]
+                        if self.context.pages
+                        else self.context.new_page()
+                    )
+                else:
+                    kwargs = {
+                        "headless": self.headless,
+                        "args": launch_args,
+                    }
+                    if self.executable_path and Path(self.executable_path).exists():
+                        kwargs["executable_path"] = self.executable_path
+
+                    self.browser = browser_type.launch(**kwargs)
+                    self.context = self.browser.new_context(
+                        viewport={"width": 1280, "height": 900}
+                        if not self.headless
+                        else {"width": 1920, "height": 1080},
+                        user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+                    )
+                    self.page = self.context.new_page()
 
             # Set sensible navigation timeouts
             self.page.set_default_navigation_timeout(30000)
@@ -1180,7 +1205,7 @@ class BrowserAutomator:
         1. Navigates to job URL and opens application form.
         2. Fills all fields, attaches tailored CV PDF, fills cover letter, answers questions.
         3. Highlights submit button and presents a review prompt to the user.
-        4. User can confirm submit with [Enter] or submit manually in Chrome.
+        4. User can confirm submit with [Enter] or submit manually in the browser.
         """
         print(f"\n🚀 Starting Assisted Auto-Apply for {company} - {job_title}")
         success = self.navigate_and_open_form(job_url)
@@ -1226,7 +1251,9 @@ class BrowserAutomator:
             print(" Non-interactive/headless mode: Auto-confirming submit...")
             choice = ""
         else:
-            print("\n👉 Chrome is open with the filled application form.")
+            print(
+                f"\n👉 {self.engine.capitalize()} is open with the filled application form."
+            )
             print("   Review the fields in your browser window.")
             print("   Options:")
             print("     [Enter] -> Auto-click the Submit button")

@@ -52,6 +52,7 @@ def run_application_pipeline(
     auto_apply: bool = False,
     autonomous: bool = False,
     headless: bool = False,
+    browser: str | None = None,
 ) -> None:
     """
     Core pipeline service that scrapes job listings, predicts active status,
@@ -100,7 +101,9 @@ def run_application_pipeline(
 
     automator: BrowserAutomator | None = None
     if auto_apply:
-        instance = BrowserAutomator(profile=candidate_profile, headless=headless)
+        instance = BrowserAutomator(
+            profile=candidate_profile, headless=headless, browser=browser
+        )
         try:
             instance.start()
             automator = instance

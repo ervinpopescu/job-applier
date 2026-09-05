@@ -1,3 +1,6 @@
+from unittest.mock import MagicMock, patch
+
+import pytest
 from job_applier.automation.browser_automator import (  # type: ignore[import-not-found]
     BrowserAutomator,
 )
@@ -137,3 +140,134 @@ def test_form_autofill_headless(tmp_path):
 
     finally:
         automator.close()
+
+
+def test_engine_validation_and_profile_isolation(tmp_path):
+    with patch(
+        "job_applier.automation.browser_runtime.get_project_root", return_value=tmp_path
+    ):
+        chrome_automator = BrowserAutomator(headless=True, browser="chrome")
+        assert chrome_automator.engine == "chrome"
+        assert chrome_automator.profile_dir == tmp_path / ".browser_profile"
+
+        firefox_automator = BrowserAutomator(headless=True, browser="firefox")
+        assert firefox_automator.engine == "firefox"
+        assert firefox_automator.profile_dir == tmp_path / ".browser_profile_firefox"
+        assert firefox_automator.profile_dir != chrome_automator.profile_dir
+
+        with pytest.raises(ValueError, match="Unsupported browser engine 'opera'"):
+            BrowserAutomator(headless=True, browser="opera")
+
+
+def test_explicit_headed_without_display_raises_error():
+    with (
+        patch(
+            "job_applier.automation.browser_automator.is_display_available",
+            return_value=False,
+        ),
+        patch(
+            "job_applier.automation.browser_automator.VirtualDisplayManager.ensure_display",
+            return_value=None,
+        ),
+    ):
+        with pytest.raises(
+            RuntimeError, match="Headed mode requested \\(headless=False\\)"
+        ):
+            BrowserAutomator(headless=False)
+
+
+def test_auto_mode_without_display_falls_back_to_headless():
+    with (
+        patch(
+            "job_applier.automation.browser_automator.is_display_available",
+            return_value=False,
+        ),
+        patch(
+            "job_applier.automation.browser_automator.VirtualDisplayManager.ensure_display",
+            return_value=None,
+        ),
+    ):
+        automator = BrowserAutomator(headless=None)
+        assert automator.headless is True
+
+
+def test_firefox_playwright_launch_persistent_context_mocked(tmp_path):
+    mock_playwright = MagicMock()
+    mock_firefox = MagicMock()
+    mock_context = MagicMock()
+    mock_page = MagicMock()
+    mock_context.pages = [mock_page]
+    mock_firefox.launch_persistent_context.return_value = mock_context
+    mock_playwright.firefox = mock_firefox
+    mock_sync_playwright = MagicMock()
+    mock_sync_playwright.return_value.start.return_value = mock_playwright
+
+    with patch.dict(
+        "sys.modules",
+        {"playwright.sync_api": MagicMock(sync_playwright=mock_sync_playwright)},
+    ):
+        automator = BrowserAutomator(
+            headless=True,
+            browser="firefox",
+            use_persistent_profile=True,
+            profile_dir=tmp_path / "ff_profile",
+        )
+        automator.start()
+
+        mock_firefox.launch_persistent_context.assert_called_once()
+        call_kwargs = mock_firefox.launch_persistent_context.call_args.kwargs
+        assert call_kwargs["user_data_dir"] == str(tmp_path / "ff_profile")
+        assert call_kwargs["headless"] is True
+        # Verify Chromium-specific flags are NOT passed to Firefox
+        assert "args" not in call_kwargs
+        assert "executable_path" not in call_kwargs
+        assert mock_playwright.chromium.launch_persistent_context.call_count == 0
+        automator.close()
+
+
+def test_chromium_playwright_launch_persistent_context_mocked(tmp_path):
+    mock_playwright = MagicMock()
+    mock_chromium = MagicMock()
+    mock_context = MagicMock()
+    mock_page = MagicMock()
+    mock_context.pages = [mock_page]
+    mock_chromium.launch_persistent_context.return_value = mock_context
+    mock_playwright.chromium = mock_chromium
+    mock_sync_playwright = MagicMock()
+    mock_sync_playwright.return_value.start.return_value = mock_playwright
+
+    with patch.dict(
+        "sys.modules",
+        {"playwright.sync_api": MagicMock(sync_playwright=mock_sync_playwright)},
+    ):
+        automator = BrowserAutomator(
+            headless=True,
+            browser="chromium",
+            use_persistent_profile=True,
+            profile_dir=tmp_path / "chrome_profile",
+        )
+        automator.start()
+
+        mock_chromium.launch_persistent_context.assert_called_once()
+        call_kwargs = mock_chromium.launch_persistent_context.call_args.kwargs
+        assert call_kwargs["user_data_dir"] == str(tmp_path / "chrome_profile")
+        assert call_kwargs["headless"] is True
+        assert "args" in call_kwargs
+        assert any("--disable-blink-features" in a for a in call_kwargs["args"])
+        assert mock_playwright.firefox.launch_persistent_context.call_count == 0
+        automator.close()
+
+
+def test_firefox_smoke_live():
+    """Smoke test running real Playwright Firefox headless if available in environment."""
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.firefox.launch(headless=True)
+            page = browser.new_page()
+            page.set_content("<html><body><h1>Firefox OK</h1></body></html>")
+            assert "Firefox OK" in page.content()
+            browser.close()
+    except Exception as exc:
+        pytest.skip(f"Firefox not runnable in current environment: {exc}")
