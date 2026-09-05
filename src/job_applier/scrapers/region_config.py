@@ -5,9 +5,10 @@ import re
 from job_applier.config import get_regions_config
 
 
-def _load_region_data() -> (
-    tuple[dict[str, set[str]], dict[str, set[str]], list[str], list[str]]
-):
+RegionData = tuple[dict[str, set[str]], dict[str, set[str]], list[str], list[str]]
+
+
+def _load_region_data() -> RegionData:
     cfg = get_regions_config()
     regions = {k: set(v) for k, v in cfg.get("regions", {}).items()}
     aliases = {k: set(v) for k, v in cfg.get("country_aliases", {}).items()}

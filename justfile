@@ -35,7 +35,7 @@ ui:
 
 # Compile production Angular single-page application bundle
 build-ui:
-    cd frontend && npm run build
+    cd frontend && npx --yes --package=node@22.12.0 node node_modules/@angular/cli/bin/ng.js build
 
 # --- Pipeline & Scraping ---
 
@@ -95,18 +95,33 @@ prune-non-emea:
 test *ARGS:
     uv run pytest {{ARGS}}
 
-# Run linter checks (ruff + mypy)
+# Run Angular unit tests (Vitest)
+test-ui:
+    cd frontend && npx --yes --package=node@22.12.0 node node_modules/@angular/cli/bin/ng.js test --watch=false
+
+# Run linter checks (pre-commit ruff hook + mypy)
 lint:
-    uv run ruff check
+    uv run pre-commit run ruff --all-files
     uv run mypy src/ --ignore-missing-imports
 
-# Format Python code with ruff and frontend with Prettier
+# Run all pre-commit git hooks
+pre-commit:
+    uv run pre-commit run --all-files
+
+# Format Python code via pre-commit ruff-format hook and frontend with Prettier
 format:
-    uv run ruff format
+    uv run pre-commit run ruff-format --all-files || true
     cd frontend && npm run format
 
-# Run all quality checks: lint, test, and frontend build
+# Verify code formatting via the pinned pre-commit ruff hook without modifying files
+format-check:
+    uv run pre-commit run ruff-format-check --all-files
+    cd frontend && npm run format:check
+
+# Run all quality checks: format, lint, tests, and frontend build
 check:
+    just format-check
     just lint
     just test
+    just test-ui
     just build-ui
