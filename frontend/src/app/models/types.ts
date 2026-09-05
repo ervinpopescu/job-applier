@@ -123,6 +123,7 @@ export interface PlatformInfo {
 }
 
 export interface AuthStatusReport {
+  browser?: string;
   profile_dir: string;
   platforms: Record<string, PlatformInfo>;
 }

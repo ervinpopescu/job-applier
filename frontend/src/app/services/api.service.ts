@@ -255,14 +255,22 @@ export class ApiService {
     });
   }
 
-  getAuthStatus(): Observable<AuthStatusReport> {
-    return this.http.get<AuthStatusReport>(this.resolveUrl('/api/auth/status'));
+  getAuthStatus(browser?: string): Observable<AuthStatusReport> {
+    const url = browser
+      ? `/api/auth/status?browser=${encodeURIComponent(browser)}`
+      : '/api/auth/status';
+    return this.http.get<AuthStatusReport>(this.resolveUrl(url));
   }
 
-  launchAuthLogin(platform: string, timeout = 180): Observable<Record<string, unknown>> {
+  launchAuthLogin(
+    platform: string,
+    timeout = 180,
+    browser?: string,
+  ): Observable<Record<string, unknown>> {
     return this.http.post<Record<string, unknown>>(this.resolveUrl('/api/auth/login'), {
       platform,
       timeout,
+      browser,
     });
   }
 

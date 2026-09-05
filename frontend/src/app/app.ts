@@ -59,6 +59,7 @@ export class App implements OnInit, OnDestroy {
   automationStatus = signal<AutomationStatus | null>(null);
   profile = signal<CandidateProfile | null>(null);
   authStatus = signal<AuthStatusReport | null>(null);
+  authBrowser = signal<'chrome' | 'firefox'>('chrome');
 
   // Per-Resource State Tracking
   resourceStates = signal<Record<ResourceKey, ResourceState>>({
@@ -458,9 +459,10 @@ export class App implements OnInit, OnDestroy {
     this.fetchProfile().subscribe();
   }
 
-  fetchAuthStatus() {
+  fetchAuthStatus(browser?: string) {
+    const b = browser ?? this.authBrowser();
     this.setResourceStatus('auth', 'loading');
-    return this.api.getAuthStatus().pipe(
+    return this.api.getAuthStatus(b).pipe(
       tap((data) => {
         this.authStatus.set(data);
         this.setResourceStatus('auth', 'ready', null, true);
@@ -470,6 +472,11 @@ export class App implements OnInit, OnDestroy {
         return of(null);
       }),
     );
+  }
+
+  setAuthBrowser(browser: 'chrome' | 'firefox') {
+    this.authBrowser.set(browser);
+    this.checkAuthStatus();
   }
 
   checkAuthStatus() {
@@ -840,10 +847,12 @@ export class App implements OnInit, OnDestroy {
 
   launchPlatformLogin(platform: string) {
     this.launchingPlatform.set(platform);
-    this.api.launchAuthLogin(platform, 180).subscribe({
+    const browser = this.authBrowser();
+    const browserLabel = browser === 'firefox' ? 'Firefox' : 'Chrome';
+    this.api.launchAuthLogin(platform, 180, browser).subscribe({
       next: () => {
         this.showToast(
-          `Chrome opened for ${platform.toUpperCase()} on DISPLAY. Complete login in browser!`,
+          `${browserLabel} opened for ${platform.toUpperCase()}. Complete login in browser!`,
         );
         setTimeout(() => this.launchingPlatform.set(null), 3000);
       },

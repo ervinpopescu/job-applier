@@ -1479,7 +1479,7 @@
           <div>
             <h3 class="text-base font-bold text-white">Platform Authentication & Sessions</h3>
             <p class="text-xs text-slate-400">
-              Log in once to store session tokens in .browser_profile/
+              Log in once to store session tokens in persistent browser profile
             </p>
           </div>
         </div>
@@ -1492,7 +1492,47 @@
       </div>
 
       <div class="auth-body p-4 sm:p-6 space-y-4 overflow-y-auto">
+        <!-- Browser Engine Selector -->
+        <div class="space-y-2">
+          <div
+            class="flex items-center justify-between p-1 bg-slate-950 border border-slate-800 rounded-xl"
+          >
+            <button
+              type="button"
+              (click)="setAuthBrowser('chrome')"
+              class="flex-1 py-1.5 px-3 rounded-lg text-xs font-semibold transition"
+              [class]="
+                authBrowser() === 'chrome'
+                  ? 'bg-blue-600 text-white shadow'
+                  : 'text-slate-400 hover:text-white'
+              "
+            >
+              Google Chrome / Chromium
+            </button>
+            <button
+              type="button"
+              (click)="setAuthBrowser('firefox')"
+              class="flex-1 py-1.5 px-3 rounded-lg text-xs font-semibold transition"
+              [class]="
+                authBrowser() === 'firefox'
+                  ? 'bg-blue-600 text-white shadow'
+                  : 'text-slate-400 hover:text-white'
+              "
+            >
+              Mozilla Firefox
+            </button>
+          </div>
+          <div class="text-[11px] text-slate-400 flex items-center justify-between px-1">
+            <span>Active profile:</span>
+            <code class="text-blue-300 font-mono">{{
+              authStatus()?.profile_dir ||
+                (authBrowser() === 'firefox' ? '.browser_profile_firefox' : '.browser_profile')
+            }}</code>
+          </div>
+        </div>
+
         <button
+          *ngIf="authBrowser() === 'chrome'"
           (click)="syncDesktopChrome()"
           [disabled]="isSyncingAuth()"
           class="w-full py-2.5 bg-gradient-to-r from-teal-700 to-emerald-700 hover:from-teal-600 hover:to-emerald-600 text-white rounded-2xl text-xs font-bold transition shadow flex items-center justify-center gap-2"
@@ -1508,6 +1548,18 @@
               : '1-Click Sync Sessions from Desktop Chrome'
           }}</span>
         </button>
+
+        <div
+          *ngIf="authBrowser() === 'firefox'"
+          class="p-3 rounded-2xl bg-slate-950/80 border border-slate-800 text-xs text-slate-300"
+        >
+          <p>
+            🦊 <strong>Firefox Mode:</strong> Uses an isolated profile
+            (<code>.browser_profile_firefox</code>). Desktop Chrome session sync is not applicable
+            to Firefox. Click <strong>Connect / Log In</strong> on any platform below to sign in
+            directly in Firefox.
+          </p>
+        </div>
 
         <div class="space-y-3">
           <!-- LinkedIn -->
