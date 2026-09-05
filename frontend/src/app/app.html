@@ -158,7 +158,7 @@
 
           <!-- Export -->
           <a
-            href="/api/export"
+            [href]="api.getExportUrl()"
             download
             class="px-3 py-1.5 bg-slate-950/70 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-800 hover:border-slate-700 rounded-xl text-xs font-medium flex items-center gap-1.5 transition shadow-sm"
             title="Export all applications and database mappings as a portable .zip backup"
@@ -169,12 +169,24 @@
 
           <!-- Import -->
           <label
+            [class.pointer-events-none]="isImporting()"
+            [class.opacity-50]="isImporting()"
             class="px-3 py-1.5 bg-slate-950/70 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-800 hover:border-slate-700 rounded-xl text-xs font-medium flex items-center gap-1.5 transition shadow-sm cursor-pointer"
             title="Import and merge a backup .zip bundle from another machine"
           >
-            <app-icon name="upload" className="w-3.5 h-3.5 text-teal-400"></app-icon>
-            <span class="action-label">Import</span>
-            <input type="file" accept=".zip" class="hidden" (change)="uploadBackup($event)" />
+            <app-icon
+              [name]="isImporting() ? 'refresh-cw' : 'upload'"
+              className="w-3.5 h-3.5 text-teal-400"
+              [class.animate-spin]="isImporting()"
+            ></app-icon>
+            <span class="action-label">{{ isImporting() ? 'Importing...' : 'Import' }}</span>
+            <input
+              type="file"
+              accept=".zip"
+              class="hidden"
+              [disabled]="isImporting()"
+              (change)="uploadBackup($event)"
+            />
           </label>
         </div>
       </div>
@@ -195,14 +207,73 @@
           toast().type === 'success',
         'bg-rose-950/90 border-rose-700/80 text-rose-200 shadow-rose-950/50':
           toast().type === 'error',
+        'bg-amber-950/90 border-amber-700/80 text-amber-200 shadow-amber-950/50':
+          toast().type === 'warning',
         'bg-slate-900/95 border-slate-700/80 text-slate-200': toast().type === 'info',
       }"
     >
       <app-icon
-        [name]="toast().type === 'error' ? 'alert-circle' : 'check'"
+        [name]="
+          toast().type === 'error'
+            ? 'alert-circle'
+            : toast().type === 'warning'
+              ? 'alert-triangle'
+              : 'check'
+        "
         className="w-4 h-4 shrink-0"
       ></app-icon>
       <span>{{ toast().message }}</span>
+    </div>
+
+    <!-- Persistent Degraded Mode Alert Banner -->
+    <div
+      *ngIf="hasDegradedResources()"
+      role="alert"
+      class="degraded-banner mb-6 p-4 rounded-2xl bg-amber-950/40 border border-amber-500/60 shadow-lg text-amber-200 backdrop-blur-md transition-all duration-300 ring-1 ring-amber-500/30"
+    >
+      <div class="flex flex-col md:flex-row md:items-center justify-between gap-3">
+        <div class="flex items-start gap-3 min-w-0">
+          <div
+            class="w-9 h-9 rounded-xl bg-amber-500/20 border border-amber-500/40 flex items-center justify-center text-amber-400 shrink-0 mt-0.5"
+          >
+            <app-icon name="alert-triangle" className="w-5 h-5"></app-icon>
+          </div>
+          <div class="min-w-0">
+            <div class="flex items-center gap-2 flex-wrap">
+              <span class="text-xs font-bold uppercase tracking-wider text-amber-300">
+                Service Degraded
+              </span>
+              <span class="text-amber-500">•</span>
+              <span class="text-xs font-medium text-amber-200">
+                Unavailable:
+                <span class="font-bold text-white">{{ degradedResourceNames().join(', ') }}</span>
+              </span>
+            </div>
+            <p class="text-xs text-amber-200/90 mt-1 leading-relaxed">
+              {{ primaryDegradedMessage() }}
+            </p>
+            <div class="flex items-center gap-3 mt-1.5 text-[11px] text-amber-400 font-mono">
+              <span *ngIf="lastAnySuccess()">Last update: {{ lastAnySuccess() }}</span>
+              <span *ngIf="lastAnySuccess()">•</span>
+              <span>Auto-retrying in {{ retryCountdown() }}s (attempt {{ retryAttempt() }})</span>
+            </div>
+          </div>
+        </div>
+        <div class="flex items-center gap-2 shrink-0 self-end md:self-center">
+          <button
+            (click)="retryFailedResources()"
+            [disabled]="isRetrying()"
+            class="px-3.5 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs rounded-xl transition shadow flex items-center gap-1.5 disabled:opacity-50 select-none"
+          >
+            <app-icon
+              name="refresh-cw"
+              className="w-3.5 h-3.5"
+              [class.animate-spin]="isRetrying()"
+            ></app-icon>
+            <span>Retry now</span>
+          </button>
+        </div>
+      </div>
     </div>
 
     <!-- Live Browser Automation HUD Monitor -->
@@ -422,6 +493,16 @@
             <span>Clear Failed</span>
           </button>
 
+          <!-- Stale indicator if applications in error but cached items exist -->
+          <span
+            *ngIf="resourceStates().applications.error && applications().length > 0"
+            class="px-2.5 py-1 bg-amber-950/60 border border-amber-800 text-amber-300 text-xs rounded-xl flex items-center gap-1.5 font-medium"
+            title="Displaying cached applications while connection recovers"
+          >
+            <app-icon name="alert-triangle" className="w-3 h-3"></app-icon>
+            <span>Cached Data</span>
+          </span>
+
           <!-- Refresh -->
           <button
             (click)="loadInitialData()"
@@ -437,9 +518,32 @@
         </div>
       </div>
 
-      <!-- Empty State -->
+      <!-- Queue Error State (When fetch failed and no cached applications) -->
       <div
-        *ngIf="!isLoading() && applications().length === 0"
+        *ngIf="!isLoading() && resourceStates().applications.error && applications().length === 0"
+        class="text-center py-16 bg-rose-950/20 rounded-2xl border border-rose-800/50 p-6 mb-6"
+      >
+        <app-icon name="alert-circle" className="w-12 h-12 text-rose-400 mx-auto mb-3"></app-icon>
+        <h3 class="text-base font-semibold text-rose-200">Unable to load application queue</h3>
+        <p class="text-xs text-rose-300/80 max-w-md mx-auto mt-1 leading-relaxed">
+          {{ resourceStates().applications.error?.message || 'The server could not be reached.' }}
+        </p>
+        <button
+          (click)="retryFailedResources()"
+          class="mt-4 px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold rounded-xl transition inline-flex items-center gap-1.5 shadow"
+        >
+          <app-icon name="refresh-cw" className="w-3.5 h-3.5"></app-icon>
+          <span>Retry loading queue</span>
+        </button>
+      </div>
+
+      <!-- Empty State (Only when resource is ready and applications array is legitimately 0) -->
+      <div
+        *ngIf="
+          !isLoading() &&
+          resourceStates().applications.status === 'ready' &&
+          applications().length === 0
+        "
         class="text-center py-20 bg-slate-900/40 rounded-2xl border border-dashed border-slate-800"
       >
         <app-icon name="inbox" className="w-12 h-12 text-slate-600 mx-auto mb-3"></app-icon>
@@ -682,7 +786,31 @@
                   </button>
                 </td>
               </tr>
-              <tr *ngIf="filteredTrackerRecords().length === 0">
+              <tr *ngIf="resourceStates().tracker.error && trackerRecords().length === 0">
+                <td colspan="7" class="py-10 text-center text-rose-400">
+                  <div class="flex flex-col items-center gap-2">
+                    <span class="font-semibold text-rose-200"
+                      >Unable to load application tracker</span
+                    >
+                    <span class="text-xs text-rose-300/80 max-w-md">
+                      {{ resourceStates().tracker.error?.message || 'Server connection failed.' }}
+                    </span>
+                    <button
+                      (click)="retryFailedResources()"
+                      class="mt-2 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-amber-300 text-xs font-semibold rounded-lg inline-flex items-center gap-1.5 transition"
+                    >
+                      <app-icon name="refresh-cw" className="w-3 h-3"></app-icon>
+                      <span>Retry tracker</span>
+                    </button>
+                  </div>
+                </td>
+              </tr>
+              <tr
+                *ngIf="
+                  resourceStates().tracker.status === 'ready' &&
+                  filteredTrackerRecords().length === 0
+                "
+              >
                 <td colspan="7" class="py-8 text-center text-slate-500">
                   No applications recorded in tracker.
                 </td>
@@ -994,6 +1122,25 @@
 
     <!-- TAB 5: PROFILE -->
     <section *ngIf="activeTab() === 'profile'" class="max-w-3xl mx-auto">
+      <!-- Profile Error State -->
+      <div
+        *ngIf="!isLoading() && resourceStates().profile.error && !profile()"
+        class="text-center py-16 bg-rose-950/20 rounded-2xl border border-rose-800/50 p-6 mb-6"
+      >
+        <app-icon name="alert-circle" className="w-12 h-12 text-rose-400 mx-auto mb-3"></app-icon>
+        <h3 class="text-base font-semibold text-rose-200">Unable to load candidate profile</h3>
+        <p class="text-xs text-rose-300/80 max-w-md mx-auto mt-1 leading-relaxed">
+          {{ resourceStates().profile.error?.message || 'The server could not be reached.' }}
+        </p>
+        <button
+          (click)="retryFailedResources()"
+          class="mt-4 px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold rounded-xl transition inline-flex items-center gap-1.5 shadow"
+        >
+          <app-icon name="refresh-cw" className="w-3.5 h-3.5"></app-icon>
+          <span>Retry loading profile</span>
+        </button>
+      </div>
+
       <div
         *ngIf="profile()"
         class="responsive-panel bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 shadow-sm"
@@ -1195,7 +1342,7 @@
               </button>
               <a
                 *ngIf="selectedApp()?.cv_pdf_url"
-                [href]="selectedApp()?.cv_pdf_url"
+                [href]="resolveFileUrl(selectedApp()?.cv_pdf_url)"
                 target="_blank"
                 class="text-emerald-400 hover:underline font-mono flex items-center gap-1 text-[11px]"
               >
@@ -1206,7 +1353,7 @@
           </div>
           <iframe
             *ngIf="selectedApp()?.cv_pdf_url"
-            [src]="selectedApp()?.cv_pdf_url"
+            [src]="resolveSafeFileUrl(selectedApp()?.cv_pdf_url)"
             class="w-full h-full border-none"
           ></iframe>
           <div

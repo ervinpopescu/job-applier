@@ -1,6 +1,7 @@
 import {
   Component,
   type ElementRef,
+  type OnDestroy,
   type OnInit,
   ViewChild,
   computed,
@@ -9,18 +10,29 @@ import {
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
+import { DomSanitizer, type SafeResourceUrl } from '@angular/platform-browser';
+import { type Observable, forkJoin, of } from 'rxjs';
+import { catchError, tap } from 'rxjs/operators';
 import { IconComponent } from './components/icon.component';
-import { ApiService } from './services/api.service';
-import type {
-  ApplicationDetail,
-  ApplicationItem,
-  AuthStatusReport,
-  AutomationStatus,
-  CandidateProfile,
-  PipelineStatus,
-  TrackerRecord,
-  TrackerStats,
+import { ApiService, resolveFileUrl } from './services/api.service';
+import {
+  type ApplicationDetail,
+  type ApplicationItem,
+  type AuthStatusReport,
+  type AutomationStatus,
+  type CandidateProfile,
+  type ClassifiedError,
+  type PipelineStatus,
+  type ResourceKey,
+  type ResourceState,
+  type ResourceStateStatus,
+  type ToastNotification,
+  type TrackerRecord,
+  type TrackerStats,
+  classifyHttpError,
 } from './models/types';
+
+const RETRY_BACKOFF_STEPS = [5, 15, 30];
 
 @Component({
   selector: 'app-root',
@@ -29,8 +41,9 @@ import type {
   templateUrl: './app.html',
   styleUrl: './app.css',
 })
-export class App implements OnInit {
-  private api = inject(ApiService);
+export class App implements OnInit, OnDestroy {
+  api = inject(ApiService);
+  private sanitizer = inject(DomSanitizer);
 
   @ViewChild('consoleContainer') consoleContainer?: ElementRef<HTMLDivElement>;
 
@@ -47,11 +60,31 @@ export class App implements OnInit {
   profile = signal<CandidateProfile | null>(null);
   authStatus = signal<AuthStatusReport | null>(null);
 
+  // Per-Resource State Tracking
+  resourceStates = signal<Record<ResourceKey, ResourceState>>({
+    stats: { status: 'idle', error: null, lastSuccess: null },
+    applications: { status: 'idle', error: null, lastSuccess: null },
+    tracker: { status: 'idle', error: null, lastSuccess: null },
+    profile: { status: 'idle', error: null, lastSuccess: null },
+    auth: { status: 'idle', error: null, lastSuccess: null },
+    pipeline: { status: 'idle', error: null, lastSuccess: null },
+    automation: { status: 'idle', error: null, lastSuccess: null },
+  });
+
+  // Degraded Mode & Recovery
+  retryAttempt = signal(1);
+  retryCountdown = signal(5);
+  isRetrying = signal(false);
+  isImporting = signal(false);
+
+  private pollIntervalId: ReturnType<typeof setInterval> | null = null;
+  private countdownTimerId: ReturnType<typeof setInterval> | null = null;
+
   // Modals & Banners
   authModalOpen = signal(false);
   diagModalOpen = signal(false);
   diagData = signal<Record<string, unknown> | null>(null);
-  toast = signal<{ visible: boolean; message: string; type: string }>({
+  toast = signal<ToastNotification>({
     visible: false,
     message: '',
     type: 'success',
@@ -106,6 +139,59 @@ export class App implements OnInit {
   isRegeneratingCv = signal<Record<string, boolean>>({});
   launchingPlatform = signal<string | null>(null);
 
+  // Computed Helpers
+  hasDegradedResources = computed(() => {
+    return Object.values(this.resourceStates()).some((state) => state.error !== null);
+  });
+
+  degradedResourceNames = computed(() => {
+    const states = this.resourceStates();
+    const names: string[] = [];
+    const labels: Record<ResourceKey, string> = {
+      stats: 'Statistics',
+      applications: 'Queue',
+      tracker: 'Tracker',
+      profile: 'Profile',
+      auth: 'Auth Status',
+      pipeline: 'Pipeline',
+      automation: 'Automation HUD',
+    };
+    for (const [key, state] of Object.entries(states) as [ResourceKey, ResourceState][]) {
+      if (state.error) {
+        names.push(labels[key] || key);
+      }
+    }
+    return names;
+  });
+
+  primaryDegradedMessage = computed(() => {
+    const states = this.resourceStates();
+    const errors = Object.values(states)
+      .map((s) => s.error)
+      .filter((e): e is ClassifiedError => Boolean(e));
+
+    if (errors.length === 0) return '';
+    // Priority order: routing (404), network (0), server (5xx), client
+    const routingErr = errors.find((e) => e.category === 'routing');
+    if (routingErr) return routingErr.message;
+    const networkErr = errors.find((e) => e.category === 'network');
+    if (networkErr) return networkErr.message;
+    const serverErr = errors.find((e) => e.category === 'server');
+    if (serverErr) return serverErr.message;
+    return errors[0].message;
+  });
+
+  lastAnySuccess = computed(() => {
+    const states = this.resourceStates();
+    let latest: Date | null = null;
+    for (const s of Object.values(states)) {
+      if (s.lastSuccess && (!latest || s.lastSuccess > latest)) {
+        latest = s.lastSuccess;
+      }
+    }
+    return latest ? latest.toLocaleTimeString() : null;
+  });
+
   // Computed Logs
   filteredLogs = computed(() => {
     const logs = this.pipelineStatus()?.logs || [];
@@ -138,71 +224,316 @@ export class App implements OnInit {
 
   ngOnInit() {
     this.loadInitialData();
-    // Periodic refresh
-    setInterval(() => {
+    // Periodic background poll
+    this.pollIntervalId = setInterval(() => {
       this.refreshPoll();
     }, 2000);
   }
 
-  loadInitialData() {
-    this.isLoading.set(true);
-    this.loadStats();
-    this.loadApplications();
-    this.loadTracker();
-    this.loadProfile();
-    this.checkAuthStatus();
-    this.isLoading.set(false);
+  ngOnDestroy() {
+    if (this.pollIntervalId) {
+      clearInterval(this.pollIntervalId);
+      this.pollIntervalId = null;
+    }
+    this.stopCountdownTimer();
   }
 
-  refreshPoll() {
-    this.loadStats();
-    this.api.getPipelineStatus().subscribe({
-      next: (data) => {
+  setResourceStatus(
+    key: ResourceKey,
+    status: ResourceStateStatus,
+    error: ClassifiedError | null = null,
+    updateSuccessTime = false,
+  ) {
+    this.resourceStates.update((states) => ({
+      ...states,
+      [key]: {
+        status,
+        error: status === 'loading' ? states[key].error : error,
+        lastSuccess: updateSuccessTime ? new Date() : states[key].lastSuccess,
+      },
+    }));
+
+    if (status === 'error' && !this.isRetrying()) {
+      this.startCountdownTimer();
+    } else if (status === 'ready') {
+      this.checkClearDegraded();
+    }
+  }
+
+  private checkClearDegraded() {
+    const states = this.resourceStates();
+    const hasAnyError = Object.values(states).some((state) => state.error !== null);
+    if (!hasAnyError) {
+      this.stopCountdownTimer();
+      this.retryAttempt.set(1);
+    }
+  }
+
+  private startCountdownTimer() {
+    if (this.countdownTimerId) return;
+
+    const stepIndex = Math.min(this.retryAttempt() - 1, RETRY_BACKOFF_STEPS.length - 1);
+    const delaySec = RETRY_BACKOFF_STEPS[Math.max(0, stepIndex)];
+    this.retryCountdown.set(delaySec);
+
+    this.countdownTimerId = setInterval(() => {
+      const current = this.retryCountdown();
+      if (current <= 1) {
+        this.stopCountdownTimer();
+        this.retryFailedResources();
+      } else {
+        this.retryCountdown.set(current - 1);
+      }
+    }, 1000);
+  }
+
+  private stopCountdownTimer() {
+    if (this.countdownTimerId) {
+      clearInterval(this.countdownTimerId);
+      this.countdownTimerId = null;
+    }
+  }
+
+  /**
+   * Loads all initial dashboard data in parallel.
+   * Keeps `isLoading` true until all initial calls settle.
+   * Preserves previously loaded data on failures and tracks per-resource error state.
+   */
+  async loadInitialData(): Promise<void> {
+    this.isLoading.set(true);
+
+    const observables = [
+      this.fetchStats(),
+      this.fetchApplications(),
+      this.fetchTracker(),
+      this.fetchProfile(),
+      this.fetchAuthStatus(),
+    ];
+
+    return new Promise((resolve) => {
+      forkJoin(observables).subscribe({
+        next: () => {
+          this.isLoading.set(false);
+          resolve();
+        },
+        error: () => {
+          this.isLoading.set(false);
+          resolve();
+        },
+      });
+    });
+  }
+
+  /**
+   * Manual or automatic retry of all degraded resources.
+   * Resets retry countdown and triggers fetches for failed items.
+   */
+  async retryFailedResources(): Promise<void> {
+    if (this.isRetrying()) return;
+    this.isRetrying.set(true);
+    this.stopCountdownTimer();
+
+    const states = this.resourceStates();
+    const tasks: Observable<unknown>[] = [];
+
+    if (states.stats.error) tasks.push(this.fetchStats());
+    if (states.applications.error) tasks.push(this.fetchApplications());
+    if (states.tracker.error) tasks.push(this.fetchTracker());
+    if (states.profile.error) tasks.push(this.fetchProfile());
+    if (states.auth.error) tasks.push(this.fetchAuthStatus());
+    if (states.pipeline.error) tasks.push(this.fetchPipelineStatus());
+    if (states.automation.error) tasks.push(this.fetchAutomationStatus());
+
+    if (tasks.length === 0) {
+      // If none specifically marked error, refresh all core
+      tasks.push(
+        this.fetchStats(),
+        this.fetchApplications(),
+        this.fetchTracker(),
+        this.fetchProfile(),
+        this.fetchAuthStatus(),
+      );
+    }
+
+    return new Promise((resolve) => {
+      forkJoin(tasks).subscribe({
+        next: () => {
+          this.isRetrying.set(false);
+          const stillFailing = Object.values(this.resourceStates()).some(
+            (state) => state.error !== null,
+          );
+          if (stillFailing) {
+            this.retryAttempt.update((a) => Math.min(a + 1, RETRY_BACKOFF_STEPS.length));
+            this.stopCountdownTimer();
+            this.startCountdownTimer();
+          } else {
+            this.retryAttempt.set(1);
+          }
+          resolve();
+        },
+        error: () => {
+          this.isRetrying.set(false);
+          this.retryAttempt.update((a) => Math.min(a + 1, RETRY_BACKOFF_STEPS.length));
+          this.stopCountdownTimer();
+          this.startCountdownTimer();
+          resolve();
+        },
+      });
+    });
+  }
+
+  fetchStats() {
+    this.setResourceStatus('stats', 'loading');
+    return this.api.getStats().pipe(
+      tap((data) => {
+        this.stats.set(data);
+        this.setResourceStatus('stats', 'ready', null, true);
+      }),
+      catchError((err) => {
+        this.setResourceStatus('stats', 'error', classifyHttpError(err, '/api/stats'));
+        return of(null);
+      }),
+    );
+  }
+
+  loadStats() {
+    this.fetchStats().subscribe();
+  }
+
+  fetchApplications() {
+    this.setResourceStatus('applications', 'loading');
+    return this.api.getApplications(this.searchQuery()).pipe(
+      tap((data) => {
+        this.applications.set(data.items || []);
+        this.setResourceStatus('applications', 'ready', null, true);
+      }),
+      catchError((err) => {
+        this.setResourceStatus(
+          'applications',
+          'error',
+          classifyHttpError(err, '/api/applications'),
+        );
+        return of(null);
+      }),
+    );
+  }
+
+  loadApplications() {
+    this.fetchApplications().subscribe();
+  }
+
+  fetchTracker() {
+    this.setResourceStatus('tracker', 'loading');
+    return this.api.getTracker(this.trackerFilter()).pipe(
+      tap((data) => {
+        this.trackerRecords.set(data.records || []);
+        this.setResourceStatus('tracker', 'ready', null, true);
+      }),
+      catchError((err) => {
+        this.setResourceStatus('tracker', 'error', classifyHttpError(err, '/api/tracker'));
+        return of(null);
+      }),
+    );
+  }
+
+  loadTracker() {
+    this.fetchTracker().subscribe();
+  }
+
+  fetchProfile() {
+    this.setResourceStatus('profile', 'loading');
+    return this.api.getProfile().pipe(
+      tap((data) => {
+        this.profile.set(data);
+        this.setResourceStatus('profile', 'ready', null, true);
+      }),
+      catchError((err) => {
+        this.setResourceStatus('profile', 'error', classifyHttpError(err, '/api/profile'));
+        return of(null);
+      }),
+    );
+  }
+
+  loadProfile() {
+    this.fetchProfile().subscribe();
+  }
+
+  fetchAuthStatus() {
+    this.setResourceStatus('auth', 'loading');
+    return this.api.getAuthStatus().pipe(
+      tap((data) => {
+        this.authStatus.set(data);
+        this.setResourceStatus('auth', 'ready', null, true);
+      }),
+      catchError((err) => {
+        this.setResourceStatus('auth', 'error', classifyHttpError(err, '/api/auth/status'));
+        return of(null);
+      }),
+    );
+  }
+
+  checkAuthStatus() {
+    this.fetchAuthStatus().subscribe();
+  }
+
+  fetchPipelineStatus() {
+    this.setResourceStatus('pipeline', 'loading');
+    return this.api.getPipelineStatus().pipe(
+      tap((data) => {
         this.pipelineStatus.set(data);
+        this.setResourceStatus('pipeline', 'ready', null, true);
         if (this.consoleAutoScroll() && this.activeTab() === 'console' && this.consoleContainer) {
           setTimeout(() => {
             const el = this.consoleContainer?.nativeElement;
             if (el) el.scrollTop = el.scrollHeight;
           }, 50);
         }
-      },
-    });
-    this.api.getAutomationStatus().subscribe({
-      next: (data) => this.automationStatus.set(data),
-    });
+      }),
+      catchError((err) => {
+        this.setResourceStatus('pipeline', 'error', classifyHttpError(err, '/api/pipeline/status'));
+        return of(null);
+      }),
+    );
   }
 
-  loadStats() {
-    this.api.getStats().subscribe({
-      next: (data) => this.stats.set(data),
-    });
+  fetchAutomationStatus() {
+    this.setResourceStatus('automation', 'loading');
+    return this.api.getAutomationStatus().pipe(
+      tap((data) => {
+        this.automationStatus.set(data);
+        this.setResourceStatus('automation', 'ready', null, true);
+      }),
+      catchError((err) => {
+        this.setResourceStatus(
+          'automation',
+          'error',
+          classifyHttpError(err, '/api/automation/status'),
+        );
+        return of(null);
+      }),
+    );
   }
 
-  loadApplications() {
-    this.api.getApplications(this.searchQuery()).subscribe({
-      next: (data) => this.applications.set(data.items || []),
-    });
+  /**
+   * Background polling: silently updates healthy resources while failed reads use backoff.
+   * Suppresses noisy error toasts to avoid toast storms when polling fails.
+   */
+  refreshPoll() {
+    const states = this.resourceStates();
+    if (!states.stats.error) this.loadStats();
+    if (!states.pipeline.error) this.fetchPipelineStatus().subscribe();
+    if (!states.automation.error) this.fetchAutomationStatus().subscribe();
   }
 
-  loadTracker() {
-    this.api.getTracker(this.trackerFilter()).subscribe({
-      next: (data) => this.trackerRecords.set(data.records || []),
-    });
+  resolveFileUrl(url: string | null | undefined): string {
+    return resolveFileUrl(url);
   }
 
-  loadProfile() {
-    this.api.getProfile().subscribe({
-      next: (data) => this.profile.set(data),
-    });
+  resolveSafeFileUrl(url: string | null | undefined): SafeResourceUrl {
+    return this.sanitizer.bypassSecurityTrustResourceUrl(this.resolveFileUrl(url));
   }
 
-  checkAuthStatus() {
-    this.api.getAuthStatus().subscribe({
-      next: (data) => this.authStatus.set(data),
-    });
-  }
-
-  showToast(message: string, type: 'success' | 'error' | 'info' = 'success') {
+  showToast(message: string, type: 'success' | 'error' | 'info' | 'warning' = 'success') {
     this.toast.set({ visible: true, message, type });
     setTimeout(() => {
       this.toast.set({ visible: false, message: '', type: 'success' });
@@ -286,7 +617,7 @@ export class App implements OnInit {
         this.isRegeneratingCv.update((m) => ({ ...m, [appId]: false }));
       },
       error: (err) => {
-        this.showToast(err.error?.detail || 'Failed to generate CV', 'error');
+        this.showToast(classifyHttpError(err).message || 'Failed to generate CV', 'error');
         this.isRegeneratingCv.update((m) => ({ ...m, [appId]: false }));
       },
     });
@@ -301,7 +632,7 @@ export class App implements OnInit {
         this.refreshPoll();
       },
       error: (err) => {
-        this.showToast(err.error?.detail || 'Could not start auto-apply', 'error');
+        this.showToast(classifyHttpError(err).message || 'Could not start auto-apply', 'error');
         this.isApplying.update((m) => ({ ...m, [appId]: false }));
       },
     });
@@ -316,7 +647,7 @@ export class App implements OnInit {
         this.isBatchRunning.set(false);
       },
       error: (err) => {
-        this.showToast(err.error?.detail || 'Failed to start batch', 'error');
+        this.showToast(classifyHttpError(err).message || 'Failed to start batch', 'error');
         this.isBatchRunning.set(false);
       },
     });
@@ -478,7 +809,8 @@ export class App implements OnInit {
           this.activeTab.set('console');
           this.refreshPoll();
         },
-        error: (err) => this.showToast(err.error?.detail || 'Failed to start pipeline', 'error'),
+        error: (err) =>
+          this.showToast(classifyHttpError(err).message || 'Failed to start pipeline', 'error'),
       });
   }
 
@@ -496,7 +828,8 @@ export class App implements OnInit {
         this.showToast('Verification code submitted to browser!');
         this.verificationCode.set('');
       },
-      error: (err) => this.showToast(err.error?.detail || 'Failed to submit code', 'error'),
+      error: (err) =>
+        this.showToast(classifyHttpError(err).message || 'Failed to submit code', 'error'),
     });
   }
 
@@ -515,7 +848,7 @@ export class App implements OnInit {
         setTimeout(() => this.launchingPlatform.set(null), 3000);
       },
       error: (err) => {
-        this.showToast(err.error?.detail || 'Failed to open login', 'error');
+        this.showToast(classifyHttpError(err).message || 'Failed to open login', 'error');
         this.launchingPlatform.set(null);
       },
     });
@@ -534,22 +867,78 @@ export class App implements OnInit {
     });
   }
 
-  uploadBackup(event: Event) {
+  uploadBackup(event: Event): Promise<void> {
     const input = event.target as HTMLInputElement;
     const file = input.files?.[0];
-    if (!file) return;
+    if (!file) return Promise.resolve();
 
     const fd = new FormData();
     fd.append('file', file);
+    this.isImporting.set(true);
     this.showToast('Importing backup package...', 'info');
-    this.api.importBackup(fd).subscribe({
-      next: (res) => {
-        this.showToast((res['message'] as string) || 'Backup imported successfully!');
-        this.loadInitialData();
-      },
-      error: (err) => this.showToast(err.error?.detail || 'Import failed', 'error'),
+
+    return new Promise((resolve) => {
+      this.api.importBackup(fd).subscribe({
+        next: async (res) => {
+          const report = res['report'] as any;
+          const importedApps =
+            report?.imported_applications ?? (res['imported_applications'] as number) ?? 0;
+          const mergedRecords =
+            report?.merged_db_records ?? (res['merged_db_records'] as number) ?? 0;
+          const importedApplied =
+            report?.imported_applied ?? (res['imported_applied'] as number) ?? 0;
+
+          // Clear search and filter so newly imported applications aren't hidden
+          this.searchQuery.set('');
+          this.trackerFilter.set('');
+
+          try {
+            await this.loadInitialData();
+            this.isImporting.set(false);
+
+            if (this.hasDegradedResources()) {
+              this.showToast(
+                `Imported ${importedApps} applications, but dashboard refresh failed. Please click Retry now.`,
+                'warning',
+              );
+              resolve();
+              return;
+            }
+
+            if (importedApps === 0 && mergedRecords === 0 && importedApplied === 0) {
+              this.showToast(
+                'Backup package imported, but 0 applications or records were found in the archive.',
+                'warning',
+              );
+            } else if (importedApps > 0) {
+              this.activeTab.set('queue');
+              this.showToast(
+                `Successfully imported ${importedApps} applications and ${mergedRecords} records!`,
+                'success',
+              );
+            } else {
+              this.activeTab.set('tracker');
+              this.showToast(`Successfully imported ${mergedRecords} tracker records!`, 'success');
+            }
+          } catch {
+            this.isImporting.set(false);
+            this.showToast(
+              `Imported ${importedApps} applications, but dashboard refresh failed. Please click Retry now.`,
+              'warning',
+            );
+          }
+          resolve();
+        },
+        error: (err) => {
+          this.isImporting.set(false);
+          const classified = classifyHttpError(err, '/api/import');
+          this.showToast(classified.message || 'Import failed', 'error');
+          resolve();
+        },
+      });
+
+      input.value = '';
     });
-    input.value = '';
   }
 
   saveProfile() {
