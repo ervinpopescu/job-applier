@@ -148,6 +148,7 @@ def set_automation_hud(
 class ApplyRequest(BaseModel):
     mode: str = "assisted"  # 'assisted' or 'autonomous'
     headless: bool | None = None
+    browser: str | None = None
 
 
 class BatchApplyRequest(BaseModel):
@@ -155,6 +156,7 @@ class BatchApplyRequest(BaseModel):
     count: int = 5
     mode: str = "assisted"
     headless: bool | None = None
+    browser: str | None = None
 
 
 class CoverLetterUpdate(BaseModel):
@@ -221,6 +223,7 @@ class SubmitCodeRequest(BaseModel):
 class AuthLoginRequest(BaseModel):
     platform: str
     timeout: int = 180
+    browser: str | None = None
 
 
 def get_safe_app_folder(app_id: str) -> Path:
@@ -622,7 +625,9 @@ def run_auto_apply_for_job(
 
     def run_worker():
         automator = BrowserAutomator(
-            headless=body.headless, status_callback=hud_callback
+            headless=body.headless,
+            browser=body.browser,
+            status_callback=hud_callback,
         )
         try:
             automator.start()
@@ -1030,11 +1035,11 @@ def submit_verification_code(body: SubmitCodeRequest) -> dict[str, Any]:
 
 
 @app.get("/api/auth/status")
-def get_auth_status() -> dict[str, Any]:
+def get_auth_status(browser: str | None = None) -> dict[str, Any]:
     """Returns platform authentication status for LinkedIn, BestJobs, eJobs, and Google."""
     from job_applier.automation.auth_manager import AuthManager
 
-    manager = AuthManager()
+    manager = AuthManager(browser=browser)
     return manager.check_auth_status()
 
 
@@ -1051,18 +1056,22 @@ def launch_auth_login(
             status_code=400, detail=f"Unsupported platform: {body.platform}"
         )
 
-    manager = AuthManager()
+    manager = AuthManager(browser=body.browser)
+    engine_name = manager.engine.capitalize()
 
     def run_login_worker():
         manager.launch_interactive_login(
-            platform=platform, timeout_seconds=body.timeout
+            platform=platform,
+            timeout_seconds=body.timeout,
+            browser=body.browser,
         )
 
     background_tasks.add_task(run_login_worker)
     return {
         "status": "started",
         "platform": platform,
-        "message": f"Launched login window for {platform.upper()}. Please complete sign-in in the Chrome window.",
+        "browser": manager.engine,
+        "message": f"Launched login window for {platform.upper()} using {engine_name}. Please complete sign-in in the browser window.",
     }
 
 
@@ -1071,7 +1080,7 @@ def sync_chrome_cookies() -> dict[str, Any]:
     """Syncs existing authenticated sessions from desktop Chrome into the persistent profile."""
     from job_applier.automation.auth_manager import AuthManager
 
-    manager = AuthManager()
+    manager = AuthManager(browser="chrome")
     return manager.sync_desktop_cookies()
 
 
@@ -1156,7 +1165,7 @@ def batch_apply(
 
     def run_batch():
         try:
-            automator = BrowserAutomator(headless=body.headless)
+            automator = BrowserAutomator(headless=body.headless, browser=body.browser)
             try:
                 automator.start()
                 for f in folders:

@@ -136,3 +136,44 @@ def test_export_endpoint(client):
     assert res.status_code == 200
     assert res.headers["content-type"] == "application/zip"
     assert len(res.content) > 1000
+
+
+def test_auth_status_with_browser_query(client):
+    res_ff = client.get("/api/auth/status?browser=firefox")
+    assert res_ff.status_code == 200
+    data_ff = res_ff.json()
+    assert data_ff["browser"] == "firefox"
+    assert ".browser_profile_firefox" in data_ff["profile_dir"]
+
+    res_ch = client.get("/api/auth/status?browser=chrome")
+    assert res_ch.status_code == 200
+    data_ch = res_ch.json()
+    assert data_ch["browser"] == "chrome"
+    assert ".browser_profile" in data_ch["profile_dir"]
+
+
+def test_auth_login_with_browser_selection(client):
+    with patch(
+        "job_applier.automation.auth_manager.AuthManager.launch_interactive_login",
+        return_value={"status": "success"},
+    ):
+        res = client.post(
+            "/api/auth/login",
+            json={"platform": "linkedin", "browser": "firefox", "timeout": 30},
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert data["status"] == "started"
+        assert data["platform"] == "linkedin"
+        assert data["browser"] == "firefox"
+        assert "Firefox" in data["message"]
+
+
+def test_auth_sync_chrome_endpoint(client):
+    with patch(
+        "job_applier.automation.auth_manager.AuthManager.sync_desktop_cookies",
+        return_value={"status": "success", "cookies_merged": 5},
+    ):
+        res = client.post("/api/auth/sync-chrome")
+        assert res.status_code == 200
+        assert res.json()["cookies_merged"] == 5
