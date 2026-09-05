@@ -152,6 +152,14 @@ class TestDisplayDetection:
 
 
 class TestVirtualDisplayManager:
+    @pytest.fixture(autouse=True)
+    def clean_display_manager(self):
+        VirtualDisplayManager.stop()
+        VirtualDisplayManager._process = None
+        yield
+        VirtualDisplayManager.stop()
+        VirtualDisplayManager._process = None
+
     def test_ensure_display_when_already_available(self):
         with (
             patch(

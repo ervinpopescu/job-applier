@@ -192,6 +192,8 @@ class VirtualDisplayManager:
                     pass
             finally:
                 cls._process = None
+        else:
+            cls._process = None
 
 
 def validate_browser_engine(engine: str | None) -> str:
