@@ -9,8 +9,8 @@ Job Applier automates the job search lifecycle: scraping technical positions, ta
 - **Unified Web Dashboard:** Full-stack FastAPI + Alpine.js interface with side-by-side PDF preview, cover letter editor, and sortable tracker.
 - **Multi-Site Scraping:** Aggregates listings from LinkedIn, Indeed, Glassdoor, Google Jobs, Romanian portals (eJobs, BestJobs, Hipo, Undelucram, Jooble), direct ATSs (Greenhouse, Lever), and remote tech boards.
 - **AI Resume & Cover Letter Tailoring:** Analyzes job descriptions and dynamically tailors your master JSON resume and generates targeted cover letters using Google Gemini 3.8-Flash.
-- **Browser Automation:** Assisted and autonomous Playwright engine with Cloudflare Turnstile handling, form autofill, CV upload, and AI screening question answering.
-- **Session Vault & Desktop Sync:** Persistent browser profile with 1-click session synchronization from your desktop Chrome browser.
+- **Browser Automation & Multi-Engine:** Cross-platform Playwright engine with Chrome/Chromium and Firefox support, Cloudflare Turnstile handling, form autofill, CV upload, and AI screening question answering.
+- **Session Vault & Desktop Sync:** Engine-isolated persistent browser profiles (.browser_profile / .browser_profile_firefox) with 1-click session synchronization from desktop Chrome.
 - **SQLite Database & Portable Sync:** Relational SQLite database with WAL concurrency, plus 1-click export/import of portable `.zip` backup bundles between machines.
 - **Portable Deployment:** Multi-architecture Docker image, host-agnostic Compose configuration, health checks, and optional secret-based GitHub deployment.
 
@@ -32,7 +32,7 @@ Create a `.env` file in the project root:
 
 ```env
 GOOGLE_API_KEY=your_gemini_api_key_here
-DISPLAY=:20  # (Optional: set your active X11 display for headed browser visibility)
+JOB_APPLIER_BROWSER=auto  # (Optional: auto, chrome, chromium, or firefox)
 ```
 
 `just setup` creates ignored private files from the public examples. Edit `data/master_resume.json` with your experience and update `data/candidate_profile.json` directly or through the dashboard.
@@ -68,7 +68,7 @@ Run `just` to see all available automated recipes:
 | **Run Pipeline** | `just pipeline` | Runs scraping, tailoring, and PDF generation |
 | **Run Remote Pipeline** | `just pipeline-remote` | Runs pipeline targeting remote/telework positions |
 | **Terminal Assistant** | `just assistant` | Launches interactive terminal review & auto-apply CLI |
-| **Log In to Platform** | `just login linkedin` | Launches native Chrome on DISPLAY to sign in & save session |
+| **Log In to Platform** | `just login linkedin` | Launches browser window to sign in & save session |
 | **Desktop Chrome Sync** | `just sync-chrome` | 1-click copies sessions from desktop Chrome into profile |
 | **Auth Status** | `just auth-status` | Inspects real cookie database for active login tokens |
 | **Export Backup** | `just export backup.zip` | Creates portable `.zip` backup of all applications & SQLite DB |

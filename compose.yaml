@@ -13,12 +13,14 @@ services:
       JOOBLE_API_KEY: ${JOOBLE_API_KEY:-}
       JOB_APPLIER_DB_PATH: /app/data/job_applier.db
       JOB_APPLIER_TRACKER_PATH: /app/data/applications_tracker.csv
+      JOB_APPLIER_BROWSER: ${JOB_APPLIER_BROWSER:-auto}
     ports:
       - "${JOB_APPLIER_BIND_ADDRESS:-127.0.0.1}:${JOB_APPLIER_PORT:-8000}:8000"
     volumes:
       - job-applier-data:/app/data
       - job-applier-output:/app/output
       - job-applier-browser-profile:/app/.browser_profile
+      - job-applier-browser-profile-firefox:/app/.browser_profile_firefox
     shm_size: "1gb"
     healthcheck:
       test:
@@ -37,3 +39,4 @@ volumes:
   job-applier-data:
   job-applier-output:
   job-applier-browser-profile:
+  job-applier-browser-profile-firefox:

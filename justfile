@@ -27,7 +27,7 @@ install:
 
 # Run the FastAPI web dashboard server on port 8000
 web:
-    DISPLAY="${DISPLAY:-:20}" uv run python src/job_applier/cli/web_app.py
+    uv run python src/job_applier/cli/web_app.py
 
 # Run the Angular frontend development server on port 4200 (with proxy to port 8000)
 ui:
@@ -54,12 +54,12 @@ assistant *ARGS:
 # --- Authentication & Sessions ---
 
 # Check connected accounts and cookie status
-auth-status:
-    uv run python src/job_applier/cli/auth_cli.py status
+auth-status *ARGS:
+    uv run python src/job_applier/cli/auth_cli.py status {{ARGS}}
 
-# Launch native Chrome on DISPLAY to log in and save cookies permanently
-login platform="linkedin":
-    DISPLAY="${DISPLAY:-:20}" uv run python src/job_applier/cli/auth_cli.py login {{platform}}
+# Launch interactive browser session to log in and save cookies permanently
+login platform="linkedin" *ARGS:
+    uv run python src/job_applier/cli/auth_cli.py login {{platform}} {{ARGS}}
 
 # 1-click sync cookies from desktop Chrome (Profile 5 & Default) into .browser_profile/
 sync-chrome:

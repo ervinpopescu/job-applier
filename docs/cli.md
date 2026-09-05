@@ -97,7 +97,7 @@ Manages login sessions and persistent cookies stored in `.browser_profile/`.
 just auth-status
 # or: python src/job_applier/cli/auth_cli.py status
 
-# Launch native Chrome on DISPLAY to log in once:
+# Launch browser session to log in once:
 just login linkedin
 just login bestjobs
 just login ejobs

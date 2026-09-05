@@ -7,7 +7,7 @@ The Job Applier dashboard is a unified, real-time web application built with Fas
 ```bash
 # Production server (hosting compiled Angular SPA):
 just web
-# or: DISPLAY=:20 python src/job_applier/cli/web_app.py
+# or: python src/job_applier/cli/web_app.py
 
 # Frontend development server with hot-reload (port 4200):
 just ui
