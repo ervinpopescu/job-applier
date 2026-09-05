@@ -14,12 +14,17 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
 
+      - name: Install just
+        uses: taiki-e/install-action@7b8d4719ee4aaa279bdf55df38dacb9ebfe12a6c # v2
+        with:
+          tool: just
+
       - name: Install uv
-        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9
         with:
           enable-cache: false
 
@@ -30,17 +35,14 @@ jobs:
         run: uv sync --all-extras --dev --frozen
 
       - name: Run pre-commit hooks
-        run: uv run pre-commit run --all-files
+        run: just pre-commit
 
       - name: Install Playwright Chromium
         run: uv run playwright install --with-deps chromium
 
-      - name: Run tests
-        run: uv run pytest
-
       # setup-node's tool cache is not shared with the image-publishing job.
       - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4, zizmor: ignore[cache-poisoning]
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5, zizmor: ignore[cache-poisoning]
         with:
           node-version: 22.12
 
@@ -48,9 +50,8 @@ jobs:
         working-directory: frontend
         run: npm ci
 
-      - name: Build frontend
-        working-directory: frontend
-        run: npm run build
+      - name: Run verification checks with just
+        run: just check
 
   publish:
     if: github.event_name != 'pull_request'
@@ -62,7 +63,7 @@ jobs:
     outputs:
       image: ${{ steps.image.outputs.image }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
 
