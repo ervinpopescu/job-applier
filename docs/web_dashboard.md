@@ -65,10 +65,22 @@ Customize your contact info, location, URLs (LinkedIn, GitHub, Portfolio), curre
 
 ---
 
-## Logins & Authentication Modal
+## Dashboard Access Control & Login Gate
 
-Accessible via the **`Logins & Auth`** button in the top navbar:
+When `APP_AUTH_ENABLED=true` is set on the server:
+
+- **Login Gate:** Unauthenticated users are presented with a responsive login screen offering Google and/or GitHub OAuth sign-in buttons depending on server configuration.
+- **Protected Endpoints:** All sensitive `/api` data endpoints and generated application files (`/files/*`) are locked down, returning HTTP 401 until authenticated.
+- **Identity & Session:** Once signed in, the user's name/username and avatar appear in the top navbar alongside a **Logout** button.
+- **Safe Callback Error Alerts:** If access is denied at consent or an account is not on the server allowlist, user-friendly error banners are displayed without exposing internal secrets or stack traces.
+- **Subpath Support:** All authentication URLs seamlessly adapt to root or subpath deployments (e.g. `/job-applier/auth/login/google`).
+
+---
+
+## Platform Logins & Browser Sessions Modal
+
+Accessible via the **`Logins & Auth`** button in the top navbar (distinct from dashboard access control):
 
 - **1-Click Sync from Desktop Chrome:** Directly merges authenticated sessions from your local desktop Chrome browser (`Profile 5` and `Default`) into `.browser_profile/`.
-- **Connect / Log In:** Launches native Chrome on your display to log in manually once with password and 2FA.
+- **Connect / Log In:** Launches native Chrome on your display to log in manually once with password and 2FA for job portals (LinkedIn, BestJobs, eJobs, Google).
 - Live status indicators: 🟢 `Connected` / ⚪ `Not Connected`.

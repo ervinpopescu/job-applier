@@ -97,9 +97,21 @@ Chromium receives a 1 GiB shared-memory allocation through Compose. Increase `sh
 
 ## Reverse proxy and authentication
 
-Keep `JOB_APPLIER_BIND_ADDRESS=127.0.0.1` when using Caddy, Nginx, Traefik, Cloudflare Tunnel, or Tailscale. Terminate HTTPS and require authentication at that layer. The application currently does not provide its own multi-user authentication boundary.
+Keep `JOB_APPLIER_BIND_ADDRESS=127.0.0.1` when using Caddy, Nginx, Traefik, Cloudflare Tunnel, or Tailscale, and terminate HTTPS at the proxy layer.
 
-Do not proxy the dashboard publicly without access control. It can expose resumes, contact details, generated documents, and authenticated browser state.
+### Built-in Dashboard OAuth Authentication
+
+`job-applier` provides native production-grade Google and GitHub OAuth dashboard access control:
+
+1. In your `.env`, set `APP_AUTH_ENABLED=true`.
+2. Generate a strong session secret (>= 32 characters): `openssl rand -base64 32`.
+3. Set `APP_PUBLIC_URL` to your public hostname and optional subpath (e.g. `https://jobs.example.com` or `https://example.com/job-applier`).
+4. Add your `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` and/or `GITHUB_CLIENT_ID`/`GITHUB_CLIENT_SECRET`.
+5. Optionally configure `AUTH_ALLOWED_GOOGLE_EMAILS` or `AUTH_ALLOWED_GITHUB_USERS` allowlists.
+
+When auth is enabled, all sensitive `/api` routes and `/files` storage return HTTP 401 JSON unless authenticated via a signed, HttpOnly, SameSite=Lax session cookie. See [Authentication Architecture](authentication.md) for full setup instructions.
+
+Do not expose the dashboard publicly without access control. It manages personal resumes, contact details, generated documents, and authenticated browser state.
 
 ## Automatic private-host deployment
 

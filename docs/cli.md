@@ -90,7 +90,7 @@ python src/job_applier/cli/apply_assistant.py --stats
 
 ## 3. Platform Authentication (`auth_cli.py`)
 
-Manages login sessions and persistent cookies stored in `.browser_profile/`.
+Manages job portal login sessions and persistent cookies stored in `.browser_profile/` (for LinkedIn, BestJobs, eJobs, and Google job applications). This is distinct from dashboard OAuth access control.
 
 ```bash
 # Check current connection status:
