@@ -51,6 +51,14 @@ pipeline-remote *ARGS:
 assistant *ARGS:
     uv run python src/job_applier/cli/apply_assistant.py {{ARGS}}
 
+# --- Resume & Documents ---
+
+# Compile resume JSON into styled PDF format (default: data/master_resume.json -> output/)
+resume *ARGS:
+    uv run python src/job_applier/resume/resume.py {{ARGS}}
+
+alias resume-pdf := resume
+
 # --- Authentication & Sessions ---
 
 # Check connected accounts and cookie status
