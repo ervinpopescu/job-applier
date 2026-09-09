@@ -133,7 +133,7 @@ def generate_resume(data, output_filename):
         pdf.section_title("Technical Skills")
         pdf.set_font("helvetica", "", 10)
         for skill in data["skills"]:
-            pdf.cell(0, 5, sanitize_text(f"- {skill}"), 0, 1)
+            pdf.multi_cell(0, 5, sanitize_text(f"- {skill}"))
         pdf.ln(3)
 
     # --- EDUCATION ---
