@@ -48,6 +48,19 @@ def test_generate_pdf_creates_parent_directory(sample_resume_data, tmp_path):
     assert output_file.stat().st_size > 0
 
 
+def test_generate_pdf_long_skills(sample_resume_data, tmp_path):
+    sample_resume_data["skills"] = [
+        "Cloud & Architecture: Google Cloud Platform (GCP), Apigee (X, Hybrid, Edge), AWS, Cloud Run, Cloud Functions, Identity-Aware Proxy (IAP), Zero Trust",
+        "Agentic AI & LLMs: Google Cloud Agent Development Kit (ADK), Gemini API, LangChain, RAG Systems, Multi-Agent Workflows, Tool-Calling",
+    ]
+    output_file = tmp_path / "test_long_skills.pdf"
+
+    generate_resume(sample_resume_data, str(output_file))
+
+    assert output_file.exists()
+    assert output_file.stat().st_size > 0
+
+
 def test_generate_pdf_unicode(sample_resume_data, tmp_path):
     # Add unicode characters that typically cause latin-1 errors
     sample_resume_data["summary"] = (
