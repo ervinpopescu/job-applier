@@ -1,6 +1,7 @@
 import argparse
 import json
 import sys
+from pathlib import Path
 
 from fpdf import FPDF
 
@@ -163,7 +164,9 @@ def generate_resume(data, output_filename):
 
     # --- OUTPUT ---
     try:
-        pdf.output(output_filename)
+        output_path = Path(output_filename)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        pdf.output(str(output_path))
         print(f"PDF generated successfully: {output_filename}")
     except Exception as e:
         print(f"Error generating PDF: {e}")
