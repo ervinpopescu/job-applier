@@ -60,8 +60,8 @@ services:
     ports:
       - "${JOB_APPLIER_BIND_ADDRESS:-127.0.0.1}:${JOB_APPLIER_PORT:-8001}:8000"
     volumes:
-      - job-applier-data:/app/data
-      - job-applier-output:/app/output
+      - ${DATA_DIR:-/home/ervin/prjs/job-applier/data}:/app/data
+      - ${OUTPUT_DIR:-/home/ervin/prjs/job-applier/output}:/app/output
     networks:
       - internal-net
     healthcheck:
@@ -106,8 +106,8 @@ services:
       NTFY_TOPIC: ${NTFY_TOPIC:-job-alerts}
       NTFY_TOKEN: ${NTFY_TOKEN:-}
     volumes:
-      - job-applier-data:/app/data
-      - job-applier-output:/app/output
+      - ${DATA_DIR:-/home/ervin/prjs/job-applier/data}:/app/data
+      - ${OUTPUT_DIR:-/home/ervin/prjs/job-applier/output}:/app/output
       - job-applier-browser-profile:/app/.browser_profile
     networks:
       - internal-net
@@ -160,8 +160,6 @@ services:
       - internal-net
 
 volumes:
-  job-applier-data:
-  job-applier-output:
   job-applier-browser-profile:
   job-applier-ntfy-data:
   caddy-data:

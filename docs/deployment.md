@@ -74,14 +74,16 @@ The Docker build excludes repository `data/`, `output/`, `.env`, and `.browser_p
 
 ## Persistent data and backups
 
-Compose creates six named volumes:
+Compose bind-mounts the canonical host data directories and keeps four service volumes:
 
-- `job-applier-data` — profile, master resume, SQLite database, and tracker data
-- `job-applier-output` — generated application packages and PDFs
+- `${DATA_DIR}` (default `/home/ervin/prjs/job-applier/data`) — profile, master resume, SQLite database, and tracker data
+- `${OUTPUT_DIR}` (default `/home/ervin/prjs/job-applier/output`) — generated application packages and PDFs
 - `job-applier-browser-profile` — persistent Playwright sessions
 - `job-applier-ntfy-data` — persistent notification cache and user db
 - `caddy-data` — internal reverse proxy state
 - `caddy-config` — internal reverse proxy runtime configuration
+
+The data and output bind mounts are shared by the web and runtime containers, so recreating containers does not require copying the database or generated packages. Ensure the rootless container UID has read/write access to both host directories.
 
 Upgrades preserve all named volumes:
 
@@ -98,7 +100,7 @@ curl -f http://127.0.0.1:8089/api/export -o job-applier-backup.zip
 # curl -f http://127.0.0.1:8001/api/export -o job-applier-backup.zip
 ```
 
-Removing the Compose stack with `docker compose down` preserves data. Adding `--volumes` permanently deletes the volumes and must only be used when intentionally resetting the installation.
+Removing the Compose stack with `docker compose down` preserves the bind-mounted data and output directories. Adding `--volumes` only removes the remaining named service volumes, but deleting or replacing the host bind-mounted directories still destroys application data and must only be done after a verified backup.
 
 ## Browser automation in containers
 
