@@ -119,3 +119,85 @@ just export my_backup.zip
 just import my_backup.zip
 # or: python src/job_applier/cli/sync_cli.py import --input my_backup.zip
 ```
+
+---
+
+## 5. Autonomous Queue Worker (`worker.py`)
+
+Runs the background daemon that continuously polls the SQLite queue, claims jobs via heartbeated leases, executes platform adapters, and enforces the central safety guard.
+
+```bash
+# Using just:
+just worker
+
+# Or directly with Python:
+python -m job_applier.cli.worker [OPTIONS]
+```
+
+### Options
+
+| Flag | Description | Default |
+| ------ | ------------- | --------- |
+| `--max-jobs` | Maximum number of jobs to process before exiting | `None` (run continuously) |
+| `--poll-interval` | Idle polling delay in seconds | `3.0` |
+| `--headed` | Launch visible browser window (defaults to headless) | `False` |
+| `--browser` | Browser engine (`chromium`, `firefox`, `chrome`) | `chromium` |
+| `--worker-id` | Custom worker identifier string | Auto-generated UUID |
+
+---
+
+## 6. Operations & Disaster Recovery (`ops_cli.py`)
+
+Provides operational reliability commands: quiesced online backups, age encryption, restore with downgrade protection, backup retention rotation, disk guards, and emergency stop.
+
+```bash
+# Using just:
+just ops-backup
+just ops-restore <ARCHIVE>
+just ops-retention
+just ops-disk-guard
+just ops-emergency-stop
+just ops-unstop
+
+# Or directly with Python:
+python -m job_applier.cli.ops_cli <SUBCOMMAND> [OPTIONS]
+```
+
+### Subcommands
+
+- `backup`: Creates an atomic, online SQLite snapshot backup with optional age encryption.
+  - `--recipient`: Age public key for encryption.
+  - `--no-quiesce`: Skip pausing the worker during snapshot.
+  - `--no-profile`: Omit the browser profile directory.
+- `restore`: Restores database and artifacts from a backup archive with schema downgrade refusal protection.
+  - `--identity-file`: Path to age secret key file for encrypted archives.
+  - `--identity`: Secret key string directly.
+- `retention`: Applies the 7 daily / 4 weekly rotation policy, purging expired archives.
+  - `--dry-run`: Preview files to be pruned without deleting.
+- `disk-guard`: Checks available filesystem headroom against minimum safety thresholds.
+  - `--enforce`: Auto-pauses the queue if disk pressure is detected.
+- `cleanup-debug`: Purges ephemeral debug screenshots and logs older than `--ttl-days`.
+- `emergency-stop`: Atomically halts queue processing, pauses execution, and revokes active worker leases.
+- `unstop`: Clears emergency stop flag (automation remains paused awaiting safe resume).
+
+---
+
+## 7. Runtime Daemon (`runtime_daemon.py`)
+
+Supervises containerized virtual display (Xvfb), internal VNC server, websockify bridge, and outbound security proxy for headed automation and remote viewer sessions.
+
+```bash
+python -m job_applier.cli.runtime_daemon [OPTIONS]
+```
+
+### Options
+
+| Flag | Description | Default |
+| ------ | ------------- | --------- |
+| `--display` | Virtual display identifier | `$DISPLAY` or `:99` |
+| `--vnc-port` | Internal localhost VNC port | `$VNC_PORT` or `5900` |
+| `--websockify-port` | Internal websockify bridge port | `$WEBSOCKIFY_PORT` or `6080` |
+| `--proxy-port` | Outbound security proxy port | `$PROXY_PORT` or `8899` |
+| `--poll-interval` | Queue polling interval in seconds | `3.0` |
+| `--novnc-dir` | Directory containing noVNC web assets | `/usr/share/novnc` |
+| `--browser` | Browser engine (`chromium`, `firefox`, `chrome`) | `chromium` |

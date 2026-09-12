@@ -11,12 +11,16 @@ dist/
 *.egg-info/
 
 # Project Specific
+output
 output/
+data
+data/
 data/scraped_jobs/
 data/processed_jobs.txt
 data/applications_tracker.csv
 data/job_applier.db*
 data/_imported*
+.browser_profile
 .browser_profile/
 *.txt
 *.json

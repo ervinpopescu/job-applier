@@ -2,12 +2,20 @@ import { Injectable, inject } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import type { Observable } from 'rxjs';
 import type {
+  AppFilterCounts,
   ApplicationDetail,
   ApplicationItem,
+  ApplicationAutomationEventsResponse,
+  ApplicationAutomationStatusResponse,
+  MainResumeResponse,
   AuthStatusReport,
+  AutomationFunnel,
   AutomationStatus,
   CandidateProfile,
+  NotificationListResponse,
   PipelineStatus,
+  QueueJobActionResponse,
+  TakeoverStatus,
   TrackerRecord,
   TrackerStats,
 } from '../models/types';
@@ -78,10 +86,31 @@ export class ApiService {
     search = '',
     limit = 60,
     offset = 0,
-  ): Observable<{ items: ApplicationItem[]; total: number }> {
+    queueOnly?: boolean,
+    filter?: string,
+  ): Observable<{
+    items: ApplicationItem[];
+    total: number;
+    scope?: string;
+    counts?: AppFilterCounts;
+  }> {
     let url = `/api/applications?limit=${limit}&offset=${offset}`;
+    if (filter) {
+      url += `&filter=${encodeURIComponent(filter)}`;
+    } else if (queueOnly !== undefined) {
+      url += `&queue_only=${queueOnly}`;
+    }
     if (search) url += `&search=${encodeURIComponent(search)}`;
-    return this.http.get<{ items: ApplicationItem[]; total: number }>(this.resolveUrl(url));
+    return this.http.get<{
+      items: ApplicationItem[];
+      total: number;
+      scope?: string;
+      counts?: AppFilterCounts;
+    }>(this.resolveUrl(url));
+  }
+
+  getTrackerExportCsvUrl(): string {
+    return this.resolveUrl('/api/tracker/export');
   }
 
   getApplication(appId: string): Observable<ApplicationDetail> {
@@ -129,10 +158,12 @@ export class ApiService {
   batchApply(
     count = 5,
     mode: 'assisted' | 'autonomous' = 'assisted',
+    appIds?: string[],
   ): Observable<Record<string, unknown>> {
     return this.http.post<Record<string, unknown>>(this.resolveUrl('/api/batch-apply'), {
       count,
       mode,
+      app_ids: appIds,
     });
   }
 
@@ -154,6 +185,24 @@ export class ApiService {
       this.resolveUrl('/api/applications/clear-failed'),
       {},
     );
+  }
+
+  clearAutomationState(): Observable<{
+    status: string;
+    message: string;
+    reset_jobs_count: number;
+    browser_closed: boolean;
+    is_paused: boolean;
+    is_stopped: boolean;
+  }> {
+    return this.http.post<{
+      status: string;
+      message: string;
+      reset_jobs_count: number;
+      browser_closed: boolean;
+      is_paused: boolean;
+      is_stopped: boolean;
+    }>(this.resolveUrl('/api/automation/clear-state'), {});
   }
 
   pruneInactive(): Observable<{ status: string; pruned_count: number; message: string }> {
@@ -209,10 +258,25 @@ export class ApiService {
     });
   }
 
+  batchRequeue(payload: {
+    items?: { job_url: string; folder_name: string }[];
+    requeue_all?: boolean;
+    status_filter?: string;
+  }): Observable<Record<string, unknown>> {
+    return this.http.post<Record<string, unknown>>(
+      this.resolveUrl('/api/tracker/batch-requeue'),
+      payload,
+    );
+  }
+
   getDiagnostics(appId: string): Observable<Record<string, unknown>> {
     return this.http.get<Record<string, unknown>>(
       this.resolveUrl(`/api/applications/${encodeURIComponent(appId)}/diagnostics`),
     );
+  }
+
+  getMainResume(): Observable<MainResumeResponse> {
+    return this.http.get<MainResumeResponse>(this.resolveUrl('/api/resume/main'));
   }
 
   getProfile(): Observable<CandidateProfile> {
@@ -249,6 +313,30 @@ export class ApiService {
     return this.http.get<AutomationStatus>(this.resolveUrl('/api/automation/status'));
   }
 
+  getAutomationFunnel(): Observable<AutomationFunnel> {
+    return this.http.get<AutomationFunnel>(this.resolveUrl('/api/automation/funnel'));
+  }
+
+  getApplicationAutomationStatus(
+    appId: string,
+    jobId?: string | null,
+  ): Observable<ApplicationAutomationStatusResponse> {
+    let url = `/api/automation/applications/${encodeURIComponent(appId)}/status`;
+    if (jobId) url += `?job_id=${encodeURIComponent(jobId)}`;
+    return this.http.get<ApplicationAutomationStatusResponse>(this.resolveUrl(url));
+  }
+
+  getApplicationAutomationEvents(
+    appId: string,
+    jobId?: string | null,
+    after = 0,
+    limit = 50,
+  ): Observable<ApplicationAutomationEventsResponse> {
+    let url = `/api/automation/applications/${encodeURIComponent(appId)}/events?after=${after}&limit=${limit}`;
+    if (jobId) url += `&job_id=${encodeURIComponent(jobId)}`;
+    return this.http.get<ApplicationAutomationEventsResponse>(this.resolveUrl(url));
+  }
+
   submitVerificationCode(code: string): Observable<Record<string, unknown>> {
     return this.http.post<Record<string, unknown>>(this.resolveUrl('/api/automation/submit-code'), {
       code,
@@ -275,5 +363,167 @@ export class ApiService {
 
   importBackup(formData: FormData): Observable<Record<string, unknown>> {
     return this.http.post<Record<string, unknown>>(this.resolveUrl('/api/import'), formData);
+  }
+
+  // --- Durable Notifications ---
+
+  getNotifications(
+    after?: number | string,
+    unreadOnly = false,
+    limit = 50,
+  ): Observable<NotificationListResponse> {
+    let url = `/api/notifications?limit=${limit}&unread_only=${unreadOnly}`;
+    if (after !== undefined && after !== null && after !== '') {
+      url += `&after=${encodeURIComponent(after.toString())}`;
+    }
+    return this.http.get<NotificationListResponse>(this.resolveUrl(url));
+  }
+
+  ackNotification(
+    notificationId: number | string,
+  ): Observable<{ status: string; id: number; notification_id: string; acknowledged: boolean }> {
+    return this.http.post<{
+      status: string;
+      id: number;
+      notification_id: string;
+      acknowledged: boolean;
+    }>(
+      this.resolveUrl(`/api/notifications/${encodeURIComponent(notificationId.toString())}/ack`),
+      {},
+    );
+  }
+
+  ackAllNotifications(
+    upToId?: number,
+  ): Observable<{ status: string; acknowledged_count: number; message: string }> {
+    return this.http.post<{ status: string; acknowledged_count: number; message: string }>(
+      this.resolveUrl('/api/notifications/ack-all'),
+      upToId ? { up_to_id: upToId } : {},
+    );
+  }
+
+  deleteNotification(
+    notificationId: number | string,
+  ): Observable<{ status: string; notification_id: string; message: string }> {
+    return this.http.delete<{ status: string; notification_id: string; message: string }>(
+      this.resolveUrl(`/api/notifications/${encodeURIComponent(notificationId.toString())}`),
+    );
+  }
+
+  clearAllNotifications(): Observable<{ status: string; cleared_count: number; message: string }> {
+    return this.http.delete<{ status: string; cleared_count: number; message: string }>(
+      this.resolveUrl('/api/notifications'),
+    );
+  }
+
+  dispatchNotifications(): Observable<Record<string, unknown>> {
+    return this.http.post<Record<string, unknown>>(
+      this.resolveUrl('/api/notifications/dispatch'),
+      {},
+    );
+  }
+
+  // --- Automation Controls (Pause / Resume / Stop / Queue Actions) ---
+
+  pauseAutomation(): Observable<QueueJobActionResponse> {
+    return this.http.post<QueueJobActionResponse>(this.resolveUrl('/api/automation/pause'), {});
+  }
+
+  resumeAutomation(): Observable<QueueJobActionResponse> {
+    return this.http.post<QueueJobActionResponse>(this.resolveUrl('/api/automation/resume'), {});
+  }
+
+  stopAutomation(): Observable<QueueJobActionResponse> {
+    return this.http.post<QueueJobActionResponse>(this.resolveUrl('/api/automation/stop'), {});
+  }
+
+  cancelJob(jobId: string): Observable<QueueJobActionResponse> {
+    return this.http.post<QueueJobActionResponse>(
+      this.resolveUrl(`/api/automation/jobs/${encodeURIComponent(jobId)}/cancel`),
+      {},
+    );
+  }
+
+  skipJob(jobId: string): Observable<QueueJobActionResponse> {
+    return this.http.post<QueueJobActionResponse>(
+      this.resolveUrl(`/api/automation/jobs/${encodeURIComponent(jobId)}/skip`),
+      {},
+    );
+  }
+
+  resolveJob(
+    jobId: string,
+    resolutionType = 'continue',
+    answerValue = '',
+    questionKey = '',
+    approvedScope = 'global',
+  ): Observable<QueueJobActionResponse> {
+    return this.http.post<QueueJobActionResponse>(
+      this.resolveUrl(`/api/automation/jobs/${encodeURIComponent(jobId)}/resolve`),
+      {
+        resolution_type: resolutionType,
+        answer_value: answerValue,
+        question_key: questionKey,
+        approved_scope: approvedScope,
+      },
+    );
+  }
+
+  // --- Operator Takeover & noVNC View Controls ---
+
+  getTakeoverStatus(): Observable<TakeoverStatus> {
+    return this.http.get<TakeoverStatus>(this.resolveUrl('/api/automation/takeover/status'));
+  }
+
+  claimTakeover(
+    owner = 'operator',
+    leaseSeconds = 300,
+  ): Observable<{ status: string; owner: string; expires_at: string; lease_seconds: number }> {
+    return this.http.post<{
+      status: string;
+      owner: string;
+      expires_at: string;
+      lease_seconds: number;
+    }>(this.resolveUrl('/api/automation/takeover/claim'), {
+      owner,
+      lease_seconds: leaseSeconds,
+    });
+  }
+
+  releaseTakeover(
+    owner = 'operator',
+    force = false,
+  ): Observable<{ status: string; message: string }> {
+    return this.http.post<{ status: string; message: string }>(
+      this.resolveUrl('/api/automation/takeover/release'),
+      {
+        owner,
+        force,
+      },
+    );
+  }
+
+  resumeTakeover(jobId?: string): Observable<{ status: string; action: string; message: string }> {
+    let url = '/api/automation/takeover/resume';
+    if (jobId) {
+      url += `?job_id=${encodeURIComponent(jobId)}`;
+    }
+    return this.http.post<{ status: string; action: string; message: string }>(
+      this.resolveUrl(url),
+      {},
+    );
+  }
+
+  reopenAuthSession(
+    jobId?: string,
+  ): Observable<{ status: string; action: string; message: string }> {
+    let url = '/api/automation/takeover/reopen-auth';
+    if (jobId) {
+      url += `?job_id=${encodeURIComponent(jobId)}`;
+    }
+    return this.http.post<{ status: string; action: string; message: string }>(
+      this.resolveUrl(url),
+      {},
+    );
   }
 }

@@ -113,4 +113,35 @@ describe('ApiService - HTTP Requests', () => {
     req.flush({ status: 'success', imported_applications: 3 });
     httpMock.verify();
   });
+
+  it('loads funnel metrics from the durable automation endpoint', () => {
+    service.getAutomationFunnel().subscribe();
+    const req = httpMock.expectOne((r) => r.url.endsWith('/api/automation/funnel'));
+    expect(req.request.method).toBe('GET');
+    req.flush({ verified_autonomous_submissions: 2, jobs_attempted: 9 });
+    httpMock.verify();
+  });
+
+  it('requests bounded per-application history with a cursor', () => {
+    service.getApplicationAutomationEvents('app/1', 'job-1', 12, 25).subscribe();
+    const req = httpMock.expectOne((r) =>
+      r.url.split('?')[0].endsWith('/api/automation/applications/app%2F1/events'),
+    );
+    expect(req.request.method).toBe('GET');
+    expect(req.request.urlWithParams).toContain('job_id=job-1');
+    expect(req.request.urlWithParams).toContain('after=12');
+    expect(req.request.urlWithParams).toContain('limit=25');
+    req.flush({ app_id: 'app/1', events: [], next_after: 12, has_more: false });
+    httpMock.verify();
+  });
+
+  it('requests projected status for a specific job', () => {
+    service.getApplicationAutomationStatus('app-1', 'job-1').subscribe();
+    const req = httpMock.expectOne((r) =>
+      r.url.split('?')[0].endsWith('/api/automation/applications/app-1/status'),
+    );
+    expect(req.request.urlWithParams).toContain('job_id=job-1');
+    req.flush({ app_id: 'app-1', jobs: [] });
+    httpMock.verify();
+  });
 });

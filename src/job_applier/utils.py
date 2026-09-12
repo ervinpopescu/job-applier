@@ -1,5 +1,30 @@
+import os
 import re
 from pathlib import Path
+
+
+def get_secret(name: str, default: str = "") -> str:
+    """
+    Retrieves a secret value, preferring Docker/container secret files in /run/secrets/
+    before falling back to environment variables.
+    """
+    secret_dir = Path("/run/secrets")
+    for variant in (name, name.lower(), name.upper()):
+        secret_file = secret_dir / variant
+        if secret_file.is_file():
+            try:
+                val = secret_file.read_text(encoding="utf-8").strip()
+                if val:
+                    return val
+            except Exception:
+                pass
+
+    for env_var in (name, name.upper(), name.lower()):
+        val = os.environ.get(env_var, "").strip()
+        if val:
+            return val
+
+    return default
 
 
 def sanitize_name(name: str) -> str:

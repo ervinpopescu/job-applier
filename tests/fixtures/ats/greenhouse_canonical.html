@@ -1,0 +1,21 @@
+<!doctype html>
+<html><body>
+<form id="application_form">
+  <label for="first_name">First Name*</label>
+  <input id="first_name" autocomplete="given-name" required>
+  <label for="last_name">Last Name*</label>
+  <input id="last_name" autocomplete="family-name" required>
+  <label for="email">Email*</label>
+  <input id="email" autocomplete="email" required>
+  <label for="phone">Phone</label><input id="phone" type="tel">
+  <label for="resume">Resume/CV*</label><input id="resume" type="file">
+  <label for="question_website">Website</label><input id="question_website" aria-label="Website">
+  <label for="question_linkedin">LinkedIn Profile</label><input id="question_linkedin" aria-label="LinkedIn Profile">
+  <label id="question_privacy-label" for="question_privacy">Please confirm that you agree to the Recruitment Privacy Policy.*</label>
+  <input id="question_privacy" role="combobox" aria-labelledby="question_privacy-label" aria-required="true">
+  <div role="option">I agree</div>
+  <label for="question_python">Outline your practical Python experience*</label>
+  <textarea id="question_python" aria-label="Outline your practical Python experience" required></textarea>
+  <input id="submit_app" type="submit" value="Submit Application">
+</form>
+</body></html>

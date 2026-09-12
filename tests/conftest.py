@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 import pytest
 
 # Ensure virtual environment packages and src/ are in sys.path even when pytest is invoked globally
+os.environ["CF_ACCESS_ENABLED"] = "false"
 root = Path(__file__).resolve().parents[1]
 venv_site_packages = list((root / ".venv" / "lib").glob("python*/site-packages"))
 for sp in venv_site_packages:
@@ -24,3 +26,4 @@ def isolate_test_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     test_csv = tmp_path / "test_tracker.csv"
     monkeypatch.setenv("JOB_APPLIER_DB_PATH", str(test_db))
     monkeypatch.setenv("JOB_APPLIER_TRACKER_PATH", str(test_csv))
+    monkeypatch.setenv("CF_ACCESS_ENABLED", "false")

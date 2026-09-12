@@ -1,5 +1,5 @@
 <div
-  class="app-shell min-h-full flex flex-col overflow-x-hidden bg-slate-950 text-slate-100 selection:bg-emerald-500 selection:text-white"
+  class="app-shell min-h-full flex min-w-0 flex-col bg-slate-950 text-slate-100 selection:bg-emerald-500 selection:text-white"
 >
   <!-- Top Navigation Bar -->
   <header
@@ -11,8 +11,8 @@
       >
         <!-- Logo & Brand -->
         <div
-          class="brand flex min-w-0 items-center space-x-2.5 sm:space-x-3.5 flex-shrink-0 cursor-pointer select-none"
-          (click)="activeTab.set('queue')"
+          class="brand flex min-w-0 shrink items-center space-x-2.5 sm:space-x-3.5 cursor-pointer select-none"
+          (click)="activeTab.set('applications')"
         >
           <div
             class="w-9 h-9 rounded-xl bg-gradient-to-tr from-emerald-600 to-teal-400 flex items-center justify-center shadow-md shadow-emerald-950/60 ring-1 ring-emerald-400/30"
@@ -37,46 +37,57 @@
 
         <!-- Center: Navigation Tabs -->
         <nav
-          class="primary-nav order-3 flex w-full items-center gap-1 overflow-x-auto bg-slate-950/70 p-1 rounded-xl border border-slate-800/80 shadow-inner lg:order-none lg:w-auto lg:gap-1.5 lg:p-1.5"
+          class="primary-nav order-3 flex min-w-0 w-full items-center gap-1 overflow-visible bg-slate-950/70 p-1 rounded-xl border border-slate-800/80 shadow-inner lg:order-none lg:w-auto lg:gap-1.5 lg:p-1.5"
           aria-label="Dashboard sections"
         >
-          <!-- Queue Tab -->
+          <!-- Applications Tab -->
           <button
             type="button"
-            title="Application queue"
-            aria-label="Application queue"
-            (click)="activeTab.set('queue')"
+            title="Unified applications dashboard"
+            aria-label="Applications dashboard"
+            (click)="activeTab.set('applications')"
             [class]="
-              activeTab() === 'queue'
+              activeTab() === 'applications' || activeTab() === 'queue' || activeTab() === 'tracker'
                 ? 'bg-slate-800 text-emerald-400 shadow-sm font-semibold'
                 : 'text-slate-400 hover:text-slate-200'
             "
-            class="px-4 py-1.5 text-xs rounded-lg transition-all flex items-center gap-2 select-none"
+            class="min-w-0 flex-1 justify-center px-1 py-1.5 text-xs rounded-lg transition-all flex items-center gap-1 select-none sm:flex-none sm:justify-start sm:gap-2 sm:px-4"
           >
             <app-icon name="layers" className="w-3.5 h-3.5"></app-icon>
-            <span>Queue</span>
+            <span class="nav-label hidden sm:inline">Applications</span>
             <span
-              class="px-1.5 py-0.2 rounded-full text-[10px] bg-slate-900 border border-slate-700 text-slate-300 font-mono font-bold"
+              class="hidden sm:inline px-1.5 py-0.2 rounded-full text-[10px] bg-slate-900 border border-slate-700 text-slate-300 font-mono font-bold"
+              [title]="
+                'Total applications: ' +
+                (appFilterCounts().all || stats()?.tracker?.total_records || 0)
+              "
             >
-              {{ stats()?.pending || 0 }}
+              {{ appFilterCounts().all || stats()?.tracker?.total_records || 0 }}
+            </span>
+            <span
+              *ngIf="(appFilterCounts().queued || 0) > 0"
+              class="hidden md:inline px-1 py-0.2 rounded-full text-[9px] bg-emerald-950/60 border border-emerald-800 text-emerald-400 font-mono"
+              [title]="'Queued: ' + (appFilterCounts().queued || 0)"
+            >
+              {{ appFilterCounts().queued }}
             </span>
           </button>
 
-          <!-- Tracker Tab -->
+          <!-- Metrics Tab -->
           <button
             type="button"
-            title="Application tracker"
-            aria-label="Application tracker"
-            (click)="activeTab.set('tracker')"
+            title="Automation and pipeline metrics"
+            aria-label="Automation metrics"
+            (click)="activeTab.set('metrics')"
             [class]="
-              activeTab() === 'tracker'
+              activeTab() === 'metrics'
                 ? 'bg-slate-800 text-emerald-400 shadow-sm font-semibold'
                 : 'text-slate-400 hover:text-slate-200'
             "
-            class="px-4 py-1.5 text-xs rounded-lg transition-all flex items-center gap-2 select-none"
+            class="min-w-0 flex-1 justify-center px-1 py-1.5 text-xs rounded-lg transition-all flex items-center gap-1 select-none sm:flex-none sm:justify-start sm:gap-2 sm:px-4"
           >
             <app-icon name="activity" className="w-3.5 h-3.5"></app-icon>
-            <span>Tracker</span>
+            <span class="nav-label hidden sm:inline">Metrics</span>
           </button>
 
           <!-- Scraper Tab -->
@@ -90,10 +101,10 @@
                 ? 'bg-slate-800 text-emerald-400 shadow-sm font-semibold'
                 : 'text-slate-400 hover:text-slate-200'
             "
-            class="px-4 py-1.5 text-xs rounded-lg transition-all flex items-center gap-2 select-none"
+            class="min-w-0 flex-1 justify-center px-1 py-1.5 text-xs rounded-lg transition-all flex items-center gap-1 select-none sm:flex-none sm:justify-start sm:gap-2 sm:px-4"
           >
             <app-icon name="play-circle" className="w-3.5 h-3.5"></app-icon>
-            <span>Scraper</span>
+            <span class="nav-label hidden sm:inline">Scraper</span>
           </button>
 
           <!-- Console Tab -->
@@ -107,10 +118,10 @@
                 ? 'bg-slate-800 text-emerald-400 shadow-sm font-semibold'
                 : 'text-slate-400 hover:text-slate-200'
             "
-            class="px-4 py-1.5 text-xs rounded-lg transition-all flex items-center gap-2 relative select-none"
+            class="min-w-0 flex-1 justify-center px-1 py-1.5 text-xs rounded-lg transition-all flex items-center gap-1 relative select-none sm:flex-none sm:justify-start sm:gap-2 sm:px-4"
           >
             <app-icon name="terminal" className="w-3.5 h-3.5"></app-icon>
-            <span>Console</span>
+            <span class="nav-label hidden sm:inline">Console</span>
             <span
               *ngIf="pipelineStatus()?.is_running || automationStatus()?.is_active"
               class="w-2 h-2 rounded-full bg-emerald-400 animate-ping absolute top-2 right-1.5"
@@ -128,16 +139,18 @@
                 ? 'bg-slate-800 text-emerald-400 shadow-sm font-semibold'
                 : 'text-slate-400 hover:text-slate-200'
             "
-            class="px-4 py-1.5 text-xs rounded-lg transition-all flex items-center gap-2 select-none"
+            class="min-w-0 flex-1 justify-center px-1 py-1.5 text-xs rounded-lg transition-all flex items-center gap-1 select-none sm:flex-none sm:justify-start sm:gap-2 sm:px-4"
           >
             <app-icon name="user" className="w-3.5 h-3.5"></app-icon>
-            <span>Profile</span>
+            <span class="nav-label hidden sm:inline">Profile</span>
           </button>
         </nav>
 
         <!-- Right: Action Controls -->
-        <div class="header-actions flex items-center gap-1.5 sm:gap-2 flex-shrink-0">
+        <div class="header-actions flex min-w-0 shrink-0 items-center gap-1.5 sm:gap-2">
           <button
+            type="button"
+            aria-label="Manage platform logins and session cookies"
             (click)="openAuthModal()"
             class="px-3.5 py-1.5 bg-slate-950/70 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-800 hover:border-slate-700 rounded-xl text-xs font-medium flex items-center gap-2 transition shadow-sm"
             title="Manage platform logins and session cookies"
@@ -154,44 +167,350 @@
             ></span>
           </button>
 
-          <div class="action-divider h-4 w-px bg-slate-800"></div>
-
-          <!-- Export -->
-          <a
-            [href]="api.getExportUrl()"
-            download
+          <!-- Live Browser View (noVNC) -->
+          <button
+            type="button"
+            aria-label="Open live browser view and operator takeover controls"
+            (click)="openTakeoverModal()"
             class="px-3 py-1.5 bg-slate-950/70 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-800 hover:border-slate-700 rounded-xl text-xs font-medium flex items-center gap-1.5 transition shadow-sm"
-            title="Export all applications and database mappings as a portable .zip backup"
+            title="Open live browser view and operator takeover controls"
           >
-            <app-icon name="download" className="w-3.5 h-3.5 text-emerald-400"></app-icon>
-            <span class="action-label">Export</span>
-          </a>
+            <app-icon name="monitor" className="w-3.5 h-3.5 text-teal-400"></app-icon>
+            <span class="action-label">Live View</span>
+          </button>
 
-          <!-- Import -->
-          <label
-            [class.pointer-events-none]="isImporting()"
-            [class.opacity-50]="isImporting()"
-            class="px-3 py-1.5 bg-slate-950/70 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-800 hover:border-slate-700 rounded-xl text-xs font-medium flex items-center gap-1.5 transition shadow-sm cursor-pointer"
-            title="Import and merge a backup .zip bundle from another machine"
+          <!-- Notifications Bell -->
+          <button
+            type="button"
+            aria-label="Open alerts and notification history"
+            (click)="openNotificationsDrawer()"
+            class="relative px-3 py-1.5 bg-slate-950/70 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-800 hover:border-slate-700 rounded-xl text-xs font-medium flex items-center gap-1.5 transition shadow-sm"
+            title="Open alerts and notification history"
           >
-            <app-icon
-              [name]="isImporting() ? 'refresh-cw' : 'upload'"
-              className="w-3.5 h-3.5 text-teal-400"
-              [class.animate-spin]="isImporting()"
-            ></app-icon>
-            <span class="action-label">{{ isImporting() ? 'Importing...' : 'Import' }}</span>
-            <input
-              type="file"
-              accept=".zip"
-              class="hidden"
-              [disabled]="isImporting()"
-              (change)="uploadBackup($event)"
-            />
-          </label>
+            <app-icon name="bell" className="w-3.5 h-3.5 text-amber-400"></app-icon>
+            <span class="action-label">Alerts</span>
+            <span
+              *ngIf="notifService.unreadCount() > 0"
+              class="px-1.5 py-0.2 rounded-full text-[10px] bg-rose-500 text-white font-mono font-bold animate-pulse"
+            >
+              {{ notifService.unreadCount() }}
+            </span>
+          </button>
+
+          <!-- Lower-priority actions stay reachable in a compact menu. -->
+          <div class="more-actions relative">
+            <button
+              #moreActionsButton
+              type="button"
+              class="more-actions-trigger px-3 py-1.5 bg-slate-950/70 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-800 hover:border-slate-700 rounded-xl text-xs font-medium flex items-center gap-1.5 transition shadow-sm"
+              aria-label="More actions"
+              aria-controls="more-actions-menu"
+              [attr.aria-expanded]="moreActionsOpen()"
+              (click)="toggleMoreActions()"
+            >
+              <span aria-hidden="true" class="text-base leading-none">⋯</span>
+              <span class="more-actions-label">More</span>
+            </button>
+
+            <div
+              *ngIf="moreActionsOpen()"
+              id="more-actions-menu"
+              class="more-actions-menu absolute right-0 top-full z-50 mt-2 min-w-52 rounded-xl border border-slate-700 bg-slate-900 p-1.5 shadow-xl shadow-slate-950/60"
+              role="menu"
+              aria-label="More actions"
+            >
+              <a
+                [href]="api.getExportUrl()"
+                download
+                role="menuitem"
+                tabindex="0"
+                class="more-actions-item flex min-h-11 w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-medium text-slate-200 hover:bg-slate-800 focus:bg-slate-800 focus:outline-none"
+                title="Export all applications and database mappings as a portable .zip backup"
+                (click)="closeMoreActions(true)"
+              >
+                <app-icon name="download" className="h-3.5 w-3.5 text-emerald-400"></app-icon>
+                Export backup
+              </a>
+
+              <button
+                type="button"
+                role="menuitem"
+                class="more-actions-item flex min-h-11 w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-medium text-slate-200 hover:bg-slate-800 focus:bg-slate-800 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                [disabled]="isImporting()"
+                title="Import and merge a backup .zip bundle from another machine"
+                (click)="importInput.click(); closeMoreActions(true)"
+              >
+                <app-icon
+                  [name]="isImporting() ? 'refresh-cw' : 'upload'"
+                  className="h-3.5 w-3.5 text-teal-400"
+                  [class.animate-spin]="isImporting()"
+                ></app-icon>
+                {{ isImporting() ? 'Importing...' : 'Import backup' }}
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                class="more-actions-item flex min-h-11 w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs font-medium text-slate-200 hover:bg-slate-800 focus:bg-slate-800 focus:outline-none"
+                title="View the canonical main resume"
+                aria-label="View main resume"
+                (click)="openResumeViewer()"
+              >
+                <app-icon name="file-text" className="h-3.5 w-3.5 text-emerald-400"></app-icon>
+                View main resume
+              </button>
+              <input
+                #importInput
+                type="file"
+                accept=".zip"
+                class="hidden"
+                [disabled]="isImporting()"
+                (change)="uploadBackup($event)"
+              />
+            </div>
+          </div>
         </div>
       </div>
     </div>
   </header>
+
+  <!-- Main resume viewer -->
+  <div
+    *ngIf="resumeModalOpen()"
+    class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-3 backdrop-blur-sm sm:p-6"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="resume-viewer-title"
+  >
+    <section
+      class="resume-viewer max-h-[92vh] w-full max-w-4xl overflow-y-auto rounded-2xl border border-slate-700 bg-slate-900 p-4 shadow-2xl sm:p-7"
+    >
+      <div class="mb-5 flex items-start justify-between gap-4 border-b border-slate-800 pb-4">
+        <div>
+          <p class="text-[10px] font-semibold uppercase tracking-[0.2em] text-emerald-400">
+            Main resume
+          </p>
+          <h2 id="resume-viewer-title" class="mt-1 text-xl font-bold text-white">
+            Canonical resume
+          </h2>
+        </div>
+        <div class="flex items-center gap-2">
+          <div
+            *ngIf="resumeArtifactUrl()"
+            class="flex items-center rounded-xl bg-slate-950 p-1 border border-slate-800 text-xs font-medium"
+            role="tablist"
+            aria-label="Resume view modes"
+          >
+            <button
+              type="button"
+              role="tab"
+              [attr.aria-selected]="resumeViewerMode() === 'structured'"
+              (click)="setResumeViewerMode('structured')"
+              [class]="
+                resumeViewerMode() === 'structured'
+                  ? 'bg-slate-800 text-white shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200'
+              "
+              class="rounded-lg px-3 py-1 transition"
+            >
+              Structured
+            </button>
+            <button
+              type="button"
+              role="tab"
+              [attr.aria-selected]="resumeViewerMode() === 'preview'"
+              (click)="setResumeViewerMode('preview')"
+              [class]="
+                resumeViewerMode() === 'preview'
+                  ? 'bg-slate-800 text-white shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200'
+              "
+              class="rounded-lg px-3 py-1 transition flex items-center gap-1"
+            >
+              <app-icon name="file-text" className="h-3 w-3"></app-icon>
+              <span>PDF Preview</span>
+            </button>
+          </div>
+
+          <a
+            *ngIf="resumeArtifactDownloadUrl()"
+            [href]="resumeArtifactDownloadUrl()"
+            download="main-resume.pdf"
+            class="flex items-center gap-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 px-3 py-1.5 text-xs font-semibold text-slate-200 transition"
+            title="Download main resume PDF"
+            aria-label="Download main resume PDF"
+          >
+            <app-icon name="download" className="h-3.5 w-3.5"></app-icon>
+            <span>Download PDF</span>
+          </a>
+
+          <button
+            type="button"
+            class="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white focus:outline-none focus:ring-2 focus:ring-emerald-400"
+            aria-label="Close main resume viewer"
+            (click)="closeResumeViewer()"
+          >
+            <app-icon name="x" className="h-5 w-5"></app-icon>
+          </button>
+        </div>
+      </div>
+
+      <div
+        *ngIf="resumeViewStatus() === 'loading'"
+        class="py-12 text-center text-sm text-slate-400"
+        role="status"
+      >
+        Loading main resume...
+      </div>
+      <div
+        *ngIf="resumeViewStatus() === 'generating' || resumeViewStatus() === 'stale'"
+        class="mb-5 rounded-xl border border-amber-500/30 bg-amber-950/30 p-4 text-sm text-amber-100"
+        role="status"
+      >
+        <span *ngIf="resumeViewStatus() === 'stale'; else generatingResume"
+          >The PDF is out of date and is being refreshed safely.</span
+        >
+        <ng-template #generatingResume
+          >Resume PDF is being generated safely. The content below is ready now; the download will
+          become available shortly.</ng-template
+        >
+      </div>
+      <div
+        *ngIf="resumeViewStatus() === 'error'"
+        class="mb-5 rounded-xl border border-rose-500/40 bg-rose-950/30 p-4 text-sm text-rose-100"
+        role="alert"
+      >
+        <p>{{ resumeViewError() || 'Unable to load the main resume.' }}</p>
+        <button
+          type="button"
+          class="mt-3 rounded-lg bg-rose-700 px-3 py-2 text-xs font-semibold text-white hover:bg-rose-600"
+          (click)="retryMainResume()"
+        >
+          Retry
+        </button>
+      </div>
+
+      <!-- Inline PDF Preview -->
+      <div
+        *ngIf="resumeViewerMode() === 'preview' && resumeArtifactUrl()"
+        class="resume-pdf-preview flex flex-col min-h-[60vh] h-[72vh]"
+      >
+        <div class="mb-3 flex items-center justify-end gap-2 border-b border-slate-800/80 pb-3">
+          <a
+            *ngIf="resumeArtifactUrl()"
+            [href]="resumeArtifactUrl()"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="flex items-center gap-1 font-mono text-[11px] text-emerald-400 hover:underline"
+            title="Open PDF preview in a new browser tab"
+            aria-label="Open PDF preview in new tab"
+          >
+            <span>Open in new tab</span>
+            <app-icon name="external-link" className="h-3 w-3"></app-icon>
+          </a>
+        </div>
+
+        <iframe
+          [src]="resolveSafeFileUrl(resumeArtifactUrl())"
+          title="Main resume PDF inline preview"
+          class="w-full flex-1 rounded-xl border border-slate-800 bg-slate-950"
+        >
+          <p class="p-4 text-xs text-slate-400">
+            Your browser does not support embedded PDF previews.
+            <a
+              [href]="resumeArtifactUrl()"
+              target="_blank"
+              rel="noopener noreferrer"
+              class="text-emerald-400 underline"
+              >Open in new tab</a
+            >
+            or
+            <a
+              [href]="resumeArtifactDownloadUrl()"
+              download="main-resume.pdf"
+              class="text-emerald-400 underline"
+              >Download PDF</a
+            >.
+          </p>
+        </iframe>
+      </div>
+
+      <ng-container *ngIf="resumeViewerMode() !== 'preview' && mainResume() as resume">
+        <div class="space-y-6 text-sm text-slate-300">
+          <div class="text-center">
+            <h3 class="text-2xl font-bold text-white">{{ resume.contact['name'] }}</h3>
+            <p class="mt-2 text-xs text-slate-400">
+              <span *ngIf="resume.contact['email']">{{ resume.contact['email'] }}</span>
+              <span *ngIf="resume.contact['location']"> · {{ resume.contact['location'] }}</span>
+            </p>
+          </div>
+          <section *ngIf="resume.summary">
+            <h3
+              class="border-b border-slate-700 pb-2 text-xs font-bold uppercase tracking-wider text-emerald-400"
+            >
+              Professional Summary
+            </h3>
+            <p class="whitespace-pre-line leading-6">{{ resume.summary }}</p>
+          </section>
+          <section *ngIf="resume.experience.length">
+            <h3
+              class="border-b border-slate-700 pb-2 text-xs font-bold uppercase tracking-wider text-emerald-400"
+            >
+              Work Experience
+            </h3>
+            <article *ngFor="let job of resume.experience" class="mb-4">
+              <div class="flex flex-wrap justify-between gap-2 font-semibold text-white">
+                <span
+                  >{{ job.role }}<span *ngIf="job.company"> · {{ job.company }}</span></span
+                ><span class="text-xs font-normal text-slate-400">{{ job.dates }}</span>
+              </div>
+              <ul class="mt-2 list-disc space-y-1 pl-5">
+                <li *ngFor="let detail of job.details">{{ detail }}</li>
+              </ul>
+            </article>
+          </section>
+          <section *ngIf="resume.skills.length">
+            <h3
+              class="border-b border-slate-700 pb-2 text-xs font-bold uppercase tracking-wider text-emerald-400"
+            >
+              Technical Skills
+            </h3>
+            <p>{{ resume.skills.join(' · ') }}</p>
+          </section>
+          <section *ngIf="resume.education.institution || resume.education.degree">
+            <h3
+              class="border-b border-slate-700 pb-2 text-xs font-bold uppercase tracking-wider text-emerald-400"
+            >
+              Education
+            </h3>
+            <p class="font-semibold text-white">{{ resume.education.institution }}</p>
+            <p>{{ resume.education.degree }}</p>
+            <p *ngIf="resume.education.details" class="mt-1">{{ resume.education.details }}</p>
+          </section>
+          <section *ngIf="resume.projects.length">
+            <h3
+              class="border-b border-slate-700 pb-2 text-xs font-bold uppercase tracking-wider text-emerald-400"
+            >
+              Open Source &amp; Personal Projects
+            </h3>
+            <article *ngFor="let project of resume.projects" class="mb-3">
+              <a
+                *ngIf="project.url; else plainProject"
+                [href]="project.url"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="font-semibold text-emerald-400 hover:underline"
+                >{{ project.name }}</a
+              >
+              <ng-template #plainProject
+                ><span class="font-semibold text-white">{{ project.name }}</span></ng-template
+              >
+              <span *ngIf="project.description">: {{ project.description }}</span>
+            </article>
+          </section>
+        </div>
+      </ng-container>
+    </section>
+  </div>
 
   <!-- Content Area -->
   <main
@@ -223,6 +542,130 @@
         className="w-4 h-4 shrink-0"
       ></app-icon>
       <span>{{ toast().message }}</span>
+    </div>
+
+    <!-- Persistent Automation Paused / Exception Banner -->
+    <div
+      *ngIf="
+        notifService.isPaused() ||
+        notifService.isStopped() ||
+        automationStatus()?.is_waiting_for_code
+      "
+      role="alert"
+      class="paused-banner mb-6 p-4 rounded-2xl border backdrop-blur-md shadow-xl transition-all duration-300 ring-1"
+      [ngClass]="{
+        'bg-rose-950/60 border-rose-500/80 text-rose-100 ring-rose-500/40 shadow-rose-950/50':
+          notifService.isStopped(),
+        'bg-amber-950/50 border-amber-500/80 text-amber-100 ring-amber-500/40 shadow-amber-950/50':
+          !notifService.isStopped(),
+      }"
+    >
+      <div class="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+        <div class="flex items-start gap-3.5 min-w-0">
+          <div
+            class="w-10 h-10 rounded-xl flex items-center justify-center shrink-0 border"
+            [ngClass]="{
+              'bg-rose-500/20 border-rose-500/40 text-rose-400': notifService.isStopped(),
+              'bg-amber-500/20 border-amber-500/40 text-amber-400': !notifService.isStopped(),
+            }"
+          >
+            <app-icon
+              [name]="notifService.isStopped() ? 'square' : 'pause'"
+              className="w-5 h-5"
+            ></app-icon>
+          </div>
+          <div class="min-w-0">
+            <div class="flex items-center gap-2 flex-wrap">
+              <span
+                class="text-xs font-bold uppercase tracking-wider px-2 py-0.5 rounded-md border"
+                [ngClass]="{
+                  'bg-rose-500/20 border-rose-500/40 text-rose-300': notifService.isStopped(),
+                  'bg-amber-500/20 border-amber-500/40 text-amber-300': !notifService.isStopped(),
+                }"
+              >
+                {{ automationBannerTitle() }}
+              </span>
+              <span
+                *ngIf="automationStatus()?.step"
+                class="text-xs font-mono font-bold text-slate-300"
+              >
+                • Step: {{ automationStatus()?.step }}
+              </span>
+              <span *ngIf="automationStatus()?.company" class="text-xs font-semibold text-white">
+                • {{ automationStatus()?.company }} ({{ automationStatus()?.title }})
+              </span>
+            </div>
+            <p class="text-xs mt-1.5 leading-relaxed text-slate-200">
+              {{ automationStatus()?.message || automationBannerMessage() }}
+            </p>
+          </div>
+        </div>
+
+        <!-- Banner Action Controls -->
+        <div class="flex items-center gap-2 flex-wrap shrink-0">
+          <!-- Resume Button (Disabled if stopped) -->
+          <button
+            *ngIf="notifService.isPaused() && !notifService.isStopped()"
+            (click)="resumeAutomation()"
+            [disabled]="isResumingAutomation()"
+            class="px-3.5 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs rounded-xl transition shadow flex items-center gap-1.5 disabled:opacity-50"
+            title="Perform safe revalidation and resume automation"
+          >
+            <app-icon name="play" className="w-3.5 h-3.5 fill-current"></app-icon>
+            <span>{{ isResumingAutomation() ? 'Revalidating...' : 'Resume' }}</span>
+          </button>
+
+          <!-- Live Browser View / Takeover -->
+          <button
+            (click)="openTakeoverModal()"
+            class="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-xl text-xs font-medium flex items-center gap-1.5 transition shadow"
+            title="Open browser viewer to inspect page or take manual control"
+          >
+            <app-icon name="monitor" className="w-3.5 h-3.5 text-teal-400"></app-icon>
+            <span>Browser View</span>
+          </button>
+
+          <!-- Resolve Question / MFA Code -->
+          <button
+            *ngIf="
+              automationStatus()?.app_id &&
+              (automationStatus()?.step?.includes('question') ||
+                automationStatus()?.is_waiting_for_code)
+            "
+            (click)="
+              openResolveModal(automationStatus()?.job_id || automationStatus()?.app_id || '')
+            "
+            class="px-3.5 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs rounded-xl transition shadow flex items-center gap-1.5"
+            title="Provide approved answer or submit code"
+          >
+            <app-icon name="key" className="w-3.5 h-3.5"></app-icon>
+            <span>Resolve</span>
+          </button>
+
+          <!-- Skip Job -->
+          <button
+            *ngIf="automationStatus()?.app_id || automationStatus()?.job_id"
+            (click)="skipActiveJob(automationStatus()?.job_id || automationStatus()?.app_id || '')"
+            class="px-3 py-1.5 bg-slate-800/80 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded-xl text-xs font-medium flex items-center gap-1.5 transition shadow"
+            title="Skip this job and move to next in queue"
+          >
+            <app-icon name="skip-forward" className="w-3.5 h-3.5"></app-icon>
+            <span>Skip</span>
+          </button>
+
+          <!-- Emergency Stop -->
+          <button
+            *ngIf="!notifService.isStopped()"
+            (click)="stopAutomation()"
+            [disabled]="isStoppingAutomation()"
+            class="px-3 py-1.5 bg-rose-950/80 hover:bg-rose-900 text-rose-300 border border-rose-800 rounded-xl text-xs font-medium flex items-center gap-1.5 transition shadow"
+            title="Emergency halt all automation"
+          >
+            <app-icon name="square" className="w-3.5 h-3.5 fill-current text-rose-400"></app-icon>
+            <span>Stop</span>
+          </button>
+        </div>
+      </div>
     </div>
 
     <!-- Persistent Degraded Mode Alert Banner -->
@@ -365,6 +808,67 @@
           [style.width.%]="automationStatus()?.is_active ? automationStatus()?.progress_pct : 0"
         ></div>
       </div>
+
+      <!-- HUD Quick Runtime Controls -->
+      <div
+        class="mt-3 pt-3 border-t border-slate-800/60 flex items-center justify-between flex-wrap gap-2 text-xs"
+      >
+        <div class="flex items-center gap-2">
+          <span class="text-[11px] text-slate-400">Controls:</span>
+          <button
+            *ngIf="!notifService.isPaused()"
+            (click)="pauseAutomation()"
+            [disabled]="isPausingAutomation()"
+            class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-amber-400 rounded-lg font-medium transition flex items-center gap-1.5"
+            title="Pause automation workers"
+          >
+            <app-icon name="pause" className="w-3 h-3"></app-icon>
+            <span>Pause</span>
+          </button>
+          <button
+            *ngIf="notifService.isPaused() && !notifService.isStopped()"
+            (click)="resumeAutomation()"
+            [disabled]="isResumingAutomation()"
+            class="px-2.5 py-1 bg-emerald-950 hover:bg-emerald-900 border border-emerald-800 text-emerald-300 rounded-lg font-medium transition flex items-center gap-1.5"
+            title="Resume automation after safe revalidation"
+          >
+            <app-icon name="play" className="w-3 h-3 fill-current"></app-icon>
+            <span>Resume</span>
+          </button>
+          <button
+            *ngIf="!notifService.isStopped()"
+            (click)="stopAutomation()"
+            [disabled]="isStoppingAutomation()"
+            class="px-2.5 py-1 bg-rose-950/60 hover:bg-rose-900 border border-rose-800 text-rose-300 rounded-lg font-medium transition flex items-center gap-1.5"
+            title="Emergency halt all worker processes"
+          >
+            <app-icon name="square" className="w-3 h-3 fill-current text-rose-400"></app-icon>
+            <span>Emergency Stop</span>
+          </button>
+          <button
+            (click)="clearAutomationState()"
+            [disabled]="isClearingAutomationState()"
+            class="px-2.5 py-1 bg-amber-950/50 hover:bg-amber-900/60 border border-amber-800 text-amber-300 rounded-lg font-medium transition flex items-center gap-1.5"
+            title="Reset stuck jobs, clear emergency stop, and close orphaned browser sessions"
+          >
+            <app-icon
+              name="rotate-ccw"
+              className="w-3 h-3"
+              [class.animate-spin]="isClearingAutomationState()"
+            ></app-icon>
+            <span>Clear State</span>
+          </button>
+        </div>
+
+        <button
+          (click)="openTakeoverModal()"
+          class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg font-medium transition flex items-center gap-1.5"
+          title="Open live browser view"
+        >
+          <app-icon name="monitor" className="w-3 h-3 text-teal-400"></app-icon>
+          <span>Live View & Takeover</span>
+        </button>
+      </div>
     </div>
 
     <!-- Live Verification Code / 2FA Challenge Banner -->
@@ -410,10 +914,10 @@
       </div>
     </div>
 
-    <!-- TAB 1: APPLICATIONS QUEUE -->
-    <section *ngIf="activeTab() === 'queue'">
-      <!-- Toolbar -->
-      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
+    <!-- TAB 1: UNIFIED APPLICATIONS DASHBOARD -->
+    <section *ngIf="activeTab() === 'applications' || activeTab() === 'queue'">
+      <!-- Search & Primary Actions Toolbar -->
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-4">
         <div class="relative flex-1 max-w-md">
           <app-icon
             name="search"
@@ -423,74 +927,21 @@
             type="text"
             [ngModel]="searchQuery()"
             (ngModelChange)="searchQuery.set($event); loadApplications()"
-            placeholder="Search queue by role or company..."
+            placeholder="Search applications by role, company, or URL..."
             class="w-full bg-slate-900 border border-slate-800 rounded-xl pl-10 pr-4 py-2 text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-emerald-500 transition shadow-sm"
           />
         </div>
 
         <div class="queue-actions flex items-center flex-wrap gap-2">
-          <!-- Batch Next 5 -->
+          <!-- Export CSV -->
           <button
-            (click)="triggerBatchApply()"
-            [disabled]="isBatchRunning() || applications().length === 0"
-            class="px-3.5 py-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 shadow-md shadow-emerald-950/40"
+            type="button"
+            (click)="exportCsv()"
+            class="px-3.5 py-2 bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700/80 rounded-xl text-xs font-semibold transition flex items-center gap-1.5 shadow-sm"
+            title="Export applications dynamically from SQLite as CSV"
           >
-            <app-icon name="zap" className="w-3.5 h-3.5 fill-white"></app-icon>
-            <span>Auto-Apply Next 5</span>
-          </button>
-
-          <!-- Prune Duplicates -->
-          <button
-            (click)="pruneDuplicates()"
-            [disabled]="isPruningDupes() || applications().length === 0"
-            class="px-3 py-2 bg-purple-950/40 border border-purple-800/80 hover:bg-purple-900/60 text-purple-300 rounded-xl text-xs font-medium transition flex items-center gap-1.5"
-            title="Purge duplicate application packages with matching roles or URLs"
-          >
-            <app-icon
-              name="copy-check"
-              className="w-3.5 h-3.5"
-              [class.animate-spin]="isPruningDupes()"
-            ></app-icon>
-            <span>{{ isPruningDupes() ? 'Deduplicating...' : 'Prune Duplicates' }}</span>
-          </button>
-
-          <!-- Prune Expired -->
-          <button
-            (click)="pruneInactive()"
-            [disabled]="isPruning() || applications().length === 0"
-            class="px-3 py-2 bg-amber-950/40 border border-amber-800/80 hover:bg-amber-900/60 text-amber-300 rounded-xl text-xs font-medium transition flex items-center gap-1.5"
-            title="Purge closed/expired job postings"
-          >
-            <app-icon
-              name="filter-x"
-              className="w-3.5 h-3.5"
-              [class.animate-spin]="isPruning()"
-            ></app-icon>
-            <span>{{ isPruning() ? 'Pruning...' : 'Prune Expired' }}</span>
-          </button>
-
-          <!-- EMEA Only Filter -->
-          <button
-            (click)="pruneNonEmea()"
-            [disabled]="isPruningEmea() || applications().length === 0"
-            class="px-3 py-2 bg-blue-950/40 border border-blue-800/80 hover:bg-blue-900/60 text-blue-300 rounded-xl text-xs font-medium transition flex items-center gap-1.5"
-            title="Prune applications with US/non-EMEA residency restrictions"
-          >
-            <app-icon
-              name="globe"
-              className="w-3.5 h-3.5"
-              [class.animate-spin]="isPruningEmea()"
-            ></app-icon>
-            <span>{{ isPruningEmea() ? 'Filtering...' : 'EMEA Only Filter' }}</span>
-          </button>
-
-          <!-- Clear Failed -->
-          <button
-            (click)="clearFailed()"
-            class="px-3 py-2 bg-rose-950/40 border border-rose-800/80 hover:bg-rose-900/60 text-rose-300 rounded-xl text-xs font-medium transition flex items-center gap-1.5"
-          >
-            <app-icon name="alert-triangle" className="w-3.5 h-3.5"></app-icon>
-            <span>Clear Failed</span>
+            <app-icon name="download" className="w-3.5 h-3.5 text-emerald-400"></app-icon>
+            <span>Export CSV</span>
           </button>
 
           <!-- Stale indicator if applications in error but cached items exist -->
@@ -517,6 +968,347 @@
           </button>
         </div>
       </div>
+
+      <!-- Status Filter Pills -->
+      <div class="flex items-center gap-2 overflow-x-auto pb-2 mb-4 scrollbar-thin">
+        <button
+          type="button"
+          (click)="setAppFilter('all')"
+          [class]="
+            appFilter() === 'all'
+              ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/50 font-bold'
+              : 'bg-slate-900/80 text-slate-400 hover:text-slate-200 border-slate-800'
+          "
+          class="px-3 py-1.5 rounded-xl border text-xs flex items-center gap-2 transition whitespace-nowrap"
+        >
+          <span>All</span>
+          <span class="px-1.5 py-0.2 rounded-full text-[10px] bg-slate-950 font-mono">
+            {{ appFilterCounts().all || 0 }}
+          </span>
+        </button>
+
+        <button
+          type="button"
+          (click)="setAppFilter('queued')"
+          [class]="
+            appFilter() === 'queued'
+              ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/50 font-bold'
+              : 'bg-slate-900/80 text-slate-400 hover:text-slate-200 border-slate-800'
+          "
+          class="px-3 py-1.5 rounded-xl border text-xs flex items-center gap-2 transition whitespace-nowrap"
+        >
+          <span class="w-2 h-2 rounded-full bg-teal-400"></span>
+          <span>Queued</span>
+          <span class="px-1.5 py-0.2 rounded-full text-[10px] bg-slate-950 font-mono">
+            {{ appFilterCounts().queued || 0 }}
+          </span>
+        </button>
+
+        <button
+          type="button"
+          *ngIf="(appFilterCounts().action_required || 0) > 0 || appFilter() === 'action_required'"
+          (click)="setAppFilter('action_required')"
+          [class]="
+            appFilter() === 'action_required'
+              ? 'bg-amber-500/20 text-amber-300 border-amber-500/50 font-bold'
+              : 'bg-amber-950/30 text-amber-400 hover:text-amber-200 border-amber-800/60'
+          "
+          class="px-3 py-1.5 rounded-xl border text-xs flex items-center gap-2 transition whitespace-nowrap"
+        >
+          <app-icon name="alert-triangle" className="w-3 h-3 text-amber-400"></app-icon>
+          <span>Action Required</span>
+          <span
+            class="px-1.5 py-0.2 rounded-full text-[10px] bg-slate-950 font-mono font-bold text-amber-300"
+          >
+            {{ appFilterCounts().action_required || 0 }}
+          </span>
+        </button>
+
+        <button
+          type="button"
+          (click)="setAppFilter('pending')"
+          [class]="
+            appFilter() === 'pending'
+              ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/50 font-bold'
+              : 'bg-slate-900/80 text-slate-400 hover:text-slate-200 border-slate-800'
+          "
+          class="px-3 py-1.5 rounded-xl border text-xs flex items-center gap-2 transition whitespace-nowrap"
+        >
+          <span>Pending Review</span>
+          <span class="px-1.5 py-0.2 rounded-full text-[10px] bg-slate-950 font-mono">
+            {{ appFilterCounts().pending || 0 }}
+          </span>
+        </button>
+
+        <button
+          type="button"
+          (click)="setAppFilter('applied')"
+          [class]="
+            appFilter() === 'applied'
+              ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/50 font-bold'
+              : 'bg-slate-900/80 text-slate-400 hover:text-slate-200 border-slate-800'
+          "
+          class="px-3 py-1.5 rounded-xl border text-xs flex items-center gap-2 transition whitespace-nowrap"
+        >
+          <span>Applied</span>
+          <span class="px-1.5 py-0.2 rounded-full text-[10px] bg-slate-950 font-mono">
+            {{ appFilterCounts().applied || 0 }}
+          </span>
+        </button>
+
+        <button
+          type="button"
+          (click)="setAppFilter('skipped')"
+          [class]="
+            appFilter() === 'skipped'
+              ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/50 font-bold'
+              : 'bg-slate-900/80 text-slate-400 hover:text-slate-200 border-slate-800'
+          "
+          class="px-3 py-1.5 rounded-xl border text-xs flex items-center gap-2 transition whitespace-nowrap"
+        >
+          <span>Skipped</span>
+          <span class="px-1.5 py-0.2 rounded-full text-[10px] bg-slate-950 font-mono">
+            {{ appFilterCounts().skipped || 0 }}
+          </span>
+        </button>
+      </div>
+
+      <!-- Bulk Actions Bar -->
+      <div
+        class="flex items-center justify-between flex-wrap gap-3 bg-slate-900/70 border border-slate-800 rounded-2xl p-3 mb-6"
+      >
+        <div class="flex items-center gap-3 flex-wrap">
+          <label class="flex items-center gap-2 text-xs text-slate-300 select-none cursor-pointer">
+            <input
+              type="checkbox"
+              [checked]="isAllAppsSelected()"
+              (change)="toggleSelectAllApps()"
+              aria-label="Select all applications"
+              class="rounded bg-slate-950 border-slate-700 text-emerald-500 focus:ring-emerald-500/20 cursor-pointer"
+            />
+            <span>Select All ({{ applications().length }})</span>
+          </label>
+
+          <button
+            *ngIf="selectedAppCount() > 0"
+            (click)="queueSelectedApps()"
+            class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition shadow-sm"
+          >
+            <app-icon name="layers" className="w-3.5 h-3.5"></app-icon>
+            <span>Queue Selected ({{ selectedAppCount() }})</span>
+          </button>
+
+          <button
+            (click)="queueAllPending()"
+            class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-medium flex items-center gap-1.5 transition border border-slate-700/60"
+            title="Enqueue all pending applications into the automation queue"
+          >
+            <app-icon name="play" className="w-3.5 h-3.5 text-emerald-400"></app-icon>
+            <span>Queue All Pending</span>
+          </button>
+
+          <!-- Auto-Apply Next 5 -->
+          <button
+            (click)="triggerBatchApply()"
+            [disabled]="isBatchRunning() || applications().length === 0"
+            class="px-3 py-1.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 shadow-md shadow-emerald-950/40"
+          >
+            <app-icon name="zap" className="w-3.5 h-3.5 fill-white"></app-icon>
+            <span>Auto-Apply Next 5</span>
+          </button>
+        </div>
+
+        <div class="flex items-center gap-2 flex-wrap">
+          <!-- Prune Duplicates -->
+          <button
+            (click)="pruneDuplicates()"
+            [disabled]="isPruningDupes() || applications().length === 0"
+            class="px-2.5 py-1.5 bg-purple-950/40 border border-purple-800/80 hover:bg-purple-900/60 text-purple-300 rounded-xl text-xs font-medium transition flex items-center gap-1"
+            title="Purge duplicate application packages with matching roles or URLs"
+          >
+            <app-icon
+              name="copy-check"
+              className="w-3 h-3"
+              [class.animate-spin]="isPruningDupes()"
+            ></app-icon>
+            <span>Prune Duplicates</span>
+          </button>
+
+          <!-- Prune Expired -->
+          <button
+            (click)="pruneInactive()"
+            [disabled]="isPruning() || applications().length === 0"
+            class="px-2.5 py-1.5 bg-amber-950/40 border border-amber-800/80 hover:bg-amber-900/60 text-amber-300 rounded-xl text-xs font-medium transition flex items-center gap-1"
+            title="Purge closed/expired job postings"
+          >
+            <app-icon
+              name="filter-x"
+              className="w-3 h-3"
+              [class.animate-spin]="isPruning()"
+            ></app-icon>
+            <span>Prune Expired</span>
+          </button>
+
+          <!-- EMEA Only Filter -->
+          <button
+            (click)="pruneNonEmea()"
+            [disabled]="isPruningEmea() || applications().length === 0"
+            class="px-2.5 py-1.5 bg-blue-950/40 border border-blue-800/80 hover:bg-blue-900/60 text-blue-300 rounded-xl text-xs font-medium transition flex items-center gap-1"
+            title="Prune applications with US/non-EMEA residency restrictions"
+          >
+            <app-icon
+              name="globe"
+              className="w-3 h-3"
+              [class.animate-spin]="isPruningEmea()"
+            ></app-icon>
+            <span>EMEA Filter</span>
+          </button>
+
+          <!-- Clear Failed -->
+          <button
+            (click)="clearFailed()"
+            class="px-2.5 py-1.5 bg-rose-950/40 border border-rose-800/80 hover:bg-rose-900/60 text-rose-300 rounded-xl text-xs font-medium transition flex items-center gap-1"
+            title="Purge failed application records"
+          >
+            <app-icon name="alert-triangle" className="w-3 h-3"></app-icon>
+            <span>Clear Failed</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Durable automation funnel: intentionally separate from artifact/manual counts. -->
+      <section
+        aria-labelledby="automation-funnel-heading"
+        class="mb-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-4 shadow-sm"
+      >
+        <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 id="automation-funnel-heading" class="text-sm font-bold text-white">
+              Automation outcomes
+            </h2>
+            <p class="text-[11px] text-slate-500">
+              Verified jobs and attempts are separate from generated artifacts and manual
+              submissions.
+            </p>
+          </div>
+          <span *ngIf="isFunnelLoading()" class="text-[11px] text-slate-500"
+            >Loading metrics...</span
+          >
+          <span *ngIf="funnelError()" class="text-[11px] text-amber-300">{{ funnelError() }}</span>
+        </div>
+        <p *ngIf="automationFunnel()?.runnable_jobs === 0" class="mb-3 text-[11px] text-slate-500">
+          No jobs are runnable right now; an idle Browser View is expected until a job becomes
+          claimable.
+        </p>
+        <div
+          *ngIf="automationFunnel() as funnel"
+          class="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8"
+        >
+          <div
+            title="Distinct application attempts with confirmation evidence"
+            class="rounded-xl border border-emerald-900/60 bg-emerald-950/20 p-2"
+          >
+            <div class="text-lg font-bold text-emerald-300">
+              {{ funnel.verified_autonomous_submissions }}
+            </div>
+            <div class="text-[10px] text-slate-400">Verified autonomous submissions</div>
+          </div>
+          <div
+            title="All automation jobs currently tracked, including terminal jobs"
+            class="rounded-xl border border-slate-800 bg-slate-950/50 p-2"
+          >
+            <div class="text-lg font-bold text-slate-200">{{ funnel.jobs_tracked }}</div>
+            <div class="text-[10px] text-slate-400">Jobs tracked</div>
+          </div>
+          <div
+            title="Jobs eligible for a claim now; zero means the live browser may be idle"
+            class="rounded-xl border border-emerald-900/60 bg-emerald-950/20 p-2"
+          >
+            <div class="text-lg font-bold text-emerald-300">{{ funnel.runnable_jobs }}</div>
+            <div class="text-[10px] text-slate-400">Runnable jobs</div>
+          </div>
+          <div
+            title="Distinct tracked jobs with an attempt or durable event"
+            class="rounded-xl border border-slate-800 bg-slate-950/50 p-2"
+          >
+            <div class="text-lg font-bold text-slate-200">{{ funnel.jobs_with_attempt }}</div>
+            <div class="text-[10px] text-slate-400">Jobs with attempt</div>
+          </div>
+          <div
+            title="All application_attempts rows, including retries"
+            class="rounded-xl border border-blue-900/60 bg-blue-950/20 p-2"
+          >
+            <div class="text-lg font-bold text-blue-300">{{ funnel.total_attempts }}</div>
+            <div class="text-[10px] text-slate-400">Attempt rows (all)</div>
+          </div>
+          <div
+            title="Distinct current jobs blocked on authentication, MFA, or CAPTCHA"
+            class="rounded-xl border border-amber-900/60 bg-amber-950/20 p-2"
+          >
+            <div class="text-lg font-bold text-amber-300">
+              {{ funnel.current_auth_blocked_jobs }}
+            </div>
+            <div class="text-[10px] text-slate-400">Auth-blocked jobs (current)</div>
+          </div>
+          <div
+            title="Distinct current jobs marked site changed or inactive"
+            class="rounded-xl border border-orange-900/60 bg-orange-950/20 p-2"
+          >
+            <div class="text-lg font-bold text-orange-300">
+              {{ funnel.current_site_changed_jobs }}
+            </div>
+            <div class="text-[10px] text-slate-400">Site-changed jobs (current)</div>
+          </div>
+          <div
+            title="Historical attempt rows requiring auth, MFA, or CAPTCHA"
+            class="rounded-xl border border-amber-900/60 bg-amber-950/20 p-2"
+          >
+            <div class="text-lg font-bold text-amber-300">
+              {{ funnel.historical_auth_blocked_attempts }}
+            </div>
+            <div class="text-[10px] text-slate-400">Auth-block attempts (historical)</div>
+          </div>
+          <div
+            title="Historical attempt rows classified as site changed or inactive"
+            class="rounded-xl border border-orange-900/60 bg-orange-950/20 p-2"
+          >
+            <div class="text-lg font-bold text-orange-300">
+              {{ funnel.historical_site_changed_attempts }}
+            </div>
+            <div class="text-[10px] text-slate-400">Site-change attempts (historical)</div>
+          </div>
+          <div
+            title="Distinct current jobs permanently failed"
+            class="rounded-xl border border-rose-900/60 bg-rose-950/20 p-2"
+          >
+            <div class="text-lg font-bold text-rose-300">
+              {{ funnel.current_permanent_failures }}
+            </div>
+            <div class="text-[10px] text-slate-400">Permanent failures (current)</div>
+          </div>
+          <div
+            title="Distinct current jobs waiting for retry"
+            class="rounded-xl border border-blue-900/60 bg-blue-950/20 p-2"
+          >
+            <div class="text-lg font-bold text-blue-300">{{ funnel.current_retry_wait_jobs }}</div>
+            <div class="text-[10px] text-slate-400">Retry-wait jobs (current)</div>
+          </div>
+          <div
+            title="Generated CV/cover-letter artifact folders, including applied folders"
+            class="rounded-xl border border-slate-800 bg-slate-950/50 p-2"
+          >
+            <div class="text-lg font-bold text-slate-200">{{ funnel.generated_artifacts }}</div>
+            <div class="text-[10px] text-slate-400">Generated artifacts</div>
+          </div>
+          <div
+            title="Application rows marked applied manually rather than verified by autonomous browser submission"
+            class="rounded-xl border border-purple-900/60 bg-purple-950/20 p-2"
+          >
+            <div class="text-lg font-bold text-purple-300">{{ funnel.manual_applied }}</div>
+            <div class="text-[10px] text-slate-400">Manual applied rows</div>
+          </div>
+        </div>
+      </section>
 
       <!-- Queue Error State (When fetch failed and no cached applications) -->
       <div
@@ -561,20 +1353,58 @@
         >
           <div>
             <div class="flex items-start justify-between gap-3 mb-2">
-              <div>
-                <h3
-                  class="font-bold text-white text-base leading-snug line-clamp-1 group-hover:text-emerald-300 transition-colors"
-                >
-                  {{ app.company }}
-                </h3>
-                <h4 class="text-xs font-medium text-slate-300 mt-0.5 line-clamp-1">
-                  {{ app.title }}
-                </h4>
+              <div class="flex items-start gap-2.5 min-w-0">
+                <input
+                  type="checkbox"
+                  [checked]="isAppSelected(app.id)"
+                  (click)="$event.stopPropagation()"
+                  (change)="toggleAppSelection(app.id, $event)"
+                  [aria-label]="'Select ' + (app.company || 'application')"
+                  class="mt-1 rounded bg-slate-950 border-slate-700 text-emerald-500 focus:ring-emerald-500/20 cursor-pointer shrink-0"
+                />
+                <div class="min-w-0">
+                  <h3
+                    class="font-bold text-white text-base leading-snug line-clamp-1 group-hover:text-emerald-300 transition-colors"
+                  >
+                    {{ app.company }}
+                  </h3>
+                  <h4 class="text-xs font-medium text-slate-300 mt-0.5 line-clamp-1">
+                    {{ app.title }}
+                  </h4>
+                </div>
               </div>
               <span
                 class="text-[10px] font-mono px-2 py-0.5 rounded-md bg-slate-950 border border-slate-800 text-slate-400 shrink-0"
               >
                 {{ app.created_at }}
+              </span>
+            </div>
+
+            <!-- Dual Status Badges & Platform -->
+            <div class="flex items-center gap-1.5 flex-wrap my-2">
+              <!-- Application Status -->
+              <span
+                class="px-2 py-0.5 rounded-md border text-[10px] font-semibold uppercase tracking-wider"
+                [ngClass]="appStatusClass(app.status)"
+              >
+                {{ app.status || 'pending' }}
+              </span>
+
+              <!-- Queue Status -->
+              <span
+                class="px-2 py-0.5 rounded-md border text-[10px] font-medium flex items-center gap-1"
+                [ngClass]="appQueueStatusClass(app)"
+              >
+                <span class="w-1.5 h-1.5 rounded-full bg-current"></span>
+                <span>{{ appQueueStatusLabel(app) }}</span>
+              </span>
+
+              <!-- Platform Badge -->
+              <span
+                *ngIf="app.platform"
+                class="px-2 py-0.5 rounded-md bg-slate-950 border border-slate-800 text-slate-400 text-[10px]"
+              >
+                {{ app.platform }}
               </span>
             </div>
 
@@ -595,17 +1425,132 @@
             >
               "{{ app.cover_letter_preview }}"
             </div>
+
+            <div
+              class="mb-4 rounded-xl border border-slate-800/80 bg-slate-950/50 p-3"
+              aria-label="Automation status"
+            >
+              <div class="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                <span class="font-semibold text-slate-300"
+                  >Automation: {{ automationStateLabel(app) }}</span
+                >
+                <span class="text-slate-500">Step: {{ automationStepLabel(app) }}</span>
+              </div>
+              <button
+                type="button"
+                class="mt-2 text-[11px] font-semibold text-emerald-400 hover:text-emerald-300 focus:outline-none focus:ring-2 focus:ring-emerald-500/60 rounded"
+                [attr.aria-expanded]="isAutomationHistoryOpen(app.id)"
+                (click)="toggleAutomationHistory(app)"
+              >
+                {{
+                  isAutomationHistoryOpen(app.id)
+                    ? 'Hide execution history'
+                    : 'View execution history'
+                }}
+              </button>
+              <div
+                *ngIf="isAutomationHistoryOpen(app.id)"
+                class="mt-3 border-t border-slate-800 pt-3"
+              >
+                <div
+                  *ngIf="automationHistory()[app.id]?.loading"
+                  class="text-[11px] text-slate-500"
+                >
+                  Loading sanitized history...
+                </div>
+                <div *ngIf="automationHistory()[app.id]?.error" class="text-[11px] text-amber-300">
+                  {{ automationHistory()[app.id]?.error }}
+                </div>
+                <div
+                  *ngIf="
+                    !automationHistory()[app.id]?.loading &&
+                    !automationHistory()[app.id]?.error &&
+                    (automationHistory()[app.id]?.events?.length || 0) === 0
+                  "
+                  class="text-[11px] text-slate-500"
+                >
+                  No automation events recorded for this application.
+                </div>
+                <ol
+                  *ngIf="(automationHistory()[app.id]?.events?.length || 0) > 0"
+                  class="max-h-48 space-y-2 overflow-y-auto pr-1"
+                >
+                  <li
+                    *ngFor="let event of automationHistory()[app.id]?.events"
+                    class="text-[11px] text-slate-400"
+                  >
+                    <div class="flex items-start justify-between gap-2">
+                      <span class="font-semibold text-slate-300">{{
+                        event.event_type || 'event'
+                      }}</span>
+                      <time class="shrink-0 text-[10px] text-slate-600">{{
+                        event.created_at
+                      }}</time>
+                    </div>
+                    <p class="mt-0.5 break-words">
+                      {{ event.message || 'No additional details.' }}
+                    </p>
+                  </li>
+                </ol>
+                <button
+                  *ngIf="automationHistory()[app.id]?.hasMore"
+                  type="button"
+                  class="mt-2 text-[11px] font-semibold text-slate-300 hover:text-white"
+                  (click)="loadMoreAutomationEvents(app)"
+                >
+                  Load older events
+                </button>
+              </div>
+            </div>
           </div>
 
           <div
             class="card-actions pt-4 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2"
           >
-            <div class="flex items-center gap-1.5">
+            <div class="flex items-center gap-1.5 flex-wrap">
               <button
                 (click)="openReviewModal(app.id)"
-                class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-semibold transition"
+                class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-semibold transition flex items-center gap-1"
+                title="Review tailored CV"
+                aria-label="Review tailored CV"
               >
-                Review CV
+                <app-icon name="file-text" className="w-3 h-3"></app-icon>
+                <span>Review CV</span>
+              </button>
+
+              <!-- Queue / Cancel Queue Toggle -->
+              <button
+                type="button"
+                (click)="toggleQueueApp(app, $event)"
+                [class]="
+                  isAppCancellable(app)
+                    ? 'px-3 py-1.5 bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-800/60 rounded-xl text-xs font-semibold transition flex items-center gap-1'
+                    : 'px-3 py-1.5 bg-teal-950/40 hover:bg-teal-900/60 text-teal-300 border border-teal-800/60 rounded-xl text-xs font-semibold transition flex items-center gap-1'
+                "
+                [title]="isAppCancellable(app) ? 'Cancel queue job' : 'Add to automation queue'"
+              >
+                <app-icon
+                  [name]="isAppCancellable(app) ? 'x' : 'play'"
+                  className="w-3 h-3"
+                ></app-icon>
+                <span>{{ isAppCancellable(app) ? 'Cancel Queue' : 'Queue' }}</span>
+              </button>
+
+              <!-- Takeover (when action required) -->
+              <button
+                *ngIf="
+                  app.job_state === 'auth_required' ||
+                  app.job_state === 'mfa_required' ||
+                  app.job_state === 'captcha_required' ||
+                  app.automation_state === 'auth_required'
+                "
+                type="button"
+                (click)="openTakeoverForJob(app.job_id, $event)"
+                class="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-xl text-xs transition flex items-center gap-1 shadow-md shadow-amber-950/50 animate-pulse"
+                title="Takeover browser to solve authentication"
+              >
+                <app-icon name="key" className="w-3 h-3"></app-icon>
+                <span>Takeover</span>
               </button>
 
               <button
@@ -655,22 +1600,42 @@
       </div>
     </section>
 
-    <!-- TAB 2: APPLICATION TRACKER -->
-    <section *ngIf="activeTab() === 'tracker'">
-      <div class="bg-slate-900/90 border border-slate-800 rounded-2xl overflow-hidden shadow-sm">
+    <!-- TAB 2: AUTOMATION & PIPELINE METRICS -->
+    <section *ngIf="activeTab() === 'metrics'">
+      <div
+        class="bg-slate-900/90 border border-slate-800 rounded-2xl overflow-hidden shadow-sm mb-6"
+      >
         <div
           class="p-4 border-b border-slate-800 flex items-center justify-between flex-wrap gap-4"
         >
           <div>
             <h3 class="text-base font-bold text-white flex items-center gap-2">
               <app-icon name="activity" className="w-4 h-4 text-emerald-400"></app-icon>
-              <span>Application Pipeline History</span>
+              <span>Application Pipeline & Automation Metrics</span>
             </h3>
             <p class="text-xs text-slate-400">
               Track statuses, dates, platforms, and submission proofs.
             </p>
           </div>
-          <div class="flex items-center gap-3">
+          <div class="flex items-center flex-wrap gap-2 sm:gap-3">
+            <button
+              *ngIf="selectedTrackerCount() > 0"
+              (click)="sendSelectedToQueue()"
+              class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition shadow-sm"
+              title="Enqueue selected applications into the automation queue"
+            >
+              <app-icon name="layers" className="w-3.5 h-3.5"></app-icon>
+              <span>Send Selected to Queue ({{ selectedTrackerCount() }})</span>
+            </button>
+            <button
+              *ngIf="filteredTrackerRecords().length > 0"
+              (click)="sendAllToQueue()"
+              class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded-xl text-xs font-medium flex items-center gap-1.5 transition border border-slate-700/60"
+              title="Enqueue all currently displayed applications into the automation queue"
+            >
+              <app-icon name="layers" className="w-3.5 h-3.5"></app-icon>
+              <span>Send All ({{ filteredTrackerRecords().length }}) to Queue</span>
+            </button>
             <select
               [ngModel]="trackerFilter()"
               (ngModelChange)="trackerFilter.set($event); loadTracker()"
@@ -692,6 +1657,15 @@
               <tr
                 class="border-b border-slate-800 bg-slate-950/60 text-slate-400 uppercase tracking-wider text-[10px]"
               >
+                <th class="py-3.5 px-4 w-10 text-center select-none">
+                  <input
+                    type="checkbox"
+                    [checked]="isAllTrackerSelected()"
+                    (change)="toggleSelectAllTracker()"
+                    aria-label="Select all applications in tracker"
+                    class="rounded bg-slate-950 border-slate-700 text-emerald-500 focus:ring-emerald-500/20 cursor-pointer"
+                  />
+                </th>
                 <th
                   (click)="toggleSort('timestamp')"
                   class="py-3.5 px-4 cursor-pointer hover:text-white select-none"
@@ -736,6 +1710,15 @@
                 *ngFor="let rec of filteredTrackerRecords()"
                 class="hover:bg-slate-800/40 transition"
               >
+                <td data-label="Select" class="py-3 px-4 text-center">
+                  <input
+                    type="checkbox"
+                    [checked]="isTrackerSelected(rec.job_url)"
+                    (change)="toggleTrackerSelection(rec.job_url, $event)"
+                    [aria-label]="'Select ' + (rec.company || 'application')"
+                    class="rounded bg-slate-950 border-slate-700 text-emerald-500 focus:ring-emerald-500/20 cursor-pointer"
+                  />
+                </td>
                 <td data-label="Date" class="py-3 px-4 font-mono text-slate-400 text-[11px]">
                   {{ rec.timestamp }}
                 </td>
@@ -759,8 +1742,10 @@
                     (ngModelChange)="updateTrackerStatus(rec.job_url, $event)"
                     class="bg-slate-950 border border-slate-800 rounded-lg px-2 py-1 text-[11px] text-slate-300 focus:outline-none"
                   >
+                    <option value="pending">Pending</option>
                     <option value="applied">Applied</option>
                     <option value="auto_filled">Auto-filled</option>
+                    <option value="filled_only">Filled Only</option>
                     <option value="interviewing">Interviewing</option>
                     <option value="offered">Offered</option>
                     <option value="rejected">Rejected</option>
@@ -787,7 +1772,7 @@
                 </td>
               </tr>
               <tr *ngIf="resourceStates().tracker.error && trackerRecords().length === 0">
-                <td colspan="7" class="py-10 text-center text-rose-400">
+                <td colspan="8" class="py-10 text-center text-rose-400">
                   <div class="flex flex-col items-center gap-2">
                     <span class="font-semibold text-rose-200"
                       >Unable to load application tracker</span
@@ -811,7 +1796,7 @@
                   filteredTrackerRecords().length === 0
                 "
               >
-                <td colspan="7" class="py-8 text-center text-slate-500">
+                <td colspan="8" class="py-8 text-center text-slate-500">
                   No applications recorded in tracker.
                 </td>
               </tr>
@@ -1658,6 +2643,570 @@
         <pre
           class="bg-slate-950 p-4 rounded-xl font-mono text-slate-300 overflow-x-auto border border-slate-800"
           >{{ diagData() | json }}</pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- NOTIFICATIONS DRAWER / FLYOUT -->
+  <div
+    *ngIf="notificationsDrawerOpen()"
+    class="modal-backdrop fixed inset-0 z-50 flex items-center justify-end bg-slate-950/70 backdrop-blur-sm"
+  >
+    <div
+      class="notifications-drawer bg-slate-900 border-l border-slate-800 w-full max-w-md h-full shadow-2xl flex flex-col transition-all duration-300"
+    >
+      <!-- Drawer Header -->
+      <div
+        class="p-4 sm:px-6 border-b border-slate-800 flex items-center justify-between gap-3 bg-slate-950/60"
+      >
+        <div class="flex items-center space-x-2.5">
+          <div
+            class="w-8 h-8 rounded-xl bg-amber-500/20 border border-amber-500/30 flex items-center justify-center text-amber-400"
+          >
+            <app-icon name="bell" className="w-4 h-4"></app-icon>
+          </div>
+          <div>
+            <div class="flex items-center gap-2">
+              <h3 class="text-sm font-bold text-white">Alerts & Notifications</h3>
+              <span
+                *ngIf="notifService.unreadCount() > 0"
+                class="px-2 py-0.5 rounded-full text-[10px] bg-rose-500 text-white font-mono font-bold"
+              >
+                {{ notifService.unreadCount() }} unread
+              </span>
+            </div>
+            <p class="text-[11px] text-slate-400">Durable system & exception history</p>
+          </div>
+        </div>
+
+        <div class="flex items-center gap-1.5">
+          <button
+            (click)="openNotifSettingsModal()"
+            class="p-1.5 text-slate-400 hover:text-slate-200 rounded-lg hover:bg-slate-800 transition"
+            title="Notification Preferences & Browser Opt-In"
+          >
+            <app-icon name="zap" className="w-4 h-4"></app-icon>
+          </button>
+          <button
+            (click)="closeNotificationsDrawer()"
+            class="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition"
+          >
+            <app-icon name="x" className="w-5 h-5"></app-icon>
+          </button>
+        </div>
+      </div>
+
+      <!-- Action Sub-header -->
+      <div
+        class="px-4 py-2 bg-slate-950/40 border-b border-slate-800/80 flex items-center justify-between text-xs"
+      >
+        <span class="text-slate-400 font-mono text-[11px]"
+          >{{ notifService.notifications().length }} notifications</span
+        >
+        <div class="flex items-center gap-3">
+          <button
+            *ngIf="notifService.unreadCount() > 0"
+            (click)="ackAllNotifications()"
+            class="text-emerald-400 hover:text-emerald-300 text-xs font-semibold flex items-center gap-1 transition"
+          >
+            <app-icon name="check-circle" className="w-3.5 h-3.5"></app-icon>
+            <span>Acknowledge All</span>
+          </button>
+          <button
+            *ngIf="notifService.notifications().length > 0"
+            (click)="clearAllNotifications()"
+            class="text-rose-400 hover:text-rose-300 text-xs font-semibold flex items-center gap-1 transition hover:underline"
+            title="Clear all notifications"
+          >
+            <app-icon name="trash-2" className="w-3.5 h-3.5"></app-icon>
+            <span>Clear All</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Notifications List -->
+      <div class="flex-1 overflow-y-auto p-4 space-y-3">
+        <div
+          *ngIf="notifService.notifications().length === 0"
+          class="py-12 text-center text-slate-500 text-xs"
+        >
+          <app-icon name="inbox" className="w-8 h-8 mx-auto mb-2 text-slate-600"></app-icon>
+          <p>No notifications recorded yet.</p>
+          <p class="text-[11px] text-slate-600 mt-1">
+            Actionable exceptions and pipeline alerts will appear here.
+          </p>
+        </div>
+
+        <div
+          *ngFor="let n of notifService.notifications()"
+          class="p-3.5 rounded-2xl border transition-all text-xs"
+          [ngClass]="{
+            'bg-slate-950/80 border-slate-800 text-slate-300': n.acknowledged,
+            'bg-slate-900 border-amber-500/50 shadow-md ring-1 ring-amber-500/20 text-slate-100':
+              !n.acknowledged && (n.severity === 'warning' || n.severity === 'info'),
+            'bg-rose-950/30 border-rose-500/60 shadow-md ring-1 ring-rose-500/20 text-rose-100':
+              !n.acknowledged && (n.severity === 'critical' || n.severity === 'error'),
+          }"
+        >
+          <div class="flex items-center justify-between gap-2 mb-1.5">
+            <div class="flex items-center gap-2 flex-wrap">
+              <span
+                class="px-2 py-0.5 rounded-md text-[10px] font-bold uppercase tracking-wider border"
+                [ngClass]="{
+                  'bg-rose-950 text-rose-300 border-rose-800':
+                    n.severity === 'critical' || n.severity === 'error',
+                  'bg-amber-950 text-amber-300 border-amber-800': n.severity === 'warning',
+                  'bg-slate-800 text-slate-300 border-slate-700': n.severity === 'info',
+                }"
+              >
+                {{ n.category.replace('_', ' ') }}
+              </span>
+              <span *ngIf="n.job_id" class="text-[10px] font-mono text-slate-400">
+                #{{ n.job_id }}
+              </span>
+            </div>
+            <div class="flex items-center gap-2">
+              <span class="text-[10px] text-slate-400 font-mono">{{ n.created_at }}</span>
+              <button
+                type="button"
+                (click)="dismissNotification(n.id); $event.stopPropagation()"
+                class="text-slate-500 hover:text-rose-400 p-0.5 rounded transition"
+                title="Dismiss notification"
+              >
+                <app-icon name="x" className="w-3.5 h-3.5"></app-icon>
+              </button>
+            </div>
+          </div>
+
+          <h4 class="font-bold text-sm mb-1" [class.text-white]="!n.acknowledged">
+            {{ n.title }}
+          </h4>
+          <p
+            class="text-xs leading-relaxed"
+            [class.text-slate-400]="n.acknowledged"
+            [class.text-slate-200]="!n.acknowledged"
+          >
+            {{ n.message }}
+          </p>
+
+          <div
+            class="mt-3 pt-2.5 border-t border-slate-800/60 flex items-center justify-between gap-2"
+          >
+            <span
+              *ngIf="n.acknowledged"
+              class="text-[10px] text-emerald-400 flex items-center gap-1 font-mono"
+            >
+              <app-icon name="check" className="w-3 h-3"></app-icon>
+              <span>Acknowledged</span>
+            </span>
+
+            <button
+              *ngIf="!n.acknowledged"
+              (click)="ackNotification(n.id)"
+              class="px-3 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white rounded-lg text-xs font-semibold transition flex items-center gap-1 border border-slate-700"
+            >
+              <app-icon name="check" className="w-3 h-3 text-emerald-400"></app-icon>
+              <span>Acknowledge</span>
+            </button>
+
+            <!-- Action helper if tied to a job -->
+            <button
+              *ngIf="
+                n.job_id &&
+                (n.category === 'unknown_question' ||
+                  n.category === 'captcha_required' ||
+                  n.category === 'mfa_required')
+              "
+              (click)="openTakeoverModal(); closeNotificationsDrawer()"
+              class="text-xs text-teal-400 hover:text-teal-300 flex items-center gap-1 font-semibold"
+            >
+              <span>Inspect in Viewer</span>
+              <app-icon name="external-link" className="w-3 h-3"></app-icon>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- NOTIFICATION PREFERENCES & OPT-IN MODAL -->
+  <div
+    *ngIf="notifSettingsModalOpen()"
+    class="modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md"
+  >
+    <div
+      class="settings-dialog bg-slate-900 border border-slate-800 w-full max-w-lg rounded-3xl overflow-hidden shadow-2xl flex flex-col"
+    >
+      <div
+        class="p-4 sm:px-6 border-b border-slate-800 flex items-center justify-between gap-3 bg-slate-950/60"
+      >
+        <div class="flex items-center space-x-3">
+          <div
+            class="w-10 h-10 rounded-2xl bg-amber-500/20 border border-amber-500/30 flex items-center justify-center text-amber-400"
+          >
+            <app-icon name="bell" className="w-5 h-5"></app-icon>
+          </div>
+          <div>
+            <h3 class="text-base font-bold text-white">Notification Preferences</h3>
+            <p class="text-xs text-slate-400">Configure native browser alerts and sound</p>
+          </div>
+        </div>
+        <button
+          (click)="closeNotifSettingsModal()"
+          class="p-2 text-slate-400 hover:text-white rounded-xl hover:bg-slate-800 transition"
+        >
+          <app-icon name="x" className="w-5 h-5"></app-icon>
+        </button>
+      </div>
+
+      <div class="p-4 sm:p-6 space-y-5 overflow-y-auto text-xs">
+        <!-- Browser Native Notifications -->
+        <div class="p-4 rounded-2xl bg-slate-950/60 border border-slate-800 space-y-3">
+          <div class="flex items-center justify-between gap-2">
+            <div>
+              <h4 class="text-sm font-semibold text-white flex items-center gap-1.5">
+                <app-icon name="bell" className="w-4 h-4 text-emerald-400"></app-icon>
+                <span>Browser Native Notifications</span>
+              </h4>
+              <p class="text-xs text-slate-400 mt-0.5">
+                Emits OS alerts for actionable exceptions when dashboard is backgrounded
+              </p>
+            </div>
+            <span
+              class="px-2 py-0.5 rounded text-[10px] font-bold uppercase"
+              [ngClass]="{
+                'bg-emerald-950 text-emerald-300 border border-emerald-800':
+                  notifService.permissionState() === 'granted',
+                'bg-rose-950 text-rose-300 border border-rose-800':
+                  notifService.permissionState() === 'denied',
+                'bg-amber-950 text-amber-300 border border-amber-800':
+                  notifService.permissionState() === 'default',
+                'bg-slate-800 text-slate-400 border border-slate-700':
+                  notifService.permissionState() === 'unsupported',
+              }"
+            >
+              {{ notifService.permissionState() }}
+            </span>
+          </div>
+
+          <!-- Explicit opt-in click button -->
+          <div *ngIf="notifService.permissionState() === 'default'">
+            <button
+              (click)="notifService.requestNotificationPermission()"
+              class="w-full py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl transition flex items-center justify-center gap-2"
+            >
+              <app-icon name="bell" className="w-3.5 h-3.5"></app-icon>
+              <span>Enable Browser Notifications</span>
+            </button>
+            <p class="text-[11px] text-slate-500 mt-1">
+              Requires HTTPS context and explicit click confirmation.
+            </p>
+          </div>
+
+          <!-- Granted state toggle -->
+          <div
+            *ngIf="notifService.permissionState() === 'granted'"
+            class="flex items-center justify-between pt-2 border-t border-slate-800"
+          >
+            <span class="text-slate-300">Deliver OS alerts:</span>
+            <button
+              (click)="notifService.setNativeNotificationsEnabled(!notifService.nativeEnabled())"
+              class="px-3 py-1 rounded-lg text-xs font-semibold transition"
+              [ngClass]="
+                notifService.nativeEnabled()
+                  ? 'bg-emerald-600 text-white'
+                  : 'bg-slate-800 text-slate-400'
+              "
+            >
+              {{ notifService.nativeEnabled() ? 'Enabled' : 'Disabled' }}
+            </button>
+          </div>
+
+          <!-- Denied or Unsupported Fallback -->
+          <div
+            *ngIf="notifService.permissionState() === 'denied'"
+            class="p-3 rounded-xl bg-rose-950/30 border border-rose-800/60 text-rose-200 text-[11px] leading-relaxed"
+          >
+            <p class="font-bold mb-0.5">Permission Denied in Browser</p>
+            <p>
+              To enable, click the lock icon in your browser address bar and set Notifications to
+              "Allow". Alternatively, use mobile push notifications via ntfy.
+            </p>
+          </div>
+
+          <div
+            *ngIf="notifService.permissionState() === 'unsupported'"
+            class="p-3 rounded-xl bg-amber-950/30 border border-amber-800/60 text-amber-200 text-[11px] leading-relaxed"
+          >
+            <p class="font-bold mb-0.5">Notifications API Not Supported</p>
+            <p>
+              Your current browser does not support the Notifications API. In-app alerts and mobile
+              push notifications via ntfy remain active.
+            </p>
+          </div>
+        </div>
+
+        <!-- Sound Alerts (Web Audio API) -->
+        <div class="p-4 rounded-2xl bg-slate-950/60 border border-slate-800 space-y-3">
+          <div class="flex items-center justify-between gap-2">
+            <div>
+              <h4 class="text-sm font-semibold text-white flex items-center gap-1.5">
+                <app-icon
+                  [name]="notifService.soundEnabled() ? 'volume-2' : 'volume-x'"
+                  className="w-4 h-4 text-teal-400"
+                ></app-icon>
+                <span>Audible Chime Alert</span>
+              </h4>
+              <p class="text-xs text-slate-400 mt-0.5">
+                Synthesizes a gentle dual-tone chime on new actionable alerts (OFF by default)
+              </p>
+            </div>
+            <button
+              (click)="notifService.setSoundEnabled(!notifService.soundEnabled())"
+              class="px-3 py-1 rounded-lg text-xs font-semibold transition"
+              [ngClass]="
+                notifService.soundEnabled()
+                  ? 'bg-teal-600 text-white'
+                  : 'bg-slate-800 text-slate-400'
+              "
+            >
+              {{ notifService.soundEnabled() ? 'ON' : 'OFF' }}
+            </button>
+          </div>
+
+          <div class="flex items-center justify-between pt-2 border-t border-slate-800">
+            <span class="text-[11px] text-slate-400">Synthesized Web Audio (Zero downloads):</span>
+            <button
+              (click)="notifService.playNotificationSound()"
+              class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs transition"
+            >
+              Test Sound
+            </button>
+          </div>
+        </div>
+
+        <!-- Mobile & Offline Push Channel (ntfy) -->
+        <div class="p-4 rounded-2xl bg-slate-950/60 border border-slate-800 space-y-2">
+          <h4 class="text-sm font-semibold text-white flex items-center gap-1.5">
+            <app-icon name="activity" className="w-4 h-4 text-indigo-400"></app-icon>
+            <span>Mobile Push Alerts (ntfy)</span>
+          </h4>
+          <p class="text-xs text-slate-400 leading-relaxed">
+            Subscribe your iOS or Android device using the free official ntfy app. Alerts contain
+            generic categories and opaque IDs only—candidate PII is never included in push payloads.
+          </p>
+          <div
+            class="p-2.5 bg-slate-900 rounded-xl font-mono text-[11px] text-slate-300 border border-slate-800"
+          >
+            Host: <span class="text-emerald-400">https://notify.jobs.aslan.net/job-alerts</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- AUTHENTICATED noVNC VIEWER & OPERATOR TAKEOVER MODAL -->
+  <div
+    *ngIf="vncModalOpen()"
+    class="modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-1 sm:p-4 bg-slate-950/90 backdrop-blur-md"
+  >
+    <div
+      class="vnc-dialog bg-slate-900 border border-slate-800 w-full max-w-6xl h-[94vh] rounded-3xl overflow-hidden shadow-2xl flex flex-col"
+    >
+      <!-- Viewer Top Bar -->
+      <div
+        class="p-3 sm:px-6 border-b border-slate-800 flex items-center justify-between gap-3 bg-slate-950 flex-wrap sm:flex-nowrap"
+      >
+        <div class="flex items-center space-x-3">
+          <div
+            class="w-8 h-8 rounded-xl bg-teal-500/20 border border-teal-500/30 flex items-center justify-center text-teal-400"
+          >
+            <app-icon name="monitor" className="w-4 h-4"></app-icon>
+          </div>
+          <div>
+            <div class="flex items-center gap-2">
+              <h3 class="text-sm font-bold text-white">Browser Automation Live Viewer</h3>
+              <span
+                class="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold uppercase tracking-wider border"
+                [ngClass]="{
+                  'bg-emerald-950 text-emerald-300 border-emerald-800':
+                    takeoverStatus()?.is_takeover_active,
+                  'bg-slate-800 text-slate-300 border-slate-700':
+                    !takeoverStatus()?.is_takeover_active,
+                }"
+              >
+                {{
+                  takeoverStatus()?.is_takeover_active
+                    ? 'Interactive Takeover Active'
+                    : 'Read-Only Mode'
+                }}
+              </span>
+            </div>
+            <p class="text-[11px] text-slate-400">
+              {{
+                takeoverStatus()?.is_takeover_active
+                  ? 'Operator has exclusive control. Lease expires in ' + takeoverCountdown() + 's.'
+                  : 'Server-enforced read-only viewer. Keystrokes/clicks are blocked until control is claimed.'
+              }}
+            </p>
+          </div>
+        </div>
+
+        <!-- Takeover Action Controls -->
+        <div class="flex items-center gap-2">
+          <!-- Claim Takeover -->
+          <button
+            *ngIf="!takeoverStatus()?.is_takeover_active"
+            (click)="claimTakeover()"
+            [disabled]="isClaimingTakeover()"
+            class="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs rounded-xl transition shadow flex items-center gap-1.5 disabled:opacity-50"
+            title="Claim exclusive control and pause automation"
+          >
+            <app-icon name="key" className="w-3.5 h-3.5"></app-icon>
+            <span>{{ isClaimingTakeover() ? 'Claiming...' : 'Claim Control' }}</span>
+          </button>
+
+          <!-- Release Takeover -->
+          <button
+            *ngIf="takeoverStatus()?.is_takeover_active"
+            (click)="releaseTakeover()"
+            [disabled]="isReleasingTakeover()"
+            class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-xl text-xs font-semibold transition flex items-center gap-1.5 disabled:opacity-50"
+            title="Release manual control (automation stays paused)"
+          >
+            <app-icon name="x" className="w-3.5 h-3.5"></app-icon>
+            <span>Release Control</span>
+          </button>
+
+          <!-- Reopen a closed authentication session without bypassing revalidation -->
+          <button
+            *ngIf="isAuthenticationWaiting()"
+            (click)="reopenAuthSession()"
+            [disabled]="isReopeningAuth()"
+            class="px-3 py-1.5 bg-sky-600 hover:bg-sky-500 text-white font-bold text-xs rounded-xl transition shadow flex items-center gap-1.5 disabled:opacity-50"
+            title="Start a fresh controlled browser session for operator authentication"
+          >
+            <app-icon name="refresh-cw" className="w-3.5 h-3.5"></app-icon>
+            <span>{{ isReopeningAuth() ? 'Reopening...' : 'Reopen Authentication' }}</span>
+          </button>
+
+          <!-- Safe Resume & Unpause -->
+          <button
+            *ngIf="
+              !isAuthenticationWaiting() &&
+              (takeoverStatus()?.is_takeover_active || notifService.isPaused())
+            "
+            (click)="resumeFromTakeover()"
+            [disabled]="isResumingTakeover()"
+            class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl transition shadow flex items-center gap-1.5 disabled:opacity-50"
+            title="Revalidate page domain, challenge completion, and resume automation"
+          >
+            <app-icon name="play" className="w-3.5 h-3.5 fill-current"></app-icon>
+            <span>{{ isResumingTakeover() ? 'Revalidating...' : 'Safe Resume' }}</span>
+          </button>
+
+          <div class="h-4 w-px bg-slate-800"></div>
+
+          <button
+            (click)="closeTakeoverModal()"
+            class="p-2 text-slate-400 hover:text-white rounded-xl hover:bg-slate-800 transition"
+          >
+            <app-icon name="x" className="w-5 h-5"></app-icon>
+          </button>
+        </div>
+      </div>
+
+      <!-- noVNC iframe Container -->
+      <div class="flex-1 bg-black relative overflow-hidden">
+        <iframe
+          [src]="vncUrl()"
+          class="w-full h-full border-0"
+          allow="clipboard-read; clipboard-write"
+          title="noVNC Browser Display"
+        ></iframe>
+      </div>
+    </div>
+  </div>
+
+  <!-- RESOLVE SCREENING QUESTION MODAL -->
+  <div
+    *ngIf="resolveModalOpen()"
+    class="modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md"
+  >
+    <div
+      class="resolve-dialog bg-slate-900 border border-slate-800 w-full max-w-lg rounded-3xl overflow-hidden shadow-2xl flex flex-col"
+    >
+      <div
+        class="p-4 sm:px-6 border-b border-slate-800 flex items-center justify-between gap-3 bg-slate-950/60"
+      >
+        <div class="flex items-center space-x-3">
+          <div
+            class="w-10 h-10 rounded-2xl bg-amber-500/20 border border-amber-500/30 flex items-center justify-center text-amber-400"
+          >
+            <app-icon name="key" className="w-5 h-5"></app-icon>
+          </div>
+          <div>
+            <h3 class="text-base font-bold text-white">Resolve Screening Question</h3>
+            <p class="text-xs text-slate-400">Job: {{ resolveJobId() }}</p>
+          </div>
+        </div>
+        <button
+          (click)="closeResolveModal()"
+          class="p-2 text-slate-400 hover:text-white rounded-xl hover:bg-slate-800 transition"
+        >
+          <app-icon name="x" className="w-5 h-5"></app-icon>
+        </button>
+      </div>
+
+      <div class="p-4 sm:p-6 space-y-4 text-xs">
+        <div>
+          <label class="block text-slate-300 font-semibold mb-1">Question Key / Prompt</label>
+          <input
+            type="text"
+            [(ngModel)]="resolveQuestionKey"
+            placeholder="e.g. sponsorship_required or legal_work_auth"
+            class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2 text-slate-200 focus:outline-none focus:border-emerald-500 font-mono text-xs"
+          />
+        </div>
+
+        <div>
+          <label class="block text-slate-300 font-semibold mb-1">Approved Answer Value</label>
+          <textarea
+            [(ngModel)]="resolveAnswerValue"
+            rows="3"
+            placeholder="Enter the exact approved answer to submit for this screening question..."
+            class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3.5 text-slate-200 focus:outline-none focus:border-emerald-500 text-xs"
+          ></textarea>
+        </div>
+
+        <div>
+          <label class="block text-slate-300 font-semibold mb-1">Approved Scope</label>
+          <select
+            [(ngModel)]="resolveApprovedScope"
+            class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2 text-slate-200 focus:outline-none focus:border-emerald-500 text-xs"
+          >
+            <option value="global">Global (Remember for all future employer questions)</option>
+            <option value="employer">Employer Only (Reuse only for this company)</option>
+            <option value="job">Single Job (One-time submission for this job attempt)</option>
+          </select>
+        </div>
+
+        <div class="pt-3 border-t border-slate-800 flex items-center justify-end gap-2">
+          <button
+            (click)="closeResolveModal()"
+            class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl font-semibold transition"
+          >
+            Cancel
+          </button>
+          <button
+            (click)="submitResolution()"
+            [disabled]="isResolvingJob() || !resolveAnswerValue().trim()"
+            class="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold rounded-xl transition flex items-center gap-1.5 shadow"
+          >
+            <app-icon name="check" className="w-4 h-4"></app-icon>
+            <span>{{ isResolvingJob() ? 'Saving & Requeueing...' : 'Approve & Requeue Job' }}</span>
+          </button>
+        </div>
       </div>
     </div>
   </div>

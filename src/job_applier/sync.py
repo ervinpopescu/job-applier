@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
 import platform
 import shutil
+import tempfile
+import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from job_applier.db import get_db_path, migrate_csv_and_disk_to_db
+from job_applier.db import backup_db, get_db_path
 from job_applier.utils import get_project_root
 
 
@@ -17,23 +20,29 @@ def export_bundle(
     include_applications: bool = True,
     include_applied: bool = True,
     include_profile: bool = True,
+    custom_db_path: Path | None = None,
 ) -> Path:
     """
-    Exports all applications, tailored PDFs, cover letters, and database mappings
-    into a portable, self-contained .zip backup bundle for transfer to another machine.
+    Exports applications, tailored PDFs, cover letters, and database mappings
+    into a portable, self-contained .zip backup bundle.
+    Guarantees:
+    1. Fail-closed: Never falls back to a raw uncheckpointed file copy if backup_db fails.
+    2. Collision-free: Uses private per-export temp storage with guaranteed cleanup.
+    3. Atomic publication: Writes to an isolated temp archive and atomically replaces output_path.
+    4. Non-mutating: Does not mutate the live database, application records, or disk state during export.
+    5. Honors include_profile flag: Omits profile and master resume if include_profile=False.
     """
     project_root = get_project_root()
     now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    unique_suffix = uuid.uuid4().hex[:8]
 
     if output_path is None:
         export_dir = project_root / "output" / "exports"
         export_dir.mkdir(parents=True, exist_ok=True)
-        output_path = export_dir / f"job_applier_backup_{now_str}.zip"
+        output_path = export_dir / f"job_applier_backup_{now_str}_{unique_suffix}.zip"
     else:
+        output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Ensure database is synchronized with latest disk state
-    migrate_csv_and_disk_to_db()
 
     manifest: dict[str, Any] = {
         "version": "1.0.0",
@@ -43,62 +52,76 @@ def export_bundle(
         "files_count": 0,
         "applications_count": 0,
         "applied_count": 0,
+        "include_profile": include_profile,
     }
 
     files_to_pack: list[tuple[Path, str]] = []
 
-    # 1. Database and Data files
-    db_file = get_db_path()
-    if db_file.exists():
-        files_to_pack.append((db_file, "data/job_applier.db"))
+    with tempfile.TemporaryDirectory(prefix="job_applier_export_") as tmp_dir_str:
+        tmp_dir = Path(tmp_dir_str)
 
-    for fname in [
-        "master_resume.json",
-        "candidate_profile.json",
-        "applications_tracker.csv",
-        "processed_jobs.txt",
-    ]:
-        fpath = project_root / "data" / fname
-        if fpath.exists():
-            files_to_pack.append((fpath, f"data/{fname}"))
+        # 1. Database snapshot via SQLite Online Backup API (captures active WAL without locking)
+        db_file = get_db_path(custom_db_path)
+        if db_file.exists():
+            tmp_backup_file = tmp_dir / "job_applier.db"
+            # Fail closed: Do NOT catch and fallback to raw copy!
+            backup_db(tmp_backup_file, custom_path=db_file)
+            files_to_pack.append((tmp_backup_file, "data/job_applier.db"))
 
-    # 2. Pending Application Packages
-    if include_applications:
-        apps_dir = project_root / "output" / "applications"
-        if apps_dir.exists():
-            app_folders = [d for d in apps_dir.iterdir() if d.is_dir()]
-            manifest["applications_count"] = len(app_folders)
-            for d in app_folders:
-                for f in d.iterdir():
-                    if f.is_file():
-                        rel_arc = f"output/applications/{d.name}/{f.name}"
-                        files_to_pack.append((f, rel_arc))
+        # 2. Data files (strictly respecting include_profile)
+        data_files = ["applications_tracker.csv", "processed_jobs.txt"]
+        if include_profile:
+            data_files.extend(["master_resume.json", "candidate_profile.json"])
 
-    # 3. Applied Packages
-    if include_applied:
-        applied_dir = project_root / "output" / "applied"
-        if applied_dir.exists():
-            applied_folders = [d for d in applied_dir.iterdir() if d.is_dir()]
-            manifest["applied_count"] = len(applied_folders)
-            for d in applied_folders:
-                for f in d.iterdir():
-                    if f.is_file():
-                        rel_arc = f"output/applied/{d.name}/{f.name}"
-                        files_to_pack.append((f, rel_arc))
+        for fname in data_files:
+            fpath = project_root / "data" / fname
+            if fpath.exists():
+                files_to_pack.append((fpath, f"data/{fname}"))
 
-    manifest["files_count"] = len(files_to_pack)
+        # 3. Pending Application Packages
+        if include_applications:
+            apps_dir = project_root / "output" / "applications"
+            if apps_dir.exists():
+                app_folders = [d for d in apps_dir.iterdir() if d.is_dir()]
+                manifest["applications_count"] = len(app_folders)
+                for d in app_folders:
+                    for f in d.iterdir():
+                        if f.is_file():
+                            rel_arc = f"output/applications/{d.name}/{f.name}"
+                            files_to_pack.append((f, rel_arc))
 
-    # Build the zip archive
-    with zipfile.ZipFile(str(output_path), "w", zipfile.ZIP_DEFLATED) as zf:
-        # Write manifest
-        zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+        # 4. Applied Packages
+        if include_applied:
+            applied_dir = project_root / "output" / "applied"
+            if applied_dir.exists():
+                applied_folders = [d for d in applied_dir.iterdir() if d.is_dir()]
+                manifest["applied_count"] = len(applied_folders)
+                for d in applied_folders:
+                    for f in d.iterdir():
+                        if f.is_file():
+                            rel_arc = f"output/applied/{d.name}/{f.name}"
+                            files_to_pack.append((f, rel_arc))
 
-        # Write files
-        for src_file, arc_name in files_to_pack:
-            try:
-                zf.write(str(src_file), arcname=arc_name)
-            except Exception as e:
-                print(f"Notice during zip write of {src_file.name}: {e}")
+        manifest["files_count"] = len(files_to_pack)
+
+        # 5. Build archive atomically in private temp file
+        tmp_zip_path = output_path.with_name(f".tmp_{output_path.name}_{unique_suffix}")
+        try:
+            with zipfile.ZipFile(str(tmp_zip_path), "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+                for src_file, arc_name in files_to_pack:
+                    # Fail closed: Do NOT catch and swallow file write errors!
+                    zf.write(str(src_file), arcname=arc_name)
+
+            # Atomic replace to prevent partial or corrupted published archives
+            os.replace(tmp_zip_path, output_path)
+        except Exception:
+            if tmp_zip_path.exists():
+                try:
+                    tmp_zip_path.unlink()
+                except Exception:
+                    pass
+            raise
 
     print(
         f"📦 Successfully created portable export bundle ({len(files_to_pack)} files): {output_path}"
@@ -178,38 +201,140 @@ def import_bundle(
                 "data/master_resume.json",
             ]:
                 target = project_root / member.filename
-                if (overwrite_profile or not target.exists()) and str(
-                    target.resolve()
-                ).startswith(str(project_root.resolve())):
+                if not target.exists() or overwrite_profile:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     try:
                         with zf.open(member) as src, open(target, "wb") as dst:
                             shutil.copyfileobj(src, dst)
                     except (OSError, zipfile.BadZipFile) as err:
-                        print(
-                            f"Notice: Failed to extract profile {member.filename}: {err}"
-                        )
+                        print(f"Notice: Failed to extract {member.filename}: {err}")
 
-            # Extract tracker CSV to merge
-            elif member.filename == "data/applications_tracker.csv":
-                temp_csv = project_root / "data" / "_imported_tracker.csv"
-                if str(temp_csv.resolve()).startswith(str(project_root.resolve())):
+        # 3. Merge processed_jobs.txt if present
+        if "data/processed_jobs.txt" in zf.namelist():
+            local_pj = project_root / "data" / "processed_jobs.txt"
+            try:
+                incoming_text = zf.read("data/processed_jobs.txt").decode(
+                    "utf-8", errors="replace"
+                )
+                incoming_urls = {
+                    line.strip() for line in incoming_text.splitlines() if line.strip()
+                }
+                existing_urls = set()
+                if local_pj.exists():
+                    existing_urls = {
+                        line.strip()
+                        for line in local_pj.read_text().splitlines()
+                        if line.strip()
+                    }
+                merged_urls = existing_urls | incoming_urls
+                local_pj.parent.mkdir(parents=True, exist_ok=True)
+                local_pj.write_text("\n".join(sorted(merged_urls)) + "\n")
+            except Exception as ex:
+                print(f"Notice: Failed to merge processed_jobs.txt: {ex}")
+
+        # 4. Merge SQLite database records if database file present in zip
+        if "data/job_applier.db" in zf.namelist():
+            temp_db = (
+                project_root
+                / "output"
+                / f"imported_temp_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+            )
+            temp_db.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with (
+                    zf.open("data/job_applier.db") as src,
+                    open(temp_db, "wb") as dst,
+                ):
+                    shutil.copyfileobj(src, dst)
+
+                # Read ALL applications from imported temp DB without arbitrary limits
+                import sqlite3
+                from job_applier.db import (
+                    get_connection,
+                    init_db,
+                    mark_job_processed,
+                    upsert_application,
+                )
+
+                t_conn = sqlite3.connect(str(temp_db))
+                t_conn.row_factory = sqlite3.Row
+                try:
+                    app_rows = t_conn.execute("SELECT * FROM applications;").fetchall()
+
+                    # Connect to local live DB to check existing statuses
+                    live_db_file = project_root / "data" / "job_applier.db"
+                    init_db(custom_path=live_db_file)
+                    live_conn = get_connection(custom_path=live_db_file)
                     try:
-                        with zf.open(member) as src, open(temp_csv, "wb") as dst:
-                            shutil.copyfileobj(src, dst)
-                    except (OSError, zipfile.BadZipFile) as err:
-                        print(f"Notice: Failed to extract tracker CSV: {err}")
+                        existing_statuses = {
+                            r["id"]: r["status"]
+                            for r in live_conn.execute(
+                                "SELECT id, status FROM applications;"
+                            ).fetchall()
+                        }
+                    finally:
+                        live_conn.close()
 
-    # 3. Synchronize unpacked folders and imported CSV into local SQLite DB
-    migrated_count = migrate_csv_and_disk_to_db()
-    report["merged_db_records"] = migrated_count
+                    for row in app_rows:
+                        app = dict(row)
+                        app_id = app["id"]
+                        imported_status = app.get("status", "pending")
+                        # Conservative status merge: do not allow older bundle to downgrade applied/ambiguous to pending
+                        local_status = existing_statuses.get(app_id)
+                        if local_status in (
+                            "applied",
+                            "ambiguous",
+                        ) and imported_status not in ("applied",):
+                            target_status = local_status
+                        else:
+                            target_status = imported_status
 
-    # Cleanup temp csv
-    temp_csv = project_root / "data" / "_imported_tracker.csv"
-    if temp_csv.exists():
-        temp_csv.unlink(missing_ok=True)
+                        upsert_application(
+                            app_id=app_id,
+                            company=app["company"],
+                            title=app["title"],
+                            job_url=app["job_url"],
+                            platform=app.get("platform", "Generic"),
+                            status=target_status,
+                            submission_type=app.get("submission_type", "manual"),
+                            folder_name=str(app.get("folder_name") or app_id),
+                            cv_filename=app.get("cv_filename", ""),
+                            has_cover_letter=bool(app.get("has_cover_letter")),
+                            proof_screenshot=app.get("proof_screenshot", ""),
+                            notes=app.get("notes", ""),
+                            custom_path=live_db_file,
+                        )
+                        report["merged_db_records"] += 1
+
+                    # Merge processed_jobs table from imported database
+                    has_processed_table = t_conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='processed_jobs';"
+                    ).fetchone()
+                    if has_processed_table:
+                        pj_rows = t_conn.execute(
+                            "SELECT * FROM processed_jobs;"
+                        ).fetchall()
+                        for pj in pj_rows:
+                            col_url = (
+                                pj["job_url"] if "job_url" in pj.keys() else pj["url"]
+                            )
+                            if col_url:
+                                col_app = pj["app_id"] if "app_id" in pj.keys() else ""
+                                mark_job_processed(
+                                    col_url, app_id=col_app, custom_path=live_db_file
+                                )
+                finally:
+                    t_conn.close()
+            except Exception as e:
+                print(f"Notice: Database merge from backup bundle failed: {e}")
+            finally:
+                if temp_db.exists():
+                    try:
+                        temp_db.unlink()
+                    except Exception:
+                        pass
 
     print(
-        f"✅ Successfully imported bundle from {zip_path.name} (Merged {migrated_count} records)!"
+        f"✅ Bundle successfully imported: {report['imported_applications']} applications, {report['imported_applied']} applied, {report['merged_db_records']} DB records."
     )
     return report

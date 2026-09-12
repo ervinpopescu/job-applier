@@ -8,6 +8,131 @@ export interface ApplicationItem {
   cover_letter_preview: string;
   pdf_url: string;
   created_at: string;
+  platform?: string;
+  status?: string;
+  submission_type?: string;
+  automation_state?: string | null;
+  job_state?: string | null;
+  job_id?: string | null;
+  lease_owner?: string | null;
+  retry_count?: number | null;
+  checkpoint?: string | null;
+  attempt_status?: string | null;
+  error_message?: string | null;
+  folder_name?: string;
+}
+
+export interface AppFilterCounts {
+  all: number;
+  queued: number;
+  action_required: number;
+  pending: number;
+  applied: number;
+  skipped: number;
+  failed: number;
+}
+
+export interface AutomationJobStatus {
+  job_id: string;
+  app_id: string;
+  attempt_number?: number | null;
+  state?: string | null;
+  step?: string | null;
+  outcome_code?: string | null;
+  event_cursor?: number | null;
+  updated_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  submit_intent_at?: string | null;
+}
+
+export interface AutomationEvent {
+  id: number;
+  app_id: string;
+  job_id?: string | null;
+  event_type: string;
+  message: string;
+  created_at: string;
+  step?: string | null;
+  outcome_code?: string | null;
+}
+
+export interface ApplicationAutomationStatusResponse {
+  app_id: string;
+  jobs: AutomationJobStatus[];
+}
+
+export interface ApplicationAutomationEventsResponse {
+  app_id: string;
+  events: AutomationEvent[];
+  next_after: number;
+  has_more: boolean;
+}
+
+export interface AutomationFunnel {
+  verified_autonomous_submissions: number;
+  jobs_tracked: number;
+  runnable_jobs: number;
+  /** @deprecated Use jobs_tracked. */
+  jobs_queued: number;
+  jobs_with_attempt: number;
+  current_auth_blocked_jobs: number;
+  current_site_changed_jobs: number;
+  historical_auth_blocked_attempts: number;
+  historical_site_changed_attempts: number;
+  total_attempts: number;
+  current_permanent_failures: number;
+  current_retry_wait_jobs: number;
+  current_skipped_jobs: number;
+  generated_artifacts: number;
+  manual_applied: number;
+  applied_artifacts: number;
+  unqueued_artifacts: number;
+  // Deprecated compatibility aliases retained for older API consumers.
+  jobs_attempted: number;
+  auth_required: number;
+  site_changed: number;
+  permanent_failures: number;
+  retries: number;
+  unknown: number;
+  jobs_total: number;
+  attempts_total: number;
+  deprecated_fields: string[];
+  job_states: Record<string, number>;
+  attempt_outcomes: Record<string, number>;
+}
+
+export interface MainResume {
+  contact: Record<string, string>;
+  summary: string;
+  experience: Array<{
+    role: string;
+    company: string;
+    dates: string;
+    details: string[];
+  }>;
+  skills: string[];
+  education: {
+    institution?: string;
+    degree?: string;
+    details?: string;
+  };
+  projects: Array<{
+    name: string;
+    description: string;
+    url: string;
+  }>;
+}
+
+export interface MainResumeResponse {
+  status: 'ready' | 'stale' | 'generating' | 'error';
+  resume: MainResume;
+  artifact_url: string | null;
+  download_url?: string | null;
+  generation_id: string | null;
+  updated_at: string | null;
+  error: string | null;
+  retry_after_seconds: number | null;
 }
 
 export interface ApplicationDetail {
@@ -53,6 +178,15 @@ export interface TrackerStats {
     is_running: boolean;
     status: string;
   };
+  queue?: {
+    active_jobs?: number;
+    total_jobs?: number;
+    ready?: number;
+    claimed?: number;
+    in_progress?: number;
+    retry_wait?: number;
+    exceptions?: number;
+  };
 }
 
 export interface LogEntry {
@@ -73,6 +207,7 @@ export interface PipelineStatus {
 export interface AutomationStatus {
   is_active: boolean;
   app_id?: string;
+  job_id?: string;
   company?: string;
   title?: string;
   step?: string;
@@ -80,6 +215,12 @@ export interface AutomationStatus {
   level?: string;
   progress_pct?: number;
   is_waiting_for_code?: boolean;
+  is_paused?: boolean;
+  is_stopped?: boolean;
+  browser_active?: boolean;
+  browser_is_closed?: boolean;
+  active_job?: Record<string, unknown>;
+  queue?: Record<string, unknown>;
 }
 
 export interface CandidateProfile {
@@ -95,21 +236,37 @@ export interface CandidateProfile {
   linkedin_url: string;
   github_url: string;
   portfolio_url: string;
-  languages: string;
+  languages: string | Record<string, string>;
   current_company: string;
   current_title: string;
   years_of_experience: string;
   education_institution: string;
   education_degree: string;
-  work_authorization: string;
+  work_authorization:
+    | string
+    | {
+        authorized_in_us?: boolean;
+        authorized_in_eu?: boolean;
+        requires_sponsorship?: boolean;
+        requires_us_sponsorship?: boolean;
+        requires_eu_sponsorship?: boolean;
+      };
   sponsorship_required: string;
   notice_period: string;
-  salary_expectation: string;
-  willing_to_relocate: string;
+  salary_expectation:
+    | string
+    | {
+        minimum?: number;
+        desired?: number;
+        currency?: string;
+        period?: string;
+      };
+  willing_to_relocate: string | boolean;
   remote_preference: string;
   gender: string;
   veteran_status: string;
   disability_status: string;
+  eeo_defaults?: Record<string, string>;
   target_roles?: string[];
   target_locations?: string[];
   target_region?: string;
@@ -120,6 +277,50 @@ export interface PlatformInfo {
   configured: boolean;
   login_url: string;
   status: 'logged_in' | 'not_logged_in';
+}
+
+export interface DurableNotification {
+  id: number;
+  notification_id: string;
+  job_id?: string;
+  app_id?: string;
+  event_id?: number;
+  category: string;
+  severity: 'info' | 'warning' | 'error' | 'critical';
+  title: string;
+  message: string;
+  url?: string;
+  details?: Record<string, unknown>;
+  acknowledged: boolean;
+  acknowledged_at?: string;
+  created_at: string;
+}
+
+export interface NotificationListResponse {
+  status: string;
+  notifications: DurableNotification[];
+  unread_count: number;
+  total: number;
+  latest_id: number;
+}
+
+export interface TakeoverStatus {
+  status: string;
+  is_takeover_active: boolean;
+  owner: string | null;
+  expires_at: string | null;
+  is_paused: boolean;
+  is_stopped: boolean;
+  read_only: boolean;
+}
+
+export interface QueueJobActionResponse {
+  status: string;
+  job_id?: string;
+  message?: string;
+  is_paused?: boolean;
+  is_stopped?: boolean;
+  action?: string;
 }
 
 export interface AuthStatusReport {

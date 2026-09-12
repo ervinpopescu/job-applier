@@ -1,0 +1,82 @@
+{
+	admin off
+	auto_https off
+}
+
+:80 {
+	# Enforced policy for the same-origin dashboard, noVNC modules, API/SSE,
+	# and the authenticated viewer WebSocket.
+	header Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' wss://jobs.archnet.lol wss://aslan.archnet.lol; frame-src 'self'; worker-src 'self' blob:; form-action 'self'; frame-ancestors 'self'"
+
+	# Matcher for ntfy mobile/offline notification server:
+	# Direct access with native token authentication, avoiding interactive Access redirects
+	@ntfy host notify.jobs.archnet.lol notify.jobs.aslan.net
+	handle @ntfy {
+		reverse_proxy ntfy:80 {
+			header_up Host {host}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	# Public canonical origin: https://jobs.archnet.lol
+	# Never cache navigational HTML at the edge; it contains the current asset manifest and CSP.
+	@html_navigation path / /index.html
+	header @html_navigation Cache-Control "no-store, no-cache, must-revalidate, max-age=0"
+	header @html_navigation Pragma "no-cache"
+	header @html_navigation Expires "0"
+
+	# Forward-auth gate for protected browser viewer HTTP & WebSocket upgrades
+	handle /browser* {
+		header Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' wss://jobs.archnet.lol wss://aslan.archnet.lol; frame-src 'self'; worker-src 'self' blob:; form-action 'self'; frame-ancestors 'self'"
+
+		forward_auth web:8000 {
+			uri /api/auth/viewer-gate
+			header_up -Upgrade
+			header_up -Connection
+			copy_headers X-Viewer-Expires-In
+		}
+
+		# WebSocket upgrades route to web:8000 for server-side 5-minute / token-expiry lifetime enforcement
+		@websockify {
+			header_regexp ws Upgrade (?i)\bwebsocket\b
+		}
+		reverse_proxy @websockify web:8000 {
+			header_up Host {host}
+			header_up X-Real-IP {remote_host}
+		}
+
+		# Static viewer assets route to runtime:6080
+		@static_viewer {
+			not header_regexp ws Upgrade (?i)\bwebsocket\b
+		}
+		reverse_proxy @static_viewer runtime:6080 {
+			header_up Host {upstream_hostport}
+			header_up X-Real-IP {remote_host}
+			header_up -Upgrade
+			header_up -Connection
+		}
+	}
+
+	# Forward-auth gate for direct /websockify WebSocket connections from noVNC
+	handle /websockify* {
+		forward_auth web:8000 {
+			uri /api/auth/viewer-gate
+			header_up -Upgrade
+			header_up -Connection
+			copy_headers X-Viewer-Expires-In
+		}
+
+		reverse_proxy web:8000 {
+			header_up Host {host}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	# API, file artifacts, SSE, and dashboard frontend
+	handle {
+		reverse_proxy web:8000 {
+			header_up Host {host}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+}

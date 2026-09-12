@@ -8,16 +8,34 @@ The codebase is structured as a standard Python package under `src/job_applier/`
 
 - **`src/job_applier/cli/`**: Contains the CLI scripts for the user.
   - `web_app.py`: Launches the unified FastAPI web dashboard server on `http://127.0.0.1:8000`.
+  - `worker.py`: Autonomous queue worker for durable background job execution, lease heartbeat, and submission pacing.
+  - `ops_cli.py`: Operational backups (online SQLite snapshot, age encryption), restore with downgrade protection, retention rotation, disk guard, and emergency stop.
+  - `runtime_daemon.py`: Runtime daemon managing virtual display (Xvfb), VNC, websockify, and proxy services.
+  - `auth_cli.py`: Platform authentication and session inspection tool.
   - `sync_cli.py`: CLI tool for portable machine-to-machine export & import backup packages.
   - `orchestrator.py`: The main pipeline script that runs the entire scraping, tailoring, resume generation, and optional auto-apply flow.
   - `apply_assistant.py`: An interactive & batch CLI tool with browser automation, 1-click autofill, and application management.
-- **`src/job_applier/db.py`**: Relational SQLite database engine with WAL concurrency, atomic queries, and auto-migration.
+- **`src/job_applier/db.py`**: Relational SQLite database engine with WAL concurrency, atomic queries, versioned migrations (schema v1-v4), and adapter canary tracking.
+- **`src/job_applier/ops/`**: Operational reliability and disaster recovery tooling.
+  - `backup.py`: Quiesced online SQLite backups, profile lock probing, and age encryption (`pyrage`).
+  - `disk_guard.py`: Fail-closed disk space guard verifying minimum volume headroom before writes.
+  - `emergency_stop.py`: Atomic circuit breaker halting execution, revoking worker leases, and pausing queue.
 - **`src/job_applier/sync.py`**: Portable self-contained backup engine packaging applications and SQLite mappings into `.zip` bundles.
 - **`src/job_applier/web/`**: Full-stack web dashboard application.
-  - `app.py`: FastAPI server with REST APIs for applications, batch auto-applying, tracking, profile editing, and background scraping pipeline execution.
-  - `templates/index.html`: Responsive single-page application dashboard.
+  - `app.py`: FastAPI server hosting the compiled Angular frontend and REST APIs for applications, batch auto-applying, tracking, profile editing, and background scraping pipeline execution.
+  - `edge_auth.py`: Zero-trust Cloudflare Access middleware with RS256 JWT validation, identity allowlists, CSRF origin verification, and gateway noVNC authorization gate.
+- **`frontend/`**: Modern Angular 21 Single-Page Application (Standalone components, Signals, TypeScript, Tailwind CSS, Lucide icons).
 - **`src/job_applier/automation/`**: Modules dedicated to browser automation and form autofilling.
-  - `browser_automator.py`: Playwright-driven browser automator that detects ATS platforms, navigates, autofills form fields, attaches the tailored CV PDF, pastes cover letters, and handles submission.
+  - `adapters/`: Versioned typed ATS adapters implementing `BaseATSAdapter` for Greenhouse, Lever, Ashby, and Generic form filling.
+  - `safety_guard.py`: Central submission safety guard enforcing canary approvals, rate limiting (5/day), pacing (300s spacing), worker lease fencing, and frozen revision validation.
+  - `queue.py`: Durable execution queue managing atomic state transitions, worker claims, lease heartbeats, and runtime pause/resume controls.
+  - `network_security.py`: Enforceable outbound proxy with SSRF egress denial for private IPs and DNS rebinding protection.
+  - `profile_lock.py`: Exclusive advisory file lock on candidate profile directories with stale lock cleanup.
+  - `safe_resume.py`: Verification contract revalidating browser domain, URL security, and tenant before resuming after operator takeover or pause.
+  - `ntfy.py`: Durable push notification outbox processor with bounded retry and exponential backoff.
+  - `browser_runtime.py`: Virtual display (Xvfb) lifecycle, browser engine resolution (Chrome/Chromium/Firefox), and profile isolation.
+  - `runtime_lock.py`: Process-level mutex for browser runtime processes.
+  - `browser_automator.py`: Playwright-driven browser automator coordinating adapters, field filling, document attachment, and screenshot capture.
   - `question_solver.py`: Heuristics and Gemini AI question answering for application screening/qualification questions.
   - `candidate_profile.py`: Loads and manages the ignored private candidate profile (`data/candidate_profile.json`) initialized from a tracked example.
   - `autofill_script.py`: Generates 1-click in-browser JavaScript bookmarklets and scripts for each application package.
@@ -42,7 +60,7 @@ The codebase is structured as a standard Python package under `src/job_applier/`
 - **Frontend:** Angular >= 21 (Standalone components, Signals, TypeScript, Tailwind CSS)
 - **Task Runner:** `just` (see `justfile`)
 - **Package Managers:** `uv` (Python), `npm` (Angular)
-- **Key Libraries:** `fpdf` (PDFs), `google-genai` (Gemini 3.8-Flash), `python-jobspy` (Scraping)
+- **Key Libraries:** `fpdf` (PDFs), `google-genai` (Gemini 3.8-Flash), `python-jobspy` (Scraping), `pyrage` (Age encryption)
 - **Testing:** `pytest`
 - **Linting/Formatting:** `ruff`, `mypy`, `prettier`
 
@@ -53,7 +71,15 @@ Agents and developers should prefer using `just` recipes:
 - `just web`: Run FastAPI backend hosting compiled Angular app on port 8000
 - `just ui`: Run Angular dev server with hot reload on port 4200 (proxy to 8000)
 - `just build-ui`: Compile production Angular bundle
+- `just worker`: Run autonomous background application queue worker
+- `just ops-backup`: Create an atomic online SQLite backup with optional age encryption
+- `just ops-restore`: Restore system from backup with schema downgrade protection
+- `just ops-retention`: Apply 7 daily / 4 weekly retention policy to backup archives
+- `just ops-disk-guard`: Check storage volume headroom and fail-closed disk guard
+- `just ops-emergency-stop`: Immediately halt queue execution and revoke active worker leases
+- `just ops-unstop`: Clear emergency stop flag (remains paused awaiting safe resume)
 - `just test`: Run the full pytest test suite
+- `just test-ui`: Run Angular unit tests (Vitest)
 - `just check`: Run linting, tests, and frontend build
 - `just pipeline`: Run the scraping, tailoring, and PDF generation pipeline
 - `just format`: Format Python code with ruff and build frontend

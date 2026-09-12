@@ -6,13 +6,14 @@ Job Applier automates the job search lifecycle: scraping technical positions, ta
 
 ## Key Capabilities
 
-- **Unified Web Dashboard:** Full-stack FastAPI + Alpine.js interface with side-by-side PDF preview, cover letter editor, and sortable tracker.
+- **Unified Web Dashboard:** Full-stack FastAPI + Angular 21 interface with side-by-side PDF preview, cover letter editor, real-time notification tray, and sortable tracker.
 - **Multi-Site Scraping:** Aggregates listings from LinkedIn, Indeed, Glassdoor, Google Jobs, Romanian portals (eJobs, BestJobs, Hipo, Undelucram, Jooble), direct ATSs (Greenhouse, Lever), and remote tech boards.
 - **AI Resume & Cover Letter Tailoring:** Analyzes job descriptions and dynamically tailors your master JSON resume and generates targeted cover letters using Google Gemini 3.8-Flash.
-- **Browser Automation:** Assisted and autonomous Playwright engine with Cloudflare Turnstile handling, form autofill, CV upload, and AI screening question answering.
+- **Autonomous Execution & Safety Guard:** Durable SQLite execution queue with worker leasing, typed ATS adapters (Greenhouse, Lever, Ashby), canary verification gates, central submission safety guard, and rate-limited pacing (5/day, 300s spacing).
+- **Browser Automation:** Assisted and autonomous Playwright engine with form autofill, CV upload, and AI screening question answering.
 - **Session Vault & Desktop Sync:** Persistent browser profile with 1-click session synchronization from your desktop Chrome browser.
 - **SQLite Database & Portable Sync:** Relational SQLite database with WAL concurrency, plus 1-click export/import of portable `.zip` backup bundles between machines.
-- **Portable Deployment:** Multi-architecture Docker image, host-agnostic Compose configuration, health checks, and optional secret-based GitHub deployment.
+- **Portable Deployment:** Multi-architecture Docker image, multi-service Compose architecture (gateway, web, runtime, cloudflared, ntfy), health checks, and zero-trust edge authentication.
 
 ---
 
@@ -65,6 +66,7 @@ Run `just` to see all available automated recipes:
 | **Start Web Dashboard** | `just web` | Runs FastAPI server hosting the Angular application on port 8000 |
 | **Angular Dev Server** | `just ui` | Runs `ng serve` on port 4200 with proxy to port 8000 |
 | **Build Frontend** | `just build-ui` | Compiles production Angular bundle into `frontend/dist/` |
+| **Autonomous Worker** | `just worker` | Runs background application queue worker with lease management |
 | **Run Pipeline** | `just pipeline` | Runs scraping, tailoring, and PDF generation |
 | **Run Remote Pipeline** | `just pipeline-remote` | Runs pipeline targeting remote/telework positions |
 | **Terminal Assistant** | `just assistant` | Launches interactive terminal review & auto-apply CLI |
@@ -73,10 +75,17 @@ Run `just` to see all available automated recipes:
 | **Auth Status** | `just auth-status` | Inspects real cookie database for active login tokens |
 | **Export Backup** | `just export backup.zip` | Creates portable `.zip` backup of all applications & SQLite DB |
 | **Import Backup** | `just import backup.zip` | Unpacks and merges backup into local environment |
+| **Ops Backup** | `just ops-backup` | Online SQLite snapshot backup with optional age encryption |
+| **Ops Restore** | `just ops-restore file.zip` | Restores from backup with schema downgrade refusal |
+| **Ops Retention** | `just ops-retention` | Enforces 7 daily / 4 weekly backup retention policy |
+| **Ops Disk Guard** | `just ops-disk-guard` | Validates minimum storage volume headroom |
+| **Emergency Stop** | `just ops-emergency-stop` | Halts execution, pauses queue, and revokes worker leases |
+| **Clear Emergency Stop** | `just ops-unstop` | Clears stop flag (automation remains paused for safe resume) |
 | **Prune Duplicates** | `just prune-dupes` | Removes redundant packages with matching canonical URLs/roles |
 | **Prune Expired** | `just prune-expired` | Purges closed/expired job postings from queue |
-| **Run Tests** | `just test` | Runs the full `pytest` test suite |
-| **Run All Checks** | `just check` | Runs linters, pytest tests, and Angular production build |
+| **Run Python Tests** | `just test` | Runs the full `pytest` test suite |
+| **Run Frontend Tests** | `just test-ui` | Runs Angular unit tests (Vitest) |
+| **Run All Checks** | `just check` | Runs linters, pytest tests, frontend tests, and UI build |
 
 ---
 
@@ -87,8 +96,10 @@ Detailed guides and references are split into specialized documentation:
 | Guide | Description |
 | ------- | ------------- |
 | 🏗️ **[Architecture & Project Structure](docs/architecture.md)** | Directory tree, component design, and module roles. |
+| 🤖 **[Autonomous Pipeline](docs/autonomous-pipeline.md)** | Queue state machine, typed ATS adapters, central safety guard, and canary gates. |
+| 🛡️ **[Edge Authentication & Zero-Trust](docs/edge_auth_deployment.md)** | Cloudflare Access RS256 JWT validation, identity allowlists, and gateway viewer gate. |
 | 🖥️ **[Web Dashboard Guide](docs/web_dashboard.md)** | Queue workflows, live HUD monitor, diagnostics, and tracker views. |
-| ⌨️ **[CLI Reference](docs/cli.md)** | Options for `orchestrator.py`, `apply_assistant.py`, and interactive keybindings. |
+| ⌨️ **[CLI Reference](docs/cli.md)** | Options for `orchestrator.py`, `apply_assistant.py`, `worker.py`, and `ops_cli.py`. |
 | 🔐 **[Authentication & Sessions](docs/authentication.md)** | Persistent browser profiles, desktop Chrome cookie sync, and 2FA handling. |
 | 📦 **[Database & Portable Sync](docs/sync.md)** | SQLite database model, backup bundle structure, and machine migration. |
 | 🚀 **[Deployment](docs/deployment.md)** | Docker Compose, GHCR releases, upgrades, private access, and secret-based CI/CD. |
