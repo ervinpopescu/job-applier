@@ -1,12 +1,11 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
+logger = logging.getLogger("job_applier.adapters.semantic")
 
 _ALWAYS_MANUAL_REVIEW_TERMS = (
-    "consent",
-    "privacy policy",
-    "privacy notice",
     "capture of my photo",
     "photo identity",
     "gender",
@@ -18,6 +17,143 @@ _ALWAYS_MANUAL_REVIEW_TERMS = (
     "compensation",
     "remuneration",
 )
+
+_EXCLUDED_CONSENT_TERMS = (
+    "gender",
+    "race",
+    "ethnicity",
+    "veteran",
+    "disability",
+    "sexual orientation",
+    "demographic",
+    "background check",
+    "criminal",
+    "credit check",
+    "drug test",
+    "photo identity",
+    "capture of my photo",
+    "facial recognition",
+    "biometric",
+    "liability waiver",
+    "release of liability",
+    "hold harmless",
+    "waive any and all",
+)
+
+_STANDARD_CONSENT_TERMS = (
+    "privacy policy",
+    "privacy notice",
+    "privacy statement",
+    "terms of service",
+    "terms and conditions",
+    "terms & conditions",
+    "terms of use",
+    "data processing",
+    "personal data",
+    "gdpr",
+    "recruitment privacy",
+    "applicant privacy",
+    "candidate privacy",
+    "processing of my personal data",
+    "processing of personal data",
+    "processing of my data",
+    "consent to store",
+    "consent to retain",
+    "consent to process",
+    "agree to the",
+    "i agree",
+    "i consent",
+    "i acknowledge",
+    "i accept",
+    "consent",
+    "agree",
+)
+
+
+def is_standard_consent_checkbox(
+    label_text: str, tag_name: str = "input", input_type: str = "checkbox"
+) -> bool:
+    """
+    Detects standard GDPR, privacy policy, terms of service, and application processing consent.
+    Strictly excludes: voluntary demographic surveys (race, gender, veteran, disability),
+    background check authorizations, or photo identity verification.
+    """
+    if not label_text:
+        return False
+
+    # Check input types
+    t_name = (tag_name or "").strip().lower()
+    i_type = (input_type or "").strip().lower()
+    if t_name and t_name not in (
+        "input",
+        "button",
+        "div",
+        "span",
+        "select",
+        "label",
+        "li",
+    ):
+        return False
+    if i_type and i_type in (
+        "text",
+        "tel",
+        "email",
+        "file",
+        "password",
+        "number",
+        "date",
+    ):
+        return False
+
+    normalized = " ".join(label_text.lower().split())
+
+    # Strictly exclude sensitive declarations, demographic surveys, background checks, waivers
+    if any(ex in normalized for ex in _EXCLUDED_CONSENT_TERMS):
+        return False
+
+    # Check standard consent keywords
+    if any(term in normalized for term in _STANDARD_CONSENT_TERMS):
+        return True
+
+    return False
+
+
+def is_sensitive_or_excluded_checkbox(label_text: str) -> bool:
+    """Returns True if the checkbox represents a sensitive declaration, demographic survey, or excluded waiver."""
+    if not label_text:
+        return False
+    normalized = " ".join(label_text.lower().split())
+    if any(ex in normalized for ex in _EXCLUDED_CONSENT_TERMS):
+        return True
+    if any(
+        term in normalized
+        for term in (
+            "consent",
+            "privacy",
+            "gdpr",
+            "waiver",
+            "authorization",
+            "authorize",
+            "declaration",
+            "agree",
+            "acknowledgement",
+        )
+    ):
+        return True
+    return False
+
+
+def requires_manual_review(question_text: str, auto_consent: bool = True) -> bool:
+    """Identify fields that must remain untouched without an explicit operator action."""
+    if auto_consent and is_standard_consent_checkbox(question_text):
+        return False
+    normalized = " ".join(question_text.lower().split())
+    # If auto-consent is disabled, general consent/privacy terms require review
+    if not auto_consent and any(
+        term in normalized for term in ("consent", "privacy policy", "privacy notice")
+    ):
+        return True
+    return any(term in normalized for term in _ALWAYS_MANUAL_REVIEW_TERMS)
 
 
 def accessible_label(element: Any) -> str:
@@ -66,12 +202,6 @@ def accessible_label(element: Any) -> str:
         return (name or field_id or "").strip()
     except Exception:
         return ""
-
-
-def requires_manual_review(question_text: str) -> bool:
-    """Identify fields that must remain untouched without an explicit operator action."""
-    normalized = " ".join(question_text.lower().split())
-    return any(term in normalized for term in _ALWAYS_MANUAL_REVIEW_TERMS)
 
 
 def combobox_for(element: Any) -> Any | None:

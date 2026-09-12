@@ -22,7 +22,11 @@ from job_applier.automation.adapters.models import (
     QuestionType,
     ValidationError,
 )
-from job_applier.automation.adapters.semantic import accessible_label
+from job_applier.automation.adapters.semantic import (
+    accessible_label,
+    is_sensitive_or_excluded_checkbox,
+    is_standard_consent_checkbox,
+)
 from job_applier.automation.candidate_profile import CandidateProfile
 
 logger = logging.getLogger("job_applier.adapters.generic")
@@ -176,6 +180,25 @@ class GenericFormAdapter(BaseATSAdapter):
                 cl.first.fill(cover_letter)
                 report.cover_letter_filled = True
                 report.fields_filled.append("Cover Letter")
+
+        # 3. Auto-accept standard privacy & GDPR consent checkboxes
+        all_checkboxes = page.locator("input[type='checkbox']")
+        for c_idx in range(all_checkboxes.count()):
+            cb = all_checkboxes.nth(c_idx)
+            cb_label = accessible_label(cb)
+            if is_standard_consent_checkbox(cb_label):
+                try:
+                    if not cb.is_checked():
+                        cb.check()
+                    name = cb_label or "Privacy Policy"
+                    if name not in report.fields_filled:
+                        report.fields_filled.append(name)
+                        report.answers_provenance[name] = "auto_consent"
+                    logger.info(f"Generic form: auto-consented to '{name}'")
+                except Exception as ex:
+                    report.errors.append(f"Failed to check consent '{cb_label}': {ex}")
+            elif is_sensitive_or_excluded_checkbox(cb_label):
+                report.unknown_questions.append(cb_label or f"Checkbox {c_idx}")
 
         return report
 

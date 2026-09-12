@@ -508,8 +508,17 @@ def test_greenhouse_live_shapes_use_semantic_fields(
     assert "Website" in report.fields_filled
     privacy = page.locator("#question_privacy")
     if privacy.count() > 0:
-        assert privacy.input_value() == ""
-        assert "Recruitment Privacy Policy" in " ".join(report.unknown_questions)
+        assert (
+            "Please confirm that you agree to the Recruitment Privacy Policy.*"
+            in report.fields_filled
+        )
+        assert (
+            report.answers_provenance.get(
+                "Please confirm that you agree to the Recruitment Privacy Policy.*"
+            )
+            == "auto_consent"
+        )
+        assert not any("privacy" in q.lower() for q in report.unknown_questions)
 
     cover_letter = tmp_path / "cover-letter.txt"
     cover_letter.write_text("Synthetic cover letter", encoding="utf-8")
@@ -520,7 +529,7 @@ def test_greenhouse_live_shapes_use_semantic_fields(
     assert page.locator("#submit_app").is_visible()
 
 
-def test_lever_quantum_metric_shape_maps_semantic_controls_without_consent(
+def test_lever_quantum_metric_shape_maps_semantic_controls_with_auto_consent(
     page, sample_profile, sample_cv, tmp_path, monkeypatch
 ):
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
@@ -548,8 +557,9 @@ def test_lever_quantum_metric_shape_maps_semantic_controls_without_consent(
     assert "Location" in report.fields_filled
     assert "Current Company" in report.fields_filled
     assert page.locator("input[name='sponsorship'][value='No']").is_checked()
-    assert not page.locator("input[name='consent']").is_checked()
-    assert any("consent" in q.lower() for q in report.unknown_questions)
+    assert page.locator("input[name='consent']").is_checked()
+    assert any("consent" in q.lower() for q in report.fields_filled)
+    assert not any("consent" in q.lower() for q in report.unknown_questions)
 
     cover_letter = tmp_path / "cover-letter.txt"
     cover_letter.write_text("Synthetic cover letter", encoding="utf-8")
@@ -625,3 +635,139 @@ def test_generic_form_fill_only_strict_protection(
         GenericAdapterCannotSubmitError, match="cannot confirm submissions"
     ):
         adapter.confirm_submission(page)
+
+
+def test_auto_consent_standard_gdpr_privacy_policy_checkboxes(
+    page, sample_profile, tmp_path
+):
+    """
+    Tests that Greenhouse, Lever, and Generic adapters automatically check
+    standard GDPR, privacy policy, and terms of service checkboxes.
+    """
+    # 1. Greenhouse with privacy checkbox
+    gh_html = """<!DOCTYPE html><html><body>
+    <form id="application_form">
+        <label for="first_name">First Name</label><input id="first_name" />
+        <label for="last_name">Last Name</label><input id="last_name" />
+        <label for="email">Email</label><input id="email" />
+        <label for="privacy_cb">
+            <input type="checkbox" id="privacy_cb" name="privacy_policy" />
+            I agree to the GDPR data processing and privacy policy
+        </label>
+        <label for="terms_cb">
+            <input type="checkbox" id="terms_cb" name="terms" />
+            I accept the Terms and Conditions
+        </label>
+    </form></body></html>"""
+    gh_file = tmp_path / "gh_consent.html"
+    gh_file.write_text(gh_html, encoding="utf-8")
+    page.goto(f"file://{gh_file.resolve()}")
+
+    gh_adapter = GreenhouseAdapter()
+    gh_report = gh_adapter.fill_fields(page, sample_profile)
+    assert page.locator("#privacy_cb").is_checked() is True
+    assert page.locator("#terms_cb").is_checked() is True
+    assert any("privacy" in q.lower() for q in gh_report.fields_filled)
+    assert gh_report.unknown_questions == []
+
+    # 2. Lever with data-qa="privacy-policy-checkbox"
+    lever_html = """<!DOCTYPE html><html><body>
+    <form id="application-form" class="lever-form">
+        <input data-qa="name-input" name="name" />
+        <input data-qa="email-input" name="email" />
+        <label>
+            <input type="checkbox" data-qa="privacy-policy-checkbox" name="consent" />
+            I consent to the processing of my personal information as described in the Privacy Policy
+        </label>
+    </form></body></html>"""
+    lever_file = tmp_path / "lever_consent.html"
+    lever_file.write_text(lever_html, encoding="utf-8")
+    page.goto(f"file://{lever_file.resolve()}")
+
+    lever_adapter = LeverAdapter()
+    lever_report = lever_adapter.fill_fields(page, sample_profile)
+    assert page.locator("[data-qa='privacy-policy-checkbox']").is_checked() is True
+    assert lever_report.unknown_questions == []
+
+    # 3. Generic with standard GDPR checkbox
+    generic_html = """<!DOCTYPE html><html><body>
+    <form>
+        <input name="first_name" />
+        <label>
+            <input type="checkbox" name="gdpr_consent" />
+            I consent to the recruitment privacy policy and data processing under GDPR
+        </label>
+    </form></body></html>"""
+    generic_file = tmp_path / "generic_consent.html"
+    generic_file.write_text(generic_html, encoding="utf-8")
+    page.goto(f"file://{generic_file.resolve()}")
+
+    gen_adapter = GenericFormAdapter()
+    gen_report = gen_adapter.fill_fields(page, sample_profile)
+    assert page.locator("input[name='gdpr_consent']").is_checked() is True
+    assert any(
+        "privacy" in q.lower() or "gdpr" in q.lower() for q in gen_report.fields_filled
+    )
+
+
+def test_consent_checked_safely_without_demographic_or_liability_waivers(
+    page, sample_profile, tmp_path
+):
+    """
+    CRITICAL SAFETY TEST: Standard consent is checked, but voluntary demographic
+    self-identification surveys, background checks, liability waivers, and photo ID
+    checkboxes are STRICTLY NOT checked and must be flagged for manual review!
+    """
+    html = """<!DOCTYPE html><html><body>
+    <form id="application_form">
+        <input id="first_name" />
+        <input id="last_name" />
+        <input id="email" />
+        <!-- Standard consent: MUST be checked -->
+        <label for="std_consent">
+            <input type="checkbox" id="std_consent" name="privacy" />
+            I agree to the standard privacy policy and data processing
+        </label>
+        <!-- Demographic survey: MUST NOT be checked -->
+        <label for="demo_survey">
+            <input type="checkbox" id="demo_survey" name="demographic_survey" />
+            Voluntary demographic self-identification of race and gender
+        </label>
+        <!-- Background check: MUST NOT be checked -->
+        <label for="bg_check">
+            <input type="checkbox" id="bg_check" name="background_check" />
+            I authorize a comprehensive criminal background check and credit check
+        </label>
+        <!-- Liability waiver: MUST NOT be checked -->
+        <label for="waiver_cb">
+            <input type="checkbox" id="waiver_cb" name="liability_waiver" />
+            I agree to the release of liability and hold harmless waiver
+        </label>
+        <!-- Photo identity: MUST NOT be checked -->
+        <label for="photo_cb">
+            <input type="checkbox" id="photo_cb" name="photo_consent" />
+            I consent to capture of my photo and facial recognition
+        </label>
+    </form></body></html>"""
+    f = tmp_path / "safety_consent.html"
+    f.write_text(html, encoding="utf-8")
+    page.goto(f"file://{f.resolve()}")
+
+    adapter = GreenhouseAdapter()
+    report = adapter.fill_fields(page, sample_profile)
+
+    # Standard consent WAS checked
+    assert page.locator("#std_consent").is_checked() is True
+
+    # Excluded items were STRICTLY NOT checked
+    assert page.locator("#demo_survey").is_checked() is False
+    assert page.locator("#bg_check").is_checked() is False
+    assert page.locator("#waiver_cb").is_checked() is False
+    assert page.locator("#photo_cb").is_checked() is False
+
+    # Excluded items are in unknown_questions to trigger human takeover
+    unknown_text = " ".join(report.unknown_questions).lower()
+    assert "demographic" in unknown_text or "race" in unknown_text
+    assert "background check" in unknown_text or "criminal" in unknown_text
+    assert "waiver" in unknown_text or "liability" in unknown_text
+    assert "photo" in unknown_text or "facial" in unknown_text

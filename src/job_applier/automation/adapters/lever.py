@@ -27,6 +27,8 @@ from job_applier.automation.adapters.models import (
 from job_applier.automation.adapters.semantic import (
     accessible_label,
     input_is_empty,
+    is_sensitive_or_excluded_checkbox,
+    is_standard_consent_checkbox,
     requires_manual_review,
     select_semantic_option,
 )
@@ -281,8 +283,24 @@ class LeverAdapter(BaseATSAdapter):
                 if requires_manual_review(q_text):
                     report.unknown_questions.append(q_text)
                     continue
-                if not q_text:
-                    continue
+
+                # Auto-accept standard consent question cards (e.g. data processing checkboxes)
+                if is_standard_consent_checkbox(q_text):
+                    cb = q_el.locator("input[type='checkbox']")
+                    if cb.count() > 0:
+                        try:
+                            if not cb.first.is_checked():
+                                cb.first.check()
+                            report.fields_filled.append(q_text)
+                            report.answers_provenance[q_text] = "auto_consent"
+                            logger.info(
+                                f"Lever auto-consented to card question: {q_text}"
+                            )
+                            continue
+                        except Exception as ex:
+                            report.errors.append(
+                                f"Failed to check consent '{q_text}': {ex}"
+                            )
 
                 # Skip if already filled
                 txt = q_el.locator("input[type='text'], input:not([type]), textarea")
@@ -372,15 +390,47 @@ class LeverAdapter(BaseATSAdapter):
             except Exception as e:
                 logger.debug(f"Error processing Lever custom question {i}: {e}")
 
-        # Legal/privacy consent is intentionally never selected automatically.
+        # Auto-accept standard consent checkboxes (privacy policy, GDPR, terms)
         consent_loc = page.locator(
-            "input[type='checkbox'][name*='consent'], input[type='checkbox'][id*='consent']"
+            "input[data-qa='privacy-policy-checkbox'], input[type='checkbox'][name*='consent'], input[type='checkbox'][id*='consent'], input[type='checkbox'][name*='privacy']"
         )
         for c_idx in range(consent_loc.count()):
-            label = (
-                accessible_label(consent_loc.nth(c_idx)) or f"Consent Checkbox {c_idx}"
-            )
-            report.unknown_questions.append(label)
+            cb = consent_loc.nth(c_idx)
+            label = accessible_label(cb) or "Privacy Policy"
+            is_data_qa = cb.get_attribute("data-qa") == "privacy-policy-checkbox"
+            if is_data_qa or is_standard_consent_checkbox(label):
+                try:
+                    if not cb.is_checked():
+                        cb.check()
+                    name = label or "Privacy Policy"
+                    if name not in report.fields_filled:
+                        report.fields_filled.append(name)
+                        report.answers_provenance[name] = "auto_consent"
+                    logger.info(f"Lever auto-consented: {name}")
+                except Exception as ex:
+                    report.errors.append(f"Failed to check consent '{label}': {ex}")
+            else:
+                report.unknown_questions.append(label)
+
+        # Check all other checkboxes on the page
+        all_checkboxes = page.locator("input[type='checkbox']")
+        for c_idx in range(all_checkboxes.count()):
+            cb = all_checkboxes.nth(c_idx)
+            label = accessible_label(cb)
+            if is_standard_consent_checkbox(label):
+                try:
+                    if not cb.is_checked():
+                        cb.check()
+                    name = label or "Privacy Policy"
+                    if name not in report.fields_filled:
+                        report.fields_filled.append(name)
+                        report.answers_provenance[name] = "auto_consent"
+                    logger.info(f"Lever auto-consented: {name}")
+                except Exception as ex:
+                    logger.debug(f"Failed checking Lever consent checkbox: {ex}")
+            elif is_sensitive_or_excluded_checkbox(label):
+                if label not in report.unknown_questions:
+                    report.unknown_questions.append(label or f"Checkbox {c_idx}")
 
         return report
 
