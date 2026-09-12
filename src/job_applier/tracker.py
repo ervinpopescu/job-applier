@@ -72,6 +72,8 @@ def detect_platform_from_url(url: str) -> str:
         return "Undelucram"
     if "jooble.org" in url_lower:
         return "Jooble"
+    if "jobicy.com" in url_lower:
+        return "Jobicy"
     if "greenhouse.io" in url_lower or "grnh.se" in url_lower:
         return "Greenhouse"
     if "lever.co" in url_lower:
@@ -148,6 +150,32 @@ def record_application(
         df.to_csv(tracker_file, index=False)
     except Exception as e:
         print(f"Error saving to tracker file: {e}")
+
+    try:
+        from job_applier.db import upsert_application
+
+        app_id = (
+            f"{company}_{title}".replace(" ", "_")
+            if company
+            else (Path(cv_path).parent.name if cv_path else f"job_{abs(hash(job_url))}")
+        )
+        if not app_id or app_id == ".":
+            app_id = f"job_{abs(hash(job_url))}"
+
+        upsert_application(
+            app_id=app_id,
+            company=company,
+            title=title,
+            job_url=job_url,
+            platform=effective_platform,
+            status=status,
+            submission_type=submission_type,
+            cv_filename=Path(cv_path).name if cv_path else "",
+            proof_screenshot=proof_path,
+            notes=notes,
+        )
+    except Exception:
+        pass
 
     return df
 
