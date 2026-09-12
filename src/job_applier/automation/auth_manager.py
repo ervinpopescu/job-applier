@@ -8,17 +8,27 @@ import time
 from pathlib import Path
 from typing import Any
 
+from job_applier.automation.browser_runtime import (
+    VirtualDisplayManager,
+    find_chrome_executable,
+    get_default_profile_dir,
+    get_sanitized_browser_env,
+    is_display_available,
+    resolve_browser_engine,
+    validate_browser_engine,
+)
+from job_applier.automation.network_security import attach_security_routes
 from job_applier.automation.candidate_profile import (  # type: ignore[import-not-found]
     load_candidate_profile,
 )
-from job_applier.automation.cloudflare import (  # type: ignore[import-not-found]
-    VirtualDisplayManager,
+from job_applier.automation.profile_lock import (
+    ProfileOwnershipError,
+    ProfileOwnershipLock,
 )
 from job_applier.config import (  # type: ignore[import-not-found]
     get_platforms_config,
 )
 from job_applier.logger import log_event  # type: ignore[import-not-found]
-from job_applier.utils import get_project_root
 
 PLATFORM_LOGIN_URLS: dict[str, str] = get_platforms_config().get("login_urls", {})
 
@@ -65,6 +75,73 @@ def get_cookie_db_path(profile_dir: Path) -> Path | None:
         if cand.exists():
             return cand
     return None
+
+
+def get_firefox_cookie_db_path(profile_dir: Path) -> Path | None:
+    """Finds SQLite cookies.sqlite in Firefox profile."""
+    for cand in [
+        profile_dir / "cookies.sqlite",
+        profile_dir / "Default" / "cookies.sqlite",
+    ]:
+        if cand.exists():
+            return cand
+    if profile_dir.is_dir():
+        try:
+            for child in profile_dir.iterdir():
+                if child.is_dir() and (child / "cookies.sqlite").exists():
+                    return child / "cookies.sqlite"
+        except Exception:
+            pass
+    return None
+
+
+def inspect_firefox_profile_cookies(profile_dir: Path) -> dict[str, bool]:
+    """Inspects Firefox cookies.sqlite (moz_cookies table) to check real platform login status."""
+    cookie_db = get_firefox_cookie_db_path(profile_dir)
+    status: dict[str, bool] = {
+        "linkedin": False,
+        "bestjobs": False,
+        "ejobs": False,
+        "google": False,
+    }
+    if not cookie_db or not cookie_db.exists():
+        return status
+
+    tmp_db = Path(
+        f"/tmp/chk_ff_auth_{os.getpid()}_{int(time.time() * 1000) % 100000}.db"
+    )
+    try:
+        shutil.copyfile(cookie_db, tmp_db)
+        conn = sqlite3.connect(tmp_db)
+        c = conn.cursor()
+        c.execute("SELECT host, name FROM moz_cookies")
+        rows = c.fetchall()
+        conn.close()
+
+        for host, name in rows:
+            h = (host or "").lower()
+            n = (name or "").lower()
+            if "linkedin.com" in h and name in ["li_at", "liap"]:
+                status["linkedin"] = True
+            if "bestjobs.eu" in h and (
+                "token" in n
+                or "auth" in n
+                or "session" in n
+                or name in ["auth_csrfToken", "tracking_sid"]
+            ):
+                status["bestjobs"] = True
+            if "ejobs.ro" in h and (
+                "token" in n or "auth" in n or "user" in n or name == "logged_in"
+            ):
+                status["ejobs"] = True
+            if "google.com" in h and name in ["SID", "SSID", "SAPISID", "HSID"]:
+                status["google"] = True
+    except Exception as e:
+        print(f"Notice inspecting Firefox cookie db: {e}")
+    finally:
+        tmp_db.unlink(missing_ok=True)
+
+    return status
 
 
 def inspect_profile_cookies(profile_dir: Path) -> dict[str, bool]:
@@ -197,16 +274,21 @@ def sync_system_chrome_cookies(profile_dir: Path) -> dict[str, Any]:
 class AuthManager:
     """Manages persistent platform logins (LinkedIn, BestJobs, eJobs, Google) and cookie synchronization."""
 
-    def __init__(self, profile_dir: Path | None = None):
-        project_root = get_project_root()
-        self.profile_dir = profile_dir or (project_root / ".browser_profile")
+    def __init__(self, profile_dir: Path | None = None, browser: str | None = None):
+        self.raw_browser = validate_browser_engine(browser)
+        self.engine, _ = resolve_browser_engine(self.raw_browser)
+        self.profile_dir = profile_dir or get_default_profile_dir(self.engine)
         self.candidate = load_candidate_profile()
 
     def check_auth_status(self) -> dict[str, Any]:
-        """Checks real login status by inspecting actual cookies in .browser_profile."""
-        real_status = inspect_profile_cookies(self.profile_dir)
+        """Checks real login status by inspecting actual cookies in the profile."""
+        if self.engine == "firefox":
+            real_status = inspect_firefox_profile_cookies(self.profile_dir)
+        else:
+            real_status = inspect_profile_cookies(self.profile_dir)
 
         status_report: dict[str, Any] = {
+            "browser": self.engine,
             "profile_dir": str(self.profile_dir),
             "platforms": {},
         }
@@ -222,27 +304,181 @@ class AuthManager:
         return status_report
 
     def sync_desktop_cookies(self) -> dict[str, Any]:
-        """Imports all sessions from the user's desktop Chrome."""
+        """
+        Imports all sessions from the user's desktop Chrome into .browser_profile/.
+        Note: Desktop cookie sync is currently Chrome-specific. For Firefox, use manual interactive login.
+        """
+        if self.engine == "firefox":
+            return {
+                "status": "warning",
+                "browser": "firefox",
+                "cookies_merged": 0,
+                "sources": [],
+                "message": (
+                    "Desktop cookie sync is only supported for Google Chrome. "
+                    "For Firefox, use 'Connect / Log In' with Firefox to complete interactive login."
+                ),
+                "auth_status": self.check_auth_status().get("platforms", {}),
+            }
         return sync_system_chrome_cookies(self.profile_dir)
 
     def launch_interactive_login(
-        self, platform: str = "linkedin", timeout_seconds: int = 180
+        self,
+        platform: str = "linkedin",
+        timeout_seconds: int = 180,
+        browser: str | None = None,
     ) -> dict[str, Any]:
         """
-        Launches Google Chrome natively on DISPLAY with the persistent profile.
-        Allows the user to sign in, complete email verification, and solve 2FA without
-        bot detection blocking. Cookies are permanently saved to .browser_profile/.
+        Launches an interactive headed browser session with the persistent profile.
+        Supports both Chrome/Chromium and Firefox engines without hardcoded display assumptions.
         """
         platform_key = platform.strip().lower()
         login_url = PLATFORM_LOGIN_URLS.get(platform_key)
         if not login_url:
             return {"status": "error", "message": f"Unsupported platform: {platform}"}
 
-        # Auto-sync existing desktop Chrome cookies first
-        sync_system_chrome_cookies(self.profile_dir)
+        target_raw = validate_browser_engine(browser or self.raw_browser)
+        target_engine, target_exe = resolve_browser_engine(target_raw)
 
-        # If already logged in from desktop Chrome, return immediately
-        status_before = inspect_profile_cookies(self.profile_dir)
+        if browser is not None and target_raw != self.raw_browser:
+            target_profile_dir = get_default_profile_dir(target_engine)
+        else:
+            target_profile_dir = self.profile_dir
+
+        # Ensure headed display is available
+        display_ok = is_display_available()
+        if not display_ok:
+            disp = VirtualDisplayManager.ensure_display(allow_xvfb=False)
+            if disp:
+                display_ok = True
+
+        if not display_ok:
+            return {
+                "status": "error",
+                "browser": target_engine,
+                "platform": platform_key,
+                "message": (
+                    "Interactive login requires a graphical display (DISPLAY or WAYLAND_DISPLAY). "
+                    "No display server was detected."
+                ),
+            }
+
+        try:
+            with ProfileOwnershipLock(target_profile_dir, owner_type="cli"):
+                return self._execute_interactive_login(
+                    target_engine=target_engine,
+                    target_profile_dir=target_profile_dir,
+                    platform_key=platform_key,
+                    login_url=login_url,
+                    target_exe=target_exe,
+                    timeout_seconds=timeout_seconds,
+                )
+        except ProfileOwnershipError as lock_err:
+            return {
+                "status": "error",
+                "browser": target_engine,
+                "platform": platform_key,
+                "message": str(lock_err),
+            }
+
+    def _execute_interactive_login(
+        self,
+        target_engine: str,
+        target_profile_dir: Path,
+        platform_key: str,
+        login_url: str,
+        target_exe: str | None,
+        timeout_seconds: int,
+    ) -> dict[str, Any]:
+        sanitized_env = get_sanitized_browser_env()
+
+        if target_engine == "firefox":
+            target_profile_dir.mkdir(parents=True, exist_ok=True)
+            log_event(
+                f"Opening interactive Firefox for {platform_key.upper()} login...",
+                category="Auth",
+            )
+            try:
+                from playwright.sync_api import (
+                    sync_playwright,  # type: ignore[import-not-found, import-untyped]
+                )
+
+                playwright = sync_playwright().start()
+                proxy_server = os.environ.get("JOB_APPLIER_OUTBOUND_PROXY")
+                launch_kwargs: dict[str, Any] = {
+                    "user_data_dir": str(target_profile_dir),
+                    "headless": False,
+                    "env": sanitized_env,
+                    "viewport": {"width": 1280, "height": 900},
+                }
+                if proxy_server:
+                    launch_kwargs["proxy"] = {"server": proxy_server}
+
+                context = playwright.firefox.launch_persistent_context(**launch_kwargs)
+                attach_security_routes(context)
+                page = context.pages[0] if context.pages else context.new_page()
+                page.goto(login_url)
+
+                start_time = time.time()
+                logged_in = False
+                while time.time() - start_time < timeout_seconds:
+                    if not context.pages or page.is_closed():
+                        break
+                    st = inspect_firefox_profile_cookies(target_profile_dir)
+                    if st.get(platform_key):
+                        logged_in = True
+                        break
+                    time.sleep(2)
+
+                if not logged_in:
+                    st_final = inspect_firefox_profile_cookies(target_profile_dir)
+                else:
+                    st_final = {platform_key: True}
+
+                try:
+                    context.close()
+                    playwright.stop()
+                except Exception:
+                    pass
+
+                if st_final.get(platform_key) or logged_in:
+                    log_event(
+                        f"Successfully authenticated on {platform_key.upper()} in Firefox! Session saved permanently.",
+                        level="SUCCESS",
+                        category="Auth",
+                    )
+                    return {
+                        "status": "success",
+                        "browser": "firefox",
+                        "platform": platform_key,
+                        "message": (
+                            f"Successfully logged into {platform_key.upper()} in Firefox. "
+                            f"Session saved in {target_profile_dir.name}/."
+                        ),
+                    }
+                else:
+                    log_event(
+                        f"Firefox login window closed or timed out for {platform_key.upper()}.",
+                        level="WARN",
+                        category="Auth",
+                    )
+                    return {
+                        "status": "timeout",
+                        "browser": "firefox",
+                        "platform": platform_key,
+                        "message": "Login window closed before authentication completed.",
+                    }
+            except Exception as e:
+                return {
+                    "status": "error",
+                    "browser": "firefox",
+                    "message": f"Could not launch Firefox login: {e}",
+                }
+
+        # Chrome / Chromium interactive login
+        sync_system_chrome_cookies(target_profile_dir)
+
+        status_before = inspect_profile_cookies(target_profile_dir)
         if status_before.get(platform_key):
             log_event(
                 f"{platform_key.upper()} is already authenticated via desktop Chrome sync!",
@@ -251,75 +487,160 @@ class AuthManager:
             )
             return {
                 "status": "success",
+                "browser": target_engine,
                 "platform": platform_key,
                 "message": f"Successfully authenticated on {platform_key.upper()} via desktop Chrome sync!",
             }
 
-        # Ensure X11 display is available
-        VirtualDisplayManager.ensure_display()
-        clean_stale_chrome_locks(self.profile_dir)
+        target_profile_dir.mkdir(parents=True, exist_ok=True)
+        clean_stale_chrome_locks(target_profile_dir)
 
-        chrome_path = "/usr/bin/google-chrome"
-        if not Path(chrome_path).exists():
-            chrome_path = "/opt/google/chrome/chrome"
+        chrome_path = target_exe or find_chrome_executable()
 
-        env = os.environ.copy()
-        if not env.get("DISPLAY"):
-            env["DISPLAY"] = ":20"
-
-        cmd = [
-            chrome_path,
-            f"--user-data-dir={self.profile_dir}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--start-maximized",
-            login_url,
-        ]
-
-        log_event(
-            f"Opening native Google Chrome on {env.get('DISPLAY')} for {platform_key.upper()} login...",
-            category="Auth",
-        )
-        try:
-            proc = subprocess.Popen(cmd, env=env)
-        except Exception as e:
-            return {"status": "error", "message": f"Could not launch Chrome: {e}"}
-
-        start_time = time.time()
-        logged_in = False
-
-        while time.time() - start_time < timeout_seconds:
-            # Check if process was closed by user
-            if proc.poll() is not None:
-                break
-            # Check if cookie appeared in sqlite
-            st = inspect_profile_cookies(self.profile_dir)
-            if st.get(platform_key):
-                logged_in = True
-                break
-            time.sleep(2)
-
-        # Final cookie check after window close or timeout
-        st_final = inspect_profile_cookies(self.profile_dir)
-        if st_final.get(platform_key) or logged_in:
+        if chrome_path and Path(chrome_path).is_file():
+            cmd = [
+                chrome_path,
+                f"--user-data-dir={target_profile_dir}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--start-maximized",
+            ]
+            proxy_server = os.environ.get("JOB_APPLIER_OUTBOUND_PROXY")
+            if proxy_server:
+                cmd.append(f"--proxy-server={proxy_server}")
+            cmd.append(login_url)
+            disp_info = (
+                sanitized_env.get("WAYLAND_DISPLAY")
+                or sanitized_env.get("DISPLAY")
+                or "native"
+            )
             log_event(
-                f"Successfully authenticated on {platform_key.upper()}! Session saved permanently.",
-                level="SUCCESS",
+                f"Opening native Google Chrome on {disp_info} for {platform_key.upper()} login...",
                 category="Auth",
             )
-            return {
-                "status": "success",
-                "platform": platform_key,
-                "message": f"Successfully logged into {platform_key.upper()}. Session saved in .browser_profile/.",
-            }
+            try:
+                proc = subprocess.Popen(
+                    cmd, env={str(k): str(v) for k, v in sanitized_env.items()}
+                )
+            except Exception as e:
+                return {
+                    "status": "error",
+                    "browser": target_engine,
+                    "message": f"Could not launch Chrome: {e}",
+                }
+
+            start_time = time.time()
+            logged_in = False
+            while time.time() - start_time < timeout_seconds:
+                if proc.poll() is not None:
+                    break
+                st = inspect_profile_cookies(target_profile_dir)
+                if st.get(platform_key):
+                    logged_in = True
+                    break
+                time.sleep(2)
+
+            if not logged_in:
+                st_final = inspect_profile_cookies(target_profile_dir)
+            else:
+                st_final = {platform_key: True}
+
+            if st_final.get(platform_key) or logged_in:
+                log_event(
+                    f"Successfully authenticated on {platform_key.upper()}! Session saved permanently.",
+                    level="SUCCESS",
+                    category="Auth",
+                )
+                return {
+                    "status": "success",
+                    "browser": target_engine,
+                    "platform": platform_key,
+                    "message": f"Successfully logged into {platform_key.upper()}. Session saved in {target_profile_dir.name}/.",
+                }
+            else:
+                log_event(
+                    f"Login window closed or timed out for {platform_key.upper()}.",
+                    level="WARN",
+                    category="Auth",
+                )
+                return {
+                    "status": "timeout",
+                    "browser": target_engine,
+                    "platform": platform_key,
+                    "message": "Login window closed before authentication completed.",
+                }
         else:
-            log_event(
-                f"Login window closed or timed out for {platform_key.upper()}.",
-                level="WARN",
-                category="Auth",
-            )
-            return {
-                "status": "timeout",
-                "platform": platform_key,
-                "message": "Login window closed before authentication completed.",
-            }
+            # Fall back to Playwright Chromium headed persistent context
+            try:
+                from playwright.sync_api import (
+                    sync_playwright,  # type: ignore[import-not-found, import-untyped]
+                )
+
+                playwright = sync_playwright().start()
+                launch_args = [
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--start-maximized",
+                ]
+
+                proxy_server = os.environ.get("JOB_APPLIER_OUTBOUND_PROXY")
+                pw_launch_kwargs: dict[str, Any] = {
+                    "user_data_dir": str(target_profile_dir),
+                    "headless": False,
+                    "args": launch_args,
+                    "env": sanitized_env,
+                    "viewport": {"width": 1280, "height": 900},
+                }
+                if proxy_server:
+                    pw_launch_kwargs["proxy"] = {"server": proxy_server}
+
+                context = playwright.chromium.launch_persistent_context(
+                    **pw_launch_kwargs
+                )
+                attach_security_routes(context)
+                page = context.pages[0] if context.pages else context.new_page()
+                page.goto(login_url)
+
+                start_time = time.time()
+                logged_in = False
+                while time.time() - start_time < timeout_seconds:
+                    if not context.pages or page.is_closed():
+                        break
+                    st = inspect_profile_cookies(target_profile_dir)
+                    if st.get(platform_key):
+                        logged_in = True
+                        break
+                    time.sleep(2)
+
+                if not logged_in:
+                    st_final = inspect_profile_cookies(target_profile_dir)
+                else:
+                    st_final = {platform_key: True}
+
+                try:
+                    context.close()
+                    playwright.stop()
+                except Exception:
+                    pass
+
+                if st_final.get(platform_key) or logged_in:
+                    return {
+                        "status": "success",
+                        "browser": target_engine,
+                        "platform": platform_key,
+                        "message": f"Successfully logged into {platform_key.upper()}. Session saved in {target_profile_dir.name}/.",
+                    }
+                else:
+                    return {
+                        "status": "timeout",
+                        "browser": target_engine,
+                        "platform": platform_key,
+                        "message": "Login window closed before authentication completed.",
+                    }
+            except Exception as e:
+                return {
+                    "status": "error",
+                    "browser": target_engine,
+                    "message": f"Could not launch browser login: {e}",
+                }

@@ -1,3 +1,10 @@
+from job_applier.automation.adapters import CaptchaDetectedError
+from pathlib import Path
+from job_applier.automation.question_solver import UnknownQuestionError
+
+from unittest.mock import MagicMock, patch
+
+import pytest
 from job_applier.automation.browser_automator import (  # type: ignore[import-not-found]
     BrowserAutomator,
 )
@@ -137,3 +144,239 @@ def test_form_autofill_headless(tmp_path):
 
     finally:
         automator.close()
+
+
+def test_engine_validation_and_profile_isolation(tmp_path):
+    with patch(
+        "job_applier.automation.browser_runtime.get_project_root", return_value=tmp_path
+    ):
+        chrome_automator = BrowserAutomator(headless=True, browser="chrome")
+        assert chrome_automator.engine == "chrome"
+        assert chrome_automator.profile_dir == tmp_path / ".browser_profile"
+
+        firefox_automator = BrowserAutomator(headless=True, browser="firefox")
+        assert firefox_automator.engine == "firefox"
+        assert firefox_automator.profile_dir == tmp_path / ".browser_profile_firefox"
+        assert firefox_automator.profile_dir != chrome_automator.profile_dir
+
+        with pytest.raises(ValueError, match="Unsupported browser engine 'opera'"):
+            BrowserAutomator(headless=True, browser="opera")
+
+
+def test_explicit_headed_without_display_raises_error():
+    with (
+        patch(
+            "job_applier.automation.browser_automator.is_display_available",
+            return_value=False,
+        ),
+        patch(
+            "job_applier.automation.browser_automator.VirtualDisplayManager.ensure_display",
+            return_value=None,
+        ),
+    ):
+        with pytest.raises(
+            RuntimeError, match="Headed mode requested \\(headless=False\\)"
+        ):
+            BrowserAutomator(headless=False)
+
+
+def test_auto_mode_without_display_falls_back_to_headless():
+    with (
+        patch(
+            "job_applier.automation.browser_automator.is_display_available",
+            return_value=False,
+        ),
+        patch(
+            "job_applier.automation.browser_automator.VirtualDisplayManager.ensure_display",
+            return_value=None,
+        ),
+    ):
+        automator = BrowserAutomator(headless=None)
+        assert automator.headless is True
+
+
+def test_firefox_playwright_launch_persistent_context_mocked(tmp_path):
+    mock_playwright = MagicMock()
+    mock_firefox = MagicMock()
+    mock_context = MagicMock()
+    mock_page = MagicMock()
+    mock_context.pages = [mock_page]
+    mock_firefox.launch_persistent_context.return_value = mock_context
+    mock_playwright.firefox = mock_firefox
+    mock_sync_playwright = MagicMock()
+    mock_sync_playwright.return_value.start.return_value = mock_playwright
+
+    with patch.dict(
+        "sys.modules",
+        {"playwright.sync_api": MagicMock(sync_playwright=mock_sync_playwright)},
+    ):
+        automator = BrowserAutomator(
+            headless=True,
+            browser="firefox",
+            use_persistent_profile=True,
+            profile_dir=tmp_path / "ff_profile",
+        )
+        automator.start()
+
+        mock_firefox.launch_persistent_context.assert_called_once()
+        call_kwargs = mock_firefox.launch_persistent_context.call_args.kwargs
+        assert call_kwargs["user_data_dir"] == str(tmp_path / "ff_profile")
+        assert call_kwargs["headless"] is True
+        # Verify Chromium-specific flags are NOT passed to Firefox
+        assert "args" not in call_kwargs
+        assert "executable_path" not in call_kwargs
+        assert mock_playwright.chromium.launch_persistent_context.call_count == 0
+        automator.close()
+
+
+def test_chromium_playwright_launch_persistent_context_mocked(tmp_path):
+    mock_playwright = MagicMock()
+    mock_chromium = MagicMock()
+    mock_context = MagicMock()
+    mock_page = MagicMock()
+    mock_context.pages = [mock_page]
+    mock_chromium.launch_persistent_context.return_value = mock_context
+    mock_playwright.chromium = mock_chromium
+    mock_sync_playwright = MagicMock()
+    mock_sync_playwright.return_value.start.return_value = mock_playwright
+
+    with patch.dict(
+        "sys.modules",
+        {"playwright.sync_api": MagicMock(sync_playwright=mock_sync_playwright)},
+    ):
+        automator = BrowserAutomator(
+            headless=True,
+            browser="chromium",
+            use_persistent_profile=True,
+            profile_dir=tmp_path / "chrome_profile",
+        )
+        automator.start()
+
+        mock_chromium.launch_persistent_context.assert_called_once()
+        call_kwargs = mock_chromium.launch_persistent_context.call_args.kwargs
+        assert call_kwargs["user_data_dir"] == str(tmp_path / "chrome_profile")
+        assert call_kwargs["headless"] is True
+        assert "args" in call_kwargs
+        assert any("--disable-blink-features" in a for a in call_kwargs["args"])
+        assert mock_playwright.firefox.launch_persistent_context.call_count == 0
+        automator.close()
+
+
+def test_oauth_popup_becomes_active_page_and_restores_original_on_close():
+    """OAuth popups must be visible to the operator without losing the job page."""
+    automator = BrowserAutomator(headless=True, use_persistent_profile=False)
+    original = MagicMock()
+    popup = MagicMock()
+    original.is_closed.return_value = False
+    popup.is_closed.return_value = False
+    context = MagicMock()
+    context.pages = [original]
+    automator.context = context
+    automator.page = original
+
+    automator._handle_new_page(popup)
+    assert automator.page is popup
+    popup.bring_to_front.assert_called_once_with()
+
+    popup.is_closed.return_value = True
+    context.pages = [original, popup]
+    automator._handle_page_close(popup)
+    assert automator.page is original
+    original.bring_to_front.assert_called_once_with()
+
+
+def test_firefox_smoke_live():
+    """Smoke test running real Playwright Firefox headless if available in environment."""
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.firefox.launch(headless=True)
+            page = browser.new_page()
+            page.set_content("<html><body><h1>Firefox OK</h1></body></html>")
+            assert "Firefox OK" in page.content()
+            browser.close()
+    except Exception as exc:
+        pytest.skip(f"Firefox not runnable in current environment: {exc}")
+
+
+def test_login_wall_is_not_misclassified_as_expired_job():
+    automator = BrowserAutomator(headless=True, skip_profile_lock=True)
+    page = MagicMock()
+    page.url = "https://www.bestjobs.eu/login?targetPath=%2Floc-de-munca%2Fjob"
+    page.is_closed.return_value = False
+    page.locator.return_value.count.return_value = 1
+    automator.page = page
+    automator.context = MagicMock()
+    automator.context.pages = [page]
+
+    with (
+        patch(
+            "job_applier.automation.browser_automator.validate_target_url",
+            return_value=(True, "OK"),
+        ),
+        patch("job_applier.automation.browser_automator.is_job_active") as active,
+        patch(
+            "job_applier.automation.browser_automator.is_cloudflare_challenge",
+            return_value=False,
+        ),
+    ):
+        assert automator.navigate_and_open_form("https://www.bestjobs.eu/job") is True
+
+    active.assert_not_called()
+
+
+def test_browser_automator_propagates_exceptions_and_cloudflare_challenge(
+    tmp_path: Path,
+):
+    """Verifies that BrowserAutomator delegates to adapter.fill_fields, propagates screening question errors, and raises CaptchaDetectedError on Cloudflare challenges."""
+    app_dir = tmp_path / "app_test"
+    app_dir.mkdir(parents=True, exist_ok=True)
+    (app_dir / "CV.pdf").write_bytes(b"%PDF-1.4 test")
+
+    automator = BrowserAutomator(
+        headless=True,
+        profile_dir=tmp_path / "prof",
+        skip_profile_lock=True,
+    )
+    automator.page = MagicMock()
+    automator.page.url = "https://greenhouse.example/job/1"
+
+    # Test Cloudflare challenge zero-bypass policy (Finding 11)
+    with (
+        patch(
+            "job_applier.automation.browser_automator.validate_target_url",
+            return_value=(True, "OK"),
+        ),
+        patch(
+            "job_applier.automation.browser_automator.is_cloudflare_challenge",
+            return_value=True,
+        ),
+    ):
+        with pytest.raises(CaptchaDetectedError) as exc_info:
+            automator.navigate_and_open_form("https://greenhouse.example/job/1")
+        assert (
+            "automated bypass prohibited by policy" in str(exc_info.value).lower()
+            or "operator takeover required" in str(exc_info.value).lower()
+        )
+
+    # Test unknown question propagation in run_autonomous_apply (Finding 3)
+    mock_adapter = MagicMock()
+    mock_adapter.detect_stale_job.return_value = (False, "")
+    mock_adapter.check_auth_state.return_value = (False, "")
+    mock_adapter.detect_captcha.return_value = (False, "")
+    mock_adapter.fill_fields.side_effect = UnknownQuestionError(
+        "Are you willing to relocate to Mars?"
+    )
+
+    with (
+        patch.object(automator, "navigate_and_open_form", return_value=True),
+        pytest.raises(UnknownQuestionError),
+    ):
+        automator.run_autonomous_apply(
+            app_dir=app_dir,
+            job_url="https://greenhouse.example/job/1",
+            company="Mars Corp",
+            job_title="Astronaut",
+            adapter_override=mock_adapter,
+        )
