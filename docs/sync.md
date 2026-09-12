@@ -44,3 +44,24 @@ python src/job_applier/cli/sync_cli.py import --input my_backup.zip
 ### Automatic Legacy Migration
 
 When running `db.py`, the system automatically detects legacy `data/applications_tracker.csv` files and pending disk folders in `output/applications`, importing them directly into SQLite.
+
+---
+
+## 4. Operational Snapshots & Age Encryption (`ops_cli.py`)
+
+For server-side disaster recovery and backup automation, the operational reliability suite provides enhanced snapshot capabilities:
+
+- **Online SQLite Snapshot**: Captures live WAL pages via `Connection.backup` without locking concurrent readers or writers.
+- **Quiesced Queue Snapshotting**: Temporarily pauses worker execution while packaging artifacts to guarantee cross-file consistency.
+- **Profile Lock Probing**: Tests exclusive lock acquisition on `.browser_profile` before archiving, failing closed if another process is mutating browser state.
+- **Lock & Ephemeral Sanitization**: Strips runtime lockfiles (`SingletonLock`, `.profile_ownership.lock`) and ephemeral IPC sockets from archives.
+- **Age Encryption**: Encrypts backups using `pyrage` with an off-server recipient key.
+- **Schema Downgrade Refusal**: Refuses restoration if the archive schema version exceeds the local codebase version.
+
+```bash
+# Quiesced, age-encrypted online backup:
+just ops-backup --recipient "age1..."
+
+# Restore from backup with downgrade verification:
+just ops-restore backup.zip --identity-file /path/to/key.txt
+```

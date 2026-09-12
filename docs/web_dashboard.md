@@ -1,6 +1,6 @@
 # Web Dashboard Guide
 
-The Job Applier dashboard is a unified, real-time web application built with FastAPI, Tailwind CSS, and Alpine.js. It runs on `http://127.0.0.1:8000`.
+The Job Applier dashboard is a unified, real-time web application built with FastAPI, Angular 21, and Tailwind CSS. It runs on `http://127.0.0.1:8000`.
 
 ## Launching the Dashboard
 
@@ -62,6 +62,12 @@ Dedicated, full-height streaming terminal:
 ### 5. Candidate Profile
 
 Customize your contact info, location, URLs (LinkedIn, GitHub, Portfolio), current employer, and pre-configured screening answers (notice period, work authorization, salary expectations).
+
+### 6. Real-Time Notifications & Operator Takeover
+
+- **Durable Notification Tray:** Real-time stream over Server-Sent Events (`/api/automation/events`) delivering immediate challenge alerts (CAPTCHA, MFA, screening questions) with cross-tab Web Locks deduplication and unread counter badges.
+- **Embedded Browser Viewer:** Authenticated live stream (`/browser/`) through internal gateway and noVNC with server-side 5-minute session lifetime limits.
+- **Atomic Takeover & Safe Resume:** Operators can engage manual takeover to solve challenges in the live browser, then trigger safe resume (`/api/automation/safe-resume`), which revalidates URL security, domain matching, and tenant consistency before handing execution back to the autonomous worker.
 
 ---
 
