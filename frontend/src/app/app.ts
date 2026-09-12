@@ -3,6 +3,7 @@ import {
   type ElementRef,
   type OnDestroy,
   type OnInit,
+  HostListener,
   ViewChild,
   computed,
   inject,
@@ -18,7 +19,12 @@ import { ApiService, resolveFileUrl } from './services/api.service';
 import {
   type ApplicationDetail,
   type ApplicationItem,
+  type MainResume,
+  type MainResumeResponse,
   type AuthStatusReport,
+  type AutomationEvent,
+  type AutomationFunnel,
+  type AutomationJobStatus,
   type AutomationStatus,
   type CandidateProfile,
   type ClassifiedError,
@@ -26,11 +32,13 @@ import {
   type ResourceKey,
   type ResourceState,
   type ResourceStateStatus,
+  type TakeoverStatus,
   type ToastNotification,
   type TrackerRecord,
   type TrackerStats,
   classifyHttpError,
 } from './models/types';
+import { NotificationService } from './services/notification.service';
 
 const RETRY_BACKOFF_STEPS = [5, 15, 30];
 
@@ -43,15 +51,18 @@ const RETRY_BACKOFF_STEPS = [5, 15, 30];
 })
 export class App implements OnInit, OnDestroy {
   api = inject(ApiService);
+  notifService = inject(NotificationService);
   private sanitizer = inject(DomSanitizer);
 
   @ViewChild('consoleContainer') consoleContainer?: ElementRef<HTMLDivElement>;
+  @ViewChild('moreActionsButton') moreActionsButton?: ElementRef<HTMLButtonElement>;
 
   // Tabs
   activeTab = signal<'queue' | 'tracker' | 'scraper' | 'console' | 'profile'>('queue');
 
   // Core Data Signals
   stats = signal<TrackerStats | null>(null);
+  automationFunnel = signal<AutomationFunnel | null>(null);
   applications = signal<ApplicationItem[]>([]);
   selectedApp = signal<ApplicationDetail | null>(null);
   trackerRecords = signal<TrackerRecord[]>([]);
@@ -59,6 +70,73 @@ export class App implements OnInit, OnDestroy {
   automationStatus = signal<AutomationStatus | null>(null);
   profile = signal<CandidateProfile | null>(null);
   authStatus = signal<AuthStatusReport | null>(null);
+
+  // Takeover & noVNC Viewer State
+  vncModalOpen = signal(false);
+  takeoverStatus = signal<TakeoverStatus | null>(null);
+  takeoverCountdown = signal(300);
+  isClaimingTakeover = signal(false);
+  isReleasingTakeover = signal(false);
+  isResumingTakeover = signal(false);
+  isReopeningAuth = signal(false);
+  private takeoverTimerId: ReturnType<typeof setInterval> | null = null;
+
+  // Queue & Automation Runtime Controls
+  isPausingAutomation = signal(false);
+  isResumingAutomation = signal(false);
+  isStoppingAutomation = signal(false);
+  isClearingAutomationState = signal(false);
+
+  // Responsive overflow menu
+  moreActionsOpen = signal(false);
+
+  // Per-application durable automation history. Event messages are sanitized by the API;
+  // the UI renders only plain text fields and never interprets event details as HTML.
+  automationHistoryOpen = signal<Record<string, boolean>>({});
+  automationHistory = signal<
+    Record<
+      string,
+      {
+        jobs: AutomationJobStatus[];
+        events: AutomationEvent[];
+        nextAfter: number;
+        hasMore: boolean;
+        loading: boolean;
+        error: string | null;
+      }
+    >
+  >({});
+
+  // Main resume viewer
+  resumeModalOpen = signal(false);
+  mainResume = signal<MainResume | null>(null);
+  resumeViewStatus = signal<'idle' | 'loading' | 'stale' | 'generating' | 'ready' | 'error'>(
+    'idle',
+  );
+  resumeArtifactUrl = signal<string | null>(null);
+  resumeArtifactDownloadUrl = signal<string | null>(null);
+  resumeViewerMode = signal<'structured' | 'preview'>('structured');
+  resumeViewError = signal<string | null>(null);
+  private resumePollTimerId: ReturnType<typeof setInterval> | null = null;
+  private resumePollAttempts = 0;
+
+  // Notifications Drawer & Settings Modal
+  notificationsDrawerOpen = signal(false);
+  notifSettingsModalOpen = signal(false);
+
+  // Exception Resolution Modal
+  resolveModalOpen = signal(false);
+  resolveJobId = signal('');
+  resolveQuestionKey = signal('');
+  resolveAnswerValue = signal('');
+  resolveApprovedScope = signal<string>('global');
+  isResolvingJob = signal(false);
+
+  vncUrl = computed(() =>
+    this.sanitizer.bypassSecurityTrustResourceUrl(
+      this.api.resolveUrl('/browser/vnc_lite.html?scale=true&path=browser/websockify'),
+    ),
+  );
 
   // Per-Resource State Tracking
   resourceStates = signal<Record<ResourceKey, ResourceState>>({
@@ -97,6 +175,16 @@ export class App implements OnInit, OnDestroy {
   sortAsc = signal(false);
   verificationCode = signal('');
 
+  // Tracker Multi-Selection
+  selectedTrackerUrls = signal<Set<string>>(new Set());
+  selectedTrackerCount = computed(() => this.selectedTrackerUrls().size);
+  isAllTrackerSelected = computed(() => {
+    const records = this.filteredTrackerRecords();
+    if (records.length === 0) return false;
+    const selected = this.selectedTrackerUrls();
+    return records.every((r) => r.job_url && selected.has(r.job_url));
+  });
+
   // Scraper Form
   scraperTerms = signal(
     'Software Engineer, Solutions Architect, DevOps Engineer, Cloud Architect, Python Dev',
@@ -130,6 +218,8 @@ export class App implements OnInit, OnDestroy {
 
   // Activity spinners
   isLoading = signal(false);
+  isFunnelLoading = signal(false);
+  funnelError = signal<string | null>(null);
   isBatchRunning = signal(false);
   isApplying = signal<Record<string, boolean>>({});
   isPruning = signal(false);
@@ -223,7 +313,9 @@ export class App implements OnInit, OnDestroy {
   });
 
   ngOnInit() {
+    this.notifService.connectEventStream((msg, type) => this.showToast(msg, type));
     this.loadInitialData();
+    this.refreshTakeoverStatus();
     // Periodic background poll
     this.pollIntervalId = setInterval(() => {
       this.refreshPoll();
@@ -231,11 +323,17 @@ export class App implements OnInit, OnDestroy {
   }
 
   ngOnDestroy() {
+    this.notifService.disconnectEventStream();
     if (this.pollIntervalId) {
       clearInterval(this.pollIntervalId);
       this.pollIntervalId = null;
     }
     this.stopCountdownTimer();
+    if (this.takeoverTimerId) {
+      clearInterval(this.takeoverTimerId);
+      this.takeoverTimerId = null;
+    }
+    this.stopResumePolling();
   }
 
   setResourceStatus(
@@ -305,6 +403,7 @@ export class App implements OnInit, OnDestroy {
     const observables = [
       this.fetchStats(),
       this.fetchApplications(),
+      ...(typeof this.api.getAutomationFunnel === 'function' ? [this.fetchAutomationFunnel()] : []),
       this.fetchTracker(),
       this.fetchProfile(),
       this.fetchAuthStatus(),
@@ -343,6 +442,7 @@ export class App implements OnInit, OnDestroy {
     if (states.auth.error) tasks.push(this.fetchAuthStatus());
     if (states.pipeline.error) tasks.push(this.fetchPipelineStatus());
     if (states.automation.error) tasks.push(this.fetchAutomationStatus());
+    if (this.funnelError()) tasks.push(this.fetchAutomationFunnel());
 
     if (tasks.length === 0) {
       // If none specifically marked error, refresh all core
@@ -352,6 +452,9 @@ export class App implements OnInit, OnDestroy {
         this.fetchTracker(),
         this.fetchProfile(),
         this.fetchAuthStatus(),
+        ...(typeof this.api.getAutomationFunnel === 'function'
+          ? [this.fetchAutomationFunnel()]
+          : []),
       );
     }
 
@@ -400,6 +503,28 @@ export class App implements OnInit, OnDestroy {
     this.fetchStats().subscribe();
   }
 
+  fetchAutomationFunnel() {
+    this.isFunnelLoading.set(true);
+    return this.api.getAutomationFunnel().pipe(
+      tap((data) => {
+        this.automationFunnel.set(data);
+        this.funnelError.set(null);
+        this.isFunnelLoading.set(false);
+      }),
+      catchError(() => {
+        this.funnelError.set('Automation metrics are temporarily unavailable.');
+        this.isFunnelLoading.set(false);
+        return of(null);
+      }),
+    );
+  }
+
+  loadAutomationFunnel() {
+    if (typeof this.api.getAutomationFunnel === 'function') {
+      this.fetchAutomationFunnel().subscribe();
+    }
+  }
+
   fetchApplications() {
     this.setResourceStatus('applications', 'loading');
     return this.api.getApplications(this.searchQuery()).pipe(
@@ -420,6 +545,92 @@ export class App implements OnInit, OnDestroy {
 
   loadApplications() {
     this.fetchApplications().subscribe();
+  }
+
+  automationStateLabel(app: ApplicationItem): string {
+    const state = app.automation_state || app.status;
+    if (!state) return 'Not queued';
+    return state.replace(/_/g, ' ');
+  }
+
+  automationStepLabel(app: ApplicationItem): string {
+    const history = this.automationHistory()[app.id];
+    const latest = history?.jobs?.[0];
+    const step = latest?.step || latest?.state || app.automation_state;
+    return step ? step.replace(/_/g, ' ') : 'Awaiting attempt';
+  }
+
+  isAutomationHistoryOpen(appId: string): boolean {
+    return Boolean(this.automationHistoryOpen()[appId]);
+  }
+
+  toggleAutomationHistory(app: ApplicationItem) {
+    const open = this.isAutomationHistoryOpen(app.id);
+    this.automationHistoryOpen.update((state) => ({ ...state, [app.id]: !open }));
+    if (!open && !this.automationHistory()[app.id]) {
+      this.loadAutomationHistory(app);
+    }
+  }
+
+  loadMoreAutomationEvents(app: ApplicationItem) {
+    const current = this.automationHistory()[app.id];
+    if (!current || current.loading || !current.hasMore) return;
+    this.api.getApplicationAutomationEvents(app.id, app.job_id, current.nextAfter, 50).subscribe({
+      next: (response) => {
+        this.automationHistory.update((state) => ({
+          ...state,
+          [app.id]: {
+            ...current,
+            events: [...current.events, ...(response.events || [])],
+            nextAfter: response.next_after,
+            hasMore: response.has_more,
+            loading: false,
+          },
+        }));
+      },
+      error: () => {
+        this.automationHistory.update((state) => ({
+          ...state,
+          [app.id]: { ...current, loading: false, error: 'Unable to load more history.' },
+        }));
+      },
+    });
+  }
+
+  private loadAutomationHistory(app: ApplicationItem) {
+    const empty = {
+      jobs: [] as AutomationJobStatus[],
+      events: [] as AutomationEvent[],
+      nextAfter: 0,
+      hasMore: false,
+      loading: true,
+      error: null as string | null,
+    };
+    this.automationHistory.update((state) => ({ ...state, [app.id]: empty }));
+    forkJoin({
+      status: this.api.getApplicationAutomationStatus(app.id, app.job_id),
+      events: this.api.getApplicationAutomationEvents(app.id, app.job_id, 0, 50),
+    }).subscribe({
+      next: (response) => {
+        this.automationHistory.update((state) => ({
+          ...state,
+          [app.id]: {
+            jobs: response.status.jobs || [],
+            events: response.events.events || [],
+            nextAfter: response.events.next_after,
+            hasMore: response.events.has_more,
+            loading: false,
+            error: null,
+          },
+        }));
+      },
+      error: () => {
+        this.automationHistory.update((state) => ({
+          ...state,
+          [app.id]: { ...empty, loading: false, error: 'Automation history is unavailable.' },
+        }));
+      },
+    });
   }
 
   fetchTracker() {
@@ -496,11 +707,45 @@ export class App implements OnInit, OnDestroy {
     );
   }
 
+  isAuthenticationWaiting(): boolean {
+    return this.automationStatus()?.step === 'auth_required';
+  }
+
+  automationBannerTitle(): string {
+    if (this.notifService.isStopped()) return 'Automation Stopped (Emergency Stop)';
+    if (this.isAuthenticationWaiting()) return 'Waiting for Authentication';
+    return 'Automation Paused';
+  }
+
+  automationBannerMessage(): string {
+    if (this.notifService.isStopped()) {
+      return 'Emergency stop engaged. Worker operations halted.';
+    }
+    if (this.isAuthenticationWaiting()) {
+      if (this.automationStatus()?.browser_is_closed || !this.automationStatus()?.browser_active) {
+        return 'Authentication is required, but the previous browser closed. Open Browser View and choose Reopen Authentication.';
+      }
+      return 'Authentication required. Open Browser View and log in; automation remains paused.';
+    }
+    return 'Automation is paused awaiting operator intervention or safe resume.';
+  }
+
   fetchAutomationStatus() {
     this.setResourceStatus('automation', 'loading');
     return this.api.getAutomationStatus().pipe(
       tap((data) => {
         this.automationStatus.set(data);
+        if (data) {
+          if (typeof data.is_paused === 'boolean') {
+            this.notifService.isPaused.set(data.is_paused);
+          }
+          if (typeof data.is_stopped === 'boolean') {
+            this.notifService.isStopped.set(data.is_stopped);
+          }
+          if (data.active_job) {
+            this.notifService.activeJob.set(data.active_job);
+          }
+        }
         this.setResourceStatus('automation', 'ready', null, true);
       }),
       catchError((err) => {
@@ -738,10 +983,134 @@ export class App implements OnInit, OnDestroy {
     });
   }
 
+  isTrackerSelected(url: string): boolean {
+    return this.selectedTrackerUrls().has(url);
+  }
+
+  toggleTrackerSelection(url: string, event: Event) {
+    const checked = (event.target as HTMLInputElement).checked;
+    this.selectedTrackerUrls.update((current) => {
+      const next = new Set(current);
+      if (checked) {
+        next.add(url);
+      } else {
+        next.delete(url);
+      }
+      return next;
+    });
+  }
+
+  toggleSelectAllTracker() {
+    const records = this.filteredTrackerRecords();
+    if (this.isAllTrackerSelected()) {
+      this.selectedTrackerUrls.update((current) => {
+        const next = new Set(current);
+        for (const r of records) {
+          if (r.job_url) {
+            next.delete(r.job_url);
+          }
+        }
+        return next;
+      });
+    } else {
+      this.selectedTrackerUrls.update((current) => {
+        const next = new Set(current);
+        for (const r of records) {
+          if (r.job_url) {
+            next.add(r.job_url);
+          }
+        }
+        return next;
+      });
+    }
+  }
+
+  sendSelectedToQueue() {
+    const selectedUrls = Array.from(this.selectedTrackerUrls());
+    if (selectedUrls.length === 0) return;
+
+    const records = this.trackerRecords().filter(
+      (r) => r.job_url && selectedUrls.includes(r.job_url),
+    );
+    const items = records.map((r) => ({
+      job_url: r.job_url,
+      folder_name: r.folder_name || '',
+    }));
+
+    this.api.batchRequeue({ items }).subscribe({
+      next: (res: any) => {
+        const count = res.count ?? items.length;
+        this.showToast(`Enqueued ${count} applications to the queue!`, 'success');
+        this.selectedTrackerUrls.set(new Set());
+        this.loadApplications();
+        this.loadTracker();
+        this.loadStats();
+      },
+      error: (err) => {
+        this.showToast(
+          `Failed to enqueue applications: ${err?.error?.detail || err.message || err}`,
+          'error',
+        );
+      },
+    });
+  }
+
+  sendAllToQueue() {
+    const records = this.filteredTrackerRecords();
+    if (records.length === 0) return;
+
+    const count = records.length;
+    const filterDesc = this.trackerFilter()
+      ? `with status "${this.trackerFilter()}"`
+      : 'currently displayed';
+    if (
+      !confirm(
+        `Are you sure you want to send all ${count} applications (${filterDesc}) to the automation queue?`,
+      )
+    ) {
+      return;
+    }
+
+    const items = records.map((r) => ({
+      job_url: r.job_url,
+      folder_name: r.folder_name || '',
+    }));
+
+    this.api
+      .batchRequeue({
+        items,
+        requeue_all: false,
+        status_filter: this.trackerFilter() || undefined,
+      })
+      .subscribe({
+        next: (res: any) => {
+          const countRes = res.count ?? count;
+          this.showToast(`Successfully enqueued ${countRes} applications!`, 'success');
+          this.selectedTrackerUrls.set(new Set());
+          this.loadApplications();
+          this.loadTracker();
+          this.loadStats();
+        },
+        error: (err) => {
+          this.showToast(
+            `Failed to enqueue applications: ${err?.error?.detail || err.message || err}`,
+            'error',
+          );
+        },
+      });
+  }
+
   requeueApp(record: TrackerRecord) {
     this.api.requeue(record.job_url, record.folder_name).subscribe({
       next: () => {
         this.showToast('Moved application back to queue!');
+        if (record.job_url) {
+          this.selectedTrackerUrls.update((s) => {
+            const next = new Set(s);
+            next.delete(record.job_url);
+            return next;
+          });
+        }
         this.loadApplications();
         this.loadTracker();
         this.loadStats();
@@ -833,7 +1202,136 @@ export class App implements OnInit, OnDestroy {
     });
   }
 
+  @HostListener('document:keydown.escape')
+  onEscapeKey() {
+    if (this.moreActionsOpen()) {
+      this.closeMoreActions(true);
+    }
+  }
+
+  @HostListener('document:click', ['$event'])
+  onDocumentClick(event: MouseEvent) {
+    if (!this.moreActionsOpen()) return;
+    const target = event.target as Element | null;
+    if (!target?.closest('.more-actions')) {
+      this.closeMoreActions(true);
+    }
+  }
+
+  toggleMoreActions() {
+    if (this.moreActionsOpen()) {
+      this.closeMoreActions(true);
+    } else {
+      this.moreActionsOpen.set(true);
+    }
+  }
+
+  closeMoreActions(restoreFocus = false) {
+    this.moreActionsOpen.set(false);
+    if (restoreFocus) {
+      queueMicrotask(() => this.moreActionsButton?.nativeElement.focus());
+    }
+  }
+
+  openResumeViewer() {
+    this.closeMoreActions();
+    this.resumeViewerMode.set('structured');
+    this.resumeModalOpen.set(true);
+    this.loadMainResume();
+  }
+
+  openPdfPreview() {
+    this.resumeViewerMode.set('preview');
+    if (!this.resumeModalOpen()) {
+      this.closeMoreActions();
+      this.resumeModalOpen.set(true);
+      this.loadMainResume();
+    }
+  }
+
+  setResumeViewerMode(mode: 'structured' | 'preview') {
+    this.resumeViewerMode.set(mode);
+  }
+
+  closeResumeViewer() {
+    this.resumeModalOpen.set(false);
+    this.resumeViewerMode.set('structured');
+    this.stopResumePolling();
+  }
+
+  retryMainResume() {
+    this.loadMainResume();
+  }
+
+  private loadMainResume() {
+    this.stopResumePolling();
+    this.resumeViewStatus.set('loading');
+    this.resumeViewError.set(null);
+    this.api.getMainResume().subscribe({
+      next: (response: MainResumeResponse) => {
+        this.applyMainResumeResponse(response);
+        if (response.status === 'generating' || response.status === 'stale')
+          this.startResumePolling();
+      },
+      error: (err) => {
+        this.resumeViewStatus.set('error');
+        this.resumeViewError.set(classifyHttpError(err).message || 'Unable to load main resume.');
+      },
+    });
+  }
+
+  private applyMainResumeResponse(response: MainResumeResponse) {
+    this.mainResume.set(response.resume);
+    this.resumeArtifactUrl.set(
+      response.artifact_url ? resolveFileUrl(response.artifact_url) : null,
+    );
+    this.resumeArtifactDownloadUrl.set(
+      response.download_url
+        ? resolveFileUrl(response.download_url)
+        : response.artifact_url
+          ? `${resolveFileUrl(response.artifact_url)}?download=true`
+          : null,
+    );
+    this.resumeViewStatus.set(response.status);
+    this.resumeViewError.set(response.error);
+  }
+
+  private startResumePolling() {
+    if (this.resumePollTimerId) return;
+    this.resumePollAttempts = 0;
+    this.resumePollTimerId = setInterval(() => {
+      this.resumePollAttempts += 1;
+      if (this.resumePollAttempts > 15) {
+        this.stopResumePolling();
+        this.resumeViewStatus.set('error');
+        this.resumeViewError.set('Resume generation is taking longer than expected. Retry.');
+        return;
+      }
+      this.api.getMainResume().subscribe({
+        next: (response) => {
+          this.applyMainResumeResponse(response);
+          if (response.status !== 'generating' && response.status !== 'stale')
+            this.stopResumePolling();
+        },
+        error: () => {
+          this.stopResumePolling();
+          this.resumeViewStatus.set('error');
+          this.resumeViewError.set('Unable to check resume generation status. Retry.');
+        },
+      });
+    }, 2000);
+  }
+
+  private stopResumePolling() {
+    if (this.resumePollTimerId) {
+      clearInterval(this.resumePollTimerId);
+      this.resumePollTimerId = null;
+    }
+    this.resumePollAttempts = 0;
+  }
+
   openAuthModal() {
+    this.closeMoreActions();
     this.checkAuthStatus();
     this.authModalOpen.set(true);
   }
@@ -947,6 +1445,329 @@ export class App implements OnInit, OnDestroy {
     this.api.updateProfile(p).subscribe({
       next: () => this.showToast('Candidate profile saved successfully!'),
       error: () => this.showToast('Failed to save profile', 'error'),
+    });
+  }
+
+  // --- Notifications Drawer & Opt-In Controls ---
+
+  openNotificationsDrawer() {
+    this.notificationsDrawerOpen.set(true);
+    this.notifService.fetchNotifications();
+  }
+
+  closeNotificationsDrawer() {
+    this.notificationsDrawerOpen.set(false);
+  }
+
+  openNotifSettingsModal() {
+    this.notifSettingsModalOpen.set(true);
+  }
+
+  closeNotifSettingsModal() {
+    this.notifSettingsModalOpen.set(false);
+  }
+
+  ackNotification(id: number | string) {
+    this.notifService.ackNotification(id);
+    this.showToast('Notification acknowledged', 'info');
+  }
+
+  ackAllNotifications() {
+    this.notifService.ackAll();
+    this.showToast('All notifications acknowledged', 'info');
+  }
+
+  dismissNotification(id: number | string) {
+    this.notifService.dismissNotification(id);
+    this.showToast('Notification dismissed', 'info');
+  }
+
+  clearAllNotifications() {
+    this.notifService.clearAll();
+    this.showToast('All notifications cleared', 'info');
+  }
+
+  // --- Automation Runtime Controls (Pause / Resume / Stop) ---
+
+  pauseAutomation() {
+    this.isPausingAutomation.set(true);
+    this.api.pauseAutomation().subscribe({
+      next: () => {
+        this.notifService.isPaused.set(true);
+        this.showToast('Automation paused. Active browser state preserved.', 'warning');
+        this.isPausingAutomation.set(false);
+        this.refreshPoll();
+      },
+      error: (err) => {
+        this.showToast(classifyHttpError(err).message || 'Failed to pause automation', 'error');
+        this.isPausingAutomation.set(false);
+      },
+    });
+  }
+
+  resumeAutomation() {
+    this.isResumingAutomation.set(true);
+    this.api.resumeAutomation().subscribe({
+      next: (res) => {
+        this.notifService.isPaused.set(false);
+        this.showToast(res.message || 'Automation resumed after safe revalidation!', 'success');
+        this.isResumingAutomation.set(false);
+        this.refreshPoll();
+      },
+      error: (err) => {
+        this.showToast(
+          classifyHttpError(err).message || 'Resume rejected: revalidation checks failed',
+          'error',
+        );
+        this.isResumingAutomation.set(false);
+      },
+    });
+  }
+
+  stopAutomation() {
+    if (!confirm('Engage Emergency Stop? All active worker operations will immediately halt.'))
+      return;
+    this.isStoppingAutomation.set(true);
+    this.api.stopAutomation().subscribe({
+      next: () => {
+        this.notifService.isStopped.set(true);
+        this.notifService.isPaused.set(true);
+        this.showToast('EMERGENCY STOP engaged. All operations halted.', 'error');
+        this.isStoppingAutomation.set(false);
+        this.refreshPoll();
+      },
+      error: (err) => {
+        this.showToast(classifyHttpError(err).message || 'Failed to stop automation', 'error');
+        this.isStoppingAutomation.set(false);
+      },
+    });
+  }
+
+  clearAutomationState() {
+    if (
+      !confirm(
+        'Clear automation state? This resets any stuck or claimed jobs back to ready, closes orphaned browser sessions, and clears emergency stop.',
+      )
+    )
+      return;
+    this.isClearingAutomationState.set(true);
+    this.api.clearAutomationState().subscribe({
+      next: (res) => {
+        this.notifService.isStopped.set(false);
+        this.notifService.isPaused.set(false);
+        this.showToast(res.message || 'Automation state cleared successfully!', 'success');
+        this.isClearingAutomationState.set(false);
+        this.loadApplications();
+        this.loadTracker();
+        this.loadStats();
+        this.refreshPoll();
+      },
+      error: (err) => {
+        this.showToast(
+          classifyHttpError(err).message || 'Failed to clear automation state',
+          'error',
+        );
+        this.isClearingAutomationState.set(false);
+      },
+    });
+  }
+
+  // --- Queue Job Actions (Skip / Cancel / Resolve) ---
+
+  skipActiveJob(jobId: string) {
+    if (!confirm(`Skip job ${jobId}?`)) return;
+    this.api.skipJob(jobId).subscribe({
+      next: () => {
+        this.showToast(`Job ${jobId} marked as skipped.`);
+        this.refreshPoll();
+        this.loadApplications();
+      },
+      error: (err) => {
+        this.showToast(classifyHttpError(err).message || 'Failed to skip job', 'error');
+      },
+    });
+  }
+
+  cancelActiveJob(jobId: string) {
+    if (!confirm(`Cancel job ${jobId}?`)) return;
+    this.api.cancelJob(jobId).subscribe({
+      next: () => {
+        this.showToast(`Job ${jobId} cancelled.`);
+        this.refreshPoll();
+        this.loadApplications();
+      },
+      error: (err) => {
+        this.showToast(classifyHttpError(err).message || 'Failed to cancel job', 'error');
+      },
+    });
+  }
+
+  openResolveModal(jobId: string, questionKey = '') {
+    this.resolveJobId.set(jobId);
+    this.resolveQuestionKey.set(questionKey);
+    this.resolveAnswerValue.set('');
+    this.resolveApprovedScope.set('global');
+    this.resolveModalOpen.set(true);
+  }
+
+  closeResolveModal() {
+    this.resolveModalOpen.set(false);
+  }
+
+  submitResolution() {
+    const jid = this.resolveJobId();
+    if (!jid) return;
+    this.isResolvingJob.set(true);
+    this.api
+      .resolveJob(
+        jid,
+        'answer',
+        this.resolveAnswerValue(),
+        this.resolveQuestionKey(),
+        this.resolveApprovedScope(),
+      )
+      .subscribe({
+        next: () => {
+          this.showToast(`Job ${jid} resolved with approved answer and requeued!`, 'success');
+          this.closeResolveModal();
+          this.isResolvingJob.set(false);
+          this.refreshPoll();
+        },
+        error: (err) => {
+          this.showToast(classifyHttpError(err).message || 'Failed to resolve job', 'error');
+          this.isResolvingJob.set(false);
+        },
+      });
+  }
+
+  // --- noVNC Viewer & Operator Takeover Controls ---
+
+  refreshTakeoverStatus() {
+    this.api
+      .getTakeoverStatus()
+      .pipe(catchError(() => of(null)))
+      .subscribe({
+        next: (status) => {
+          if (status) {
+            this.takeoverStatus.set(status);
+            if (status.is_takeover_active) {
+              this.startTakeoverTimer();
+            } else {
+              this.stopTakeoverTimer();
+            }
+          }
+        },
+      });
+  }
+
+  private startTakeoverTimer() {
+    if (this.takeoverTimerId) return;
+    this.takeoverTimerId = setInterval(() => {
+      const current = this.takeoverCountdown();
+      if (current <= 1) {
+        this.stopTakeoverTimer();
+        this.refreshTakeoverStatus();
+      } else {
+        this.takeoverCountdown.set(current - 1);
+      }
+    }, 1000);
+  }
+
+  private stopTakeoverTimer() {
+    if (this.takeoverTimerId) {
+      clearInterval(this.takeoverTimerId);
+      this.takeoverTimerId = null;
+    }
+  }
+
+  openTakeoverModal() {
+    this.vncModalOpen.set(true);
+    this.refreshTakeoverStatus();
+  }
+
+  closeTakeoverModal() {
+    this.vncModalOpen.set(false);
+  }
+
+  claimTakeover() {
+    this.isClaimingTakeover.set(true);
+    this.api.claimTakeover('operator', 300).subscribe({
+      next: (res) => {
+        this.showToast('Exclusive operator takeover claimed! Automation paused.', 'warning');
+        this.isClaimingTakeover.set(false);
+        this.takeoverCountdown.set(res.lease_seconds || 300);
+        this.refreshTakeoverStatus();
+      },
+      error: (err) => {
+        this.showToast(classifyHttpError(err).message || 'Failed to claim takeover lease', 'error');
+        this.isClaimingTakeover.set(false);
+      },
+    });
+  }
+
+  releaseTakeover() {
+    this.isReleasingTakeover.set(true);
+    this.api.releaseTakeover('operator', false).subscribe({
+      next: () => {
+        this.showToast(
+          'Takeover lease released. Automation remains paused awaiting safe resume revalidation.',
+          'info',
+        );
+        this.isReleasingTakeover.set(false);
+        this.stopTakeoverTimer();
+        this.refreshTakeoverStatus();
+      },
+      error: (err) => {
+        this.showToast(classifyHttpError(err).message || 'Failed to release takeover', 'error');
+        this.isReleasingTakeover.set(false);
+      },
+    });
+  }
+
+  reopenAuthSession() {
+    this.isReopeningAuth.set(true);
+    const jobId = (this.automationStatus()?.active_job as { id?: string } | undefined)?.id;
+    this.api.reopenAuthSession(jobId).subscribe({
+      next: (res) => {
+        this.showToast(
+          res.message || 'Fresh browser session requested. Waiting for authentication challenge.',
+          'info',
+        );
+        this.isReopeningAuth.set(false);
+        this.closeTakeoverModal();
+        this.refreshTakeoverStatus();
+        this.refreshPoll();
+      },
+      error: (err) => {
+        this.showToast(
+          classifyHttpError(err).message || 'Unable to reopen authentication session',
+          'error',
+        );
+        this.isReopeningAuth.set(false);
+      },
+    });
+  }
+
+  resumeFromTakeover() {
+    this.isResumingTakeover.set(true);
+    this.api.resumeTakeover().subscribe({
+      next: (res) => {
+        this.showToast(
+          res.message || 'Safe resume revalidation succeeded! Automation unpaused.',
+          'success',
+        );
+        this.isResumingTakeover.set(false);
+        this.closeTakeoverModal();
+        this.refreshTakeoverStatus();
+        this.refreshPoll();
+      },
+      error: (err) => {
+        this.showToast(
+          classifyHttpError(err).message || 'Safe resume rejected: revalidation checks failed',
+          'error',
+        );
+        this.isResumingTakeover.set(false);
+      },
     });
   }
 

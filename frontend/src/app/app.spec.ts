@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { TestBed } from '@angular/core/testing';
+import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { of, throwError } from 'rxjs';
 import { App } from './app';
 import { ApiService } from './services/api.service';
@@ -61,10 +61,18 @@ describe('Error Classification - classifyHttpError', () => {
 
 describe('App Component - State & Degraded Mode Recovery', () => {
   let app: App;
+  let fixture: ComponentFixture<App>;
   let mockApi: Partial<ApiService>;
 
   beforeEach(() => {
     vi.useFakeTimers();
+    vi.stubGlobal(
+      'EventSource',
+      class {
+        addEventListener(): void {}
+        close(): void {}
+      },
+    );
 
     mockApi = {
       getStats: vi
@@ -91,6 +99,7 @@ describe('App Component - State & Degraded Mode Recovery', () => {
         .fn()
         .mockReturnValue(of({ is_running: false, status: 'idle', logs: [] })),
       getAutomationStatus: vi.fn().mockReturnValue(of({ is_active: false })),
+      getTakeoverStatus: vi.fn().mockReturnValue(of({ is_takeover_active: false })),
       importBackup: vi.fn(),
       resolveUrl: vi.fn().mockImplementation((path: string) => path),
       getExportUrl: vi.fn().mockReturnValue('/api/export'),
@@ -101,14 +110,327 @@ describe('App Component - State & Degraded Mode Recovery', () => {
       providers: [{ provide: ApiService, useValue: mockApi }],
     });
 
-    const fixture = TestBed.createComponent(App);
+    fixture = TestBed.createComponent(App);
     app = fixture.componentInstance;
   });
 
   afterEach(() => {
     app.ngOnDestroy();
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
     vi.useRealTimers();
+  });
+
+  it('keeps every primary navigation destination visible without a scrolling strip', () => {
+    fixture.detectChanges();
+
+    const nav = fixture.nativeElement.querySelector('.primary-nav') as HTMLElement;
+    const tabs = Array.from(nav.querySelectorAll('button')) as HTMLButtonElement[];
+
+    expect(tabs).toHaveLength(5);
+    expect(nav.className).not.toContain('overflow-x-auto');
+    expect(tabs.every((tab) => tab.className.includes('flex-1'))).toBe(true);
+    expect(tabs.map((tab) => tab.getAttribute('aria-label'))).toEqual([
+      'Application queue',
+      'Application tracker',
+      'Scraper configuration',
+      'Execution console',
+      'Candidate profile',
+    ]);
+  });
+
+  it('opens the safe main resume viewer from the More actions menu', () => {
+    mockApi.getMainResume = vi.fn().mockReturnValue(
+      of({
+        status: 'ready',
+        resume: {
+          contact: { name: 'Synthetic Candidate', email: 'candidate@example.test' },
+          summary: 'Synthetic summary',
+          experience: [],
+          skills: ['Python'],
+          education: {},
+          projects: [
+            { name: 'Example', description: 'Example project', url: 'https://example.test' },
+          ],
+        },
+        artifact_url: '/api/resume/main.pdf',
+        generation_id: null,
+        updated_at: null,
+        error: null,
+        retry_after_seconds: null,
+      }),
+    );
+
+    app.openResumeViewer();
+    fixture.detectChanges();
+
+    expect(
+      fixture.nativeElement.querySelector('[aria-labelledby="resume-viewer-title"]'),
+    ).not.toBeNull();
+    expect(fixture.nativeElement.textContent).toContain('Synthetic Candidate');
+    expect(fixture.nativeElement.textContent).toContain('Example project');
+  });
+
+  it('opens inline PDF preview on Open PDF action instead of triggering download and preserves explicit download action', () => {
+    mockApi.getMainResume = vi.fn().mockReturnValue(
+      of({
+        status: 'ready',
+        resume: {
+          contact: { name: 'Synthetic Candidate', email: 'candidate@example.test' },
+          summary: 'Synthetic summary',
+          experience: [],
+          skills: ['Python'],
+          education: {},
+          projects: [
+            { name: 'Example', description: 'Example project', url: 'https://example.test' },
+          ],
+        },
+        artifact_url: '/api/resume/main.pdf',
+        download_url: '/api/resume/main.pdf?download=true',
+        generation_id: null,
+        updated_at: null,
+        error: null,
+        retry_after_seconds: null,
+      }),
+    );
+
+    app.openResumeViewer();
+    fixture.detectChanges();
+
+    // Verify Open PDF button and Download PDF link exist in structured view
+    const openPdfBtn = fixture.nativeElement.querySelector(
+      'button[aria-label="Open PDF inline preview"]',
+    ) as HTMLButtonElement;
+    expect(openPdfBtn).not.toBeNull();
+    expect(openPdfBtn.textContent).toContain('Open PDF');
+
+    const downloadLink = fixture.nativeElement.querySelector(
+      'a[aria-label="Download main resume PDF"]',
+    ) as HTMLAnchorElement;
+    expect(downloadLink).not.toBeNull();
+    expect(downloadLink.getAttribute('download')).toBe('main-resume.pdf');
+    expect(downloadLink.getAttribute('href')).toContain('/api/resume/main.pdf?download=true');
+
+    // Clicking Open PDF must open the inline preview without triggering a download
+    openPdfBtn.click();
+    fixture.detectChanges();
+
+    const iframe = fixture.nativeElement.querySelector(
+      'iframe[title="Main resume PDF inline preview"]',
+    ) as HTMLIFrameElement;
+    expect(iframe).not.toBeNull();
+    expect(iframe.getAttribute('src')).toContain('/api/resume/main.pdf');
+
+    // In preview mode, the explicit download action and back button must be available
+    const previewDownloadLink = fixture.nativeElement.querySelector(
+      '.resume-pdf-preview a[aria-label="Download main resume PDF"]',
+    ) as HTMLAnchorElement;
+    expect(previewDownloadLink).not.toBeNull();
+    expect(previewDownloadLink.getAttribute('download')).toBe('main-resume.pdf');
+    expect(previewDownloadLink.getAttribute('href')).toContain(
+      '/api/resume/main.pdf?download=true',
+    );
+
+    const backBtn = fixture.nativeElement.querySelector(
+      'button[aria-label="Back to structured resume view"]',
+    ) as HTMLButtonElement;
+    expect(backBtn).not.toBeNull();
+    backBtn.click();
+    fixture.detectChanges();
+
+    // Switched back to structured view
+    expect(
+      fixture.nativeElement.querySelector('iframe[title="Main resume PDF inline preview"]'),
+    ).toBeNull();
+    expect(fixture.nativeElement.textContent).toContain('Synthetic Candidate');
+  });
+
+  it('renders resume viewer buttons with matching Lucide file-text icon, accessible labeling, and correct spacing', async () => {
+    await app.loadInitialData();
+    fixture.detectChanges();
+
+    // Primary Review CV viewer button in queue card actions
+    const reviewBtn = fixture.nativeElement.querySelector(
+      'button[aria-label="Review tailored CV"]',
+    ) as HTMLButtonElement;
+    expect(reviewBtn).not.toBeNull();
+    expect(reviewBtn.getAttribute('title')).toBe('Review tailored CV');
+    expect(reviewBtn.className).toContain('flex');
+    expect(reviewBtn.className).toContain('items-center');
+    expect(reviewBtn.className).toContain('gap-1');
+
+    const reviewIcon = reviewBtn.querySelector('app-icon');
+    expect(reviewIcon).not.toBeNull();
+    expect(reviewIcon?.getAttribute('name')).toBe('file-text');
+    expect(reviewIcon?.querySelector('svg g')).not.toBeNull();
+
+    // Main resume viewer button in more actions menu
+    const moreButton = fixture.nativeElement.querySelector(
+      '.more-actions-trigger',
+    ) as HTMLButtonElement;
+    moreButton.click();
+    fixture.detectChanges();
+
+    const mainResumeBtn = fixture.nativeElement.querySelector(
+      'button[aria-label="View main resume"]',
+    ) as HTMLButtonElement;
+    expect(mainResumeBtn).not.toBeNull();
+    expect(mainResumeBtn.getAttribute('title')).toBe('View the canonical main resume');
+    expect(mainResumeBtn.className).toContain('flex');
+    expect(mainResumeBtn.className).toContain('items-center');
+    expect(mainResumeBtn.className).toContain('gap-2');
+
+    const mainResumeIcon = mainResumeBtn.querySelector('app-icon');
+    expect(mainResumeIcon).not.toBeNull();
+    expect(mainResumeIcon?.getAttribute('name')).toBe('file-text');
+    expect(mainResumeIcon?.querySelector('svg g')).not.toBeNull();
+  });
+
+  it('keeps compact actions accessible through the More actions menu', async () => {
+    fixture.detectChanges();
+
+    const shell = fixture.nativeElement.querySelector('.app-shell') as HTMLElement;
+    const moreButton = fixture.nativeElement.querySelector(
+      '.more-actions-trigger',
+    ) as HTMLButtonElement;
+    const actionButtons = Array.from(
+      fixture.nativeElement.querySelectorAll('.header-actions > button'),
+    ) as HTMLButtonElement[];
+
+    expect(shell.className).not.toContain('overflow-x-hidden');
+    expect(actionButtons.map((button) => button.getAttribute('aria-label'))).toEqual([
+      'Manage platform logins and session cookies',
+      'Open live browser view and operator takeover controls',
+      'Open alerts and notification history',
+    ]);
+    expect(moreButton.getAttribute('aria-label')).toBe('More actions');
+    expect(moreButton.getAttribute('aria-expanded')).toBe('false');
+    expect(fixture.nativeElement.querySelector('#more-actions-menu')).toBeNull();
+
+    moreButton.click();
+    fixture.detectChanges();
+
+    expect(moreButton.getAttribute('aria-expanded')).toBe('true');
+    const menu = fixture.nativeElement.querySelector('#more-actions-menu') as HTMLElement;
+    expect(menu.getAttribute('role')).toBe('menu');
+    expect(
+      Array.from(menu.querySelectorAll('[role="menuitem"]')).map((item) =>
+        item.textContent?.trim(),
+      ),
+    ).toEqual(['Export backup', 'Import backup', 'View main resume']);
+
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+    fixture.detectChanges();
+    await Promise.resolve();
+    expect(moreButton.getAttribute('aria-expanded')).toBe('false');
+    expect(document.activeElement).toBe(moreButton);
+
+    moreButton.click();
+    fixture.detectChanges();
+    document.body.click();
+    fixture.detectChanges();
+    await Promise.resolve();
+    expect(moreButton.getAttribute('aria-expanded')).toBe('false');
+  });
+
+  it('distinguishes authentication waiting from a true emergency stop', () => {
+    app.automationStatus.set({
+      is_active: false,
+      step: 'auth_required',
+      message: 'Authentication required.',
+    });
+    app.notifService.isPaused.set(true);
+    app.notifService.isStopped.set(false);
+
+    expect(app.isAuthenticationWaiting()).toBe(true);
+    expect(app.automationBannerTitle()).toBe('Waiting for Authentication');
+    expect(app.automationBannerMessage()).toContain('Open Browser View');
+
+    app.notifService.isStopped.set(true);
+    expect(app.automationBannerTitle()).toBe('Automation Stopped (Emergency Stop)');
+    expect(app.automationBannerMessage()).toContain('Emergency stop engaged');
+  });
+
+  it('renders durable funnel metrics and sanitized per-application history state', () => {
+    mockApi.getAutomationFunnel = vi.fn().mockReturnValue(
+      of({
+        verified_autonomous_submissions: 1,
+        jobs_tracked: 4,
+        runnable_jobs: 0,
+        jobs_queued: 4,
+        jobs_with_attempt: 4,
+        current_auth_blocked_jobs: 1,
+        current_site_changed_jobs: 2,
+        historical_auth_blocked_attempts: 1,
+        historical_site_changed_attempts: 2,
+        total_attempts: 4,
+        current_permanent_failures: 0,
+        current_retry_wait_jobs: 1,
+        current_skipped_jobs: 0,
+        generated_artifacts: 7,
+        manual_applied: 2,
+        applied_artifacts: 2,
+        unqueued_artifacts: 3,
+        jobs_attempted: 4,
+        auth_required: 1,
+        site_changed: 2,
+        permanent_failures: 0,
+        retries: 1,
+        unknown: 0,
+        jobs_total: 4,
+        attempts_total: 4,
+        deprecated_fields: ['jobs_attempted', 'auth_required', 'site_changed'],
+        job_states: {},
+        attempt_outcomes: {},
+      }),
+    );
+    mockApi.getApplicationAutomationStatus = vi.fn().mockReturnValue(
+      of({
+        app_id: 'app1',
+        jobs: [{ job_id: 'job1', app_id: 'app1', state: 'in_progress', step: 'filling' }],
+      }),
+    );
+    mockApi.getApplicationAutomationEvents = vi.fn().mockReturnValue(
+      of({
+        app_id: 'app1',
+        events: [
+          {
+            id: 1,
+            app_id: 'app1',
+            event_type: 'filling',
+            message: 'Sanitized event',
+            created_at: '2026-09-09T12:00:00Z',
+          },
+        ],
+        next_after: 1,
+        has_more: false,
+      }),
+    );
+
+    app.loadAutomationFunnel();
+    fixture.detectChanges();
+    const funnelText = fixture.nativeElement.textContent as string;
+    expect(funnelText).toContain('Jobs tracked');
+    expect(funnelText).toContain('Runnable jobs');
+    expect(funnelText).toContain('Auth-block attempts (historical)');
+    expect(funnelText).toContain('Attempt rows (all)');
+    expect(funnelText).not.toContain('Jobs attempted');
+
+    app.toggleAutomationHistory({
+      id: 'app1',
+      company: 'Acme',
+      title: 'DevOps',
+      job_url: 'https://example.test',
+      cv_filename: '',
+      has_cover_letter: false,
+      cover_letter_preview: '',
+      pdf_url: '',
+      created_at: '',
+    });
+
+    expect(app.automationFunnel()?.verified_autonomous_submissions).toBe(1);
+    expect(app.isAutomationHistoryOpen('app1')).toBe(true);
+    expect(app.automationHistory()['app1'].events[0].message).toBe('Sanitized event');
   });
 
   it('loadInitialData settles isLoading to false only after requests complete', async () => {
@@ -327,6 +649,11 @@ describe('App Component - State & Degraded Mode Recovery', () => {
       expect(app.resourceStates().applications.status).toBe('error');
       expect(app.toast().type).toBe('warning');
       expect(app.toast().message).toContain('dashboard refresh failed');
+    });
+
+    it('computes vncUrl pointing to vnc_lite.html with scale and path=browser/websockify', () => {
+      const urlStr = String(app.vncUrl());
+      expect(urlStr).toContain('/browser/vnc_lite.html?scale=true&path=browser/websockify');
     });
   });
 });
