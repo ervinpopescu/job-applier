@@ -383,6 +383,87 @@ def test_tracker_endpoints(client):
     assert "stats" in data
 
 
+def test_tracker_export_csv_endpoint(client, tmp_path, monkeypatch):
+    test_db = tmp_path / "test_export.db"
+    monkeypatch.setenv("JOB_APPLIER_DB_PATH", str(test_db))
+    from job_applier.db import init_db, upsert_application
+
+    init_db(test_db)
+    upsert_application(
+        app_id="export_test_app",
+        company="Export Acme Inc",
+        title="Senior CSV Specialist",
+        job_url="https://example.com/export-test",
+        status="pending",
+        custom_path=test_db,
+    )
+
+    response = client.get("/api/tracker/export")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/csv")
+    assert 'attachment; filename="applications_tracker.csv"' in response.headers.get(
+        "content-disposition", ""
+    )
+    assert "company" in response.text
+    assert "job_url" in response.text
+    assert "Export Acme Inc" in response.text
+    assert "Senior CSV Specialist" in response.text
+
+
+def test_applications_unified_filters(client, tmp_path, monkeypatch):
+    test_db = tmp_path / "test_filters.db"
+    monkeypatch.setenv("JOB_APPLIER_DB_PATH", str(test_db))
+    from job_applier.automation.queue import enqueue_job
+    from job_applier.db import init_db, upsert_application
+
+    init_db(test_db)
+    upsert_application(
+        app_id="filter_test_pending",
+        company="Pending Co",
+        title="Frontend Dev",
+        job_url="https://example.com/filter-pending",
+        status="pending",
+        custom_path=test_db,
+    )
+    upsert_application(
+        app_id="filter_test_applied",
+        company="Applied Co",
+        title="Backend Dev",
+        job_url="https://example.com/filter-applied",
+        status="applied",
+        custom_path=test_db,
+    )
+    enqueue_job("filter_test_pending", custom_path=test_db)
+
+    # Test filter=all
+    res_all = client.get("/api/applications?filter=all")
+    assert res_all.status_code == 200
+    data_all = res_all.json()
+    assert data_all["total"] == 2
+    assert "counts" in data_all
+    assert data_all["counts"]["all"] == 2
+    assert data_all["counts"]["queued"] == 1
+    assert data_all["counts"]["pending"] == 1
+    assert data_all["counts"]["applied"] == 1
+    assert data_all["counts"]["action_required"] == 0
+    assert data_all["counts"]["skipped"] == 0
+    assert data_all["counts"]["failed"] == 0
+
+    # Test filter=queued
+    res_queued = client.get("/api/applications?filter=queued")
+    assert res_queued.status_code == 200
+    data_queued = res_queued.json()
+    assert data_queued["total"] == 1
+    assert data_queued["items"][0]["id"] == "filter_test_pending"
+
+    # Test filter=applied
+    res_applied = client.get("/api/applications?filter=applied")
+    assert res_applied.status_code == 200
+    data_applied = res_applied.json()
+    assert data_applied["total"] == 1
+    assert data_applied["items"][0]["id"] == "filter_test_applied"
+
+
 def test_requeue_endpoint(client):
     with (
         patch("job_applier.tracker.record_application"),
@@ -397,11 +478,13 @@ def test_requeue_endpoint(client):
         assert data["status"] == "success"
 
 
-def test_requeue_endpoint_enqueues_and_syncs_sqlite(client):
+def test_requeue_endpoint_enqueues_and_syncs_sqlite(client, tmp_path, monkeypatch):
+    test_db = tmp_path / "test_requeue.db"
+    monkeypatch.setenv("JOB_APPLIER_DB_PATH", str(test_db))
     from job_applier.db import get_connection, init_db, upsert_application
 
-    init_db()
-    conn = get_connection()
+    init_db(test_db)
+    conn = get_connection(test_db)
     app_id = "test_requeue_app_1"
     upsert_application(
         app_id=app_id,
@@ -409,11 +492,11 @@ def test_requeue_endpoint_enqueues_and_syncs_sqlite(client):
         title="Software Engineer",
         job_url="https://example.com/job-to-requeue",
         status="applied",
+        submission_type="assisted_browser",
+        has_cover_letter=True,
+        custom_path=test_db,
     )
-    with (
-        patch("job_applier.tracker.record_application"),
-        patch("job_applier.web.app.record_application"),
-    ):
+    try:
         response = client.post(
             "/api/tracker/requeue",
             json={"job_url": "https://example.com/job-to-requeue"},
@@ -422,11 +505,14 @@ def test_requeue_endpoint_enqueues_and_syncs_sqlite(client):
         data = response.json()
         assert data["status"] == "success"
 
-        # Verify SQLite application status is pending
+        # Verify SQLite application status is pending and metadata preserved
         row = conn.execute(
-            "SELECT status FROM applications WHERE id = ?;", (app_id,)
+            "SELECT status, submission_type, has_cover_letter FROM applications WHERE id = ?;",
+            (app_id,),
         ).fetchone()
         assert row["status"] == "pending"
+        assert row["submission_type"] == "assisted_browser"
+        assert row["has_cover_letter"] == 1
 
         # Verify automation_jobs has a ready job for this app_id
         job_row = conn.execute(
@@ -435,6 +521,52 @@ def test_requeue_endpoint_enqueues_and_syncs_sqlite(client):
         ).fetchone()
         assert job_row is not None
         assert job_row["state"] == "ready"
+    finally:
+        conn.close()
+
+
+def test_update_tracker_job_status_preserves_metadata(client, tmp_path, monkeypatch):
+    test_db = tmp_path / "test_status.db"
+    monkeypatch.setenv("JOB_APPLIER_DB_PATH", str(test_db))
+    from job_applier.db import get_connection, init_db, upsert_application
+
+    init_db(test_db)
+    app_id = "test_status_app_1"
+    job_url = "https://example.com/status-update-job"
+    upsert_application(
+        app_id=app_id,
+        company="Status Acme Corp",
+        title="Staff Engineer",
+        job_url=job_url,
+        status="applied",
+        submission_type="assisted_browser",
+        has_cover_letter=True,
+        custom_path=test_db,
+    )
+
+    response = client.post(
+        "/api/tracker/update-status",
+        json={
+            "job_url": job_url,
+            "status": "interviewing",
+            "notes": "First round scheduled",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "success"
+
+    conn = get_connection(test_db)
+    try:
+        row = conn.execute(
+            "SELECT status, notes, submission_type, has_cover_letter FROM applications WHERE id = ?;",
+            (app_id,),
+        ).fetchone()
+        assert row["status"] == "interviewing"
+        assert row["notes"] == "First round scheduled"
+        assert row["submission_type"] == "assisted_browser"
+        assert row["has_cover_letter"] == 1
+    finally:
+        conn.close()
 
 
 def test_batch_requeue_endpoint(client):

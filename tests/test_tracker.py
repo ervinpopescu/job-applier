@@ -1,6 +1,9 @@
 from job_applier.tracker import (  # type: ignore[import-not-found]
+    export_tracker_csv,
     get_tracker_stats,
     record_application,
+    remove_from_tracker,
+    update_status,
 )
 
 
@@ -69,3 +72,38 @@ def test_tracker_update_existing_url(tmp_path):
     assert len(df) == 1
     assert df.iloc[0]["status"] == "applied"
     assert df.iloc[0]["notes"] == "Applied via assisted browser"
+
+
+def test_tracker_export_and_update(tmp_path):
+    tracker_csv = tmp_path / "test_tracker.csv"
+    job_url = "https://example.com/job-export-test"
+
+    record_application(
+        company="Datadog",
+        title="Site Reliability Engineer",
+        job_url=job_url,
+        status="pending",
+        custom_path=tracker_csv,
+    )
+
+    # Export CSV
+    csv_out = export_tracker_csv(custom_path=tracker_csv)
+    assert "Datadog" in csv_out
+    assert "Site Reliability Engineer" in csv_out
+
+    # Update status via update_status
+    updated = update_status(
+        job_url=job_url,
+        status="applied",
+        notes="Updated notes",
+        custom_path=tracker_csv,
+    )
+    assert updated is True
+
+    # Verify updated in export
+    csv_updated = export_tracker_csv(custom_path=tracker_csv)
+    assert "applied" in csv_updated
+
+    # Remove/reset from tracker
+    df_after_remove = remove_from_tracker(job_url=job_url, custom_path=tracker_csv)
+    assert df_after_remove.iloc[0]["status"] == "pending"

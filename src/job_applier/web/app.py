@@ -72,10 +72,10 @@ from job_applier.sync import (  # type: ignore[import-not-found]
     import_bundle,
 )
 from job_applier.tracker import (  # type: ignore[import-not-found]
-    get_tracker_file,
     get_tracker_stats,
     load_tracker,
     record_application,
+    update_status,
 )
 from job_applier.utils import get_project_root, parse_app_folder_info
 
@@ -471,6 +471,10 @@ def list_applications(
     status: str | None = Query(
         None, description="Filter by status (e.g. pending, applied)"
     ),
+    filter: str | None = Query(
+        None,
+        description="Unified status/scope filter: all, queued, action_required, pending, applied, skipped, failed",
+    ),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     queue_only: bool = Query(
@@ -478,13 +482,15 @@ def list_applications(
         description="Return only applications backed by an automation queue job",
     ),
 ) -> dict[str, Any]:
-    """Lists queue-backed applications by default; set queue_only=false for legacy inventory."""
+    """Lists applications with unified scope filtering and queue state directly from SQLite."""
+    effective_scope = filter.strip().lower() if filter else None
     db_res = get_applications(
         status=status,
         search=search,
         limit=limit,
         offset=offset,
-        queue_only=queue_only,
+        queue_only=queue_only if effective_scope is None else False,
+        filter_scope=effective_scope,
     )
     total = db_res["total"]
     items = []
@@ -529,13 +535,25 @@ def list_applications(
                 "pdf_url": pdf_url,
                 "created_at": r.get("created_at", ""),
                 "automation_state": r.get("automation_state"),
+                "job_state": r.get("job_state") or r.get("automation_state"),
                 "job_id": r.get("job_id"),
+                "lease_owner": r.get("lease_owner"),
+                "retry_count": r.get("retry_count") or 0,
+                "checkpoint": r.get("checkpoint"),
+                "attempt_status": r.get("attempt_status"),
+                "error_message": r.get("error_message"),
+                "folder_name": folder_name,
                 "has_artifacts": bool(r.get("has_artifacts", True)),
             }
         )
 
     # Legacy inventory fallback is never mixed into the automation queue response.
-    if not queue_only and total == 0 and output_apps_dir.exists():
+    if (
+        effective_scope is None
+        and not queue_only
+        and total == 0
+        and output_apps_dir.exists()
+    ):
         folders = sorted(
             [d for d in output_apps_dir.iterdir() if d.is_dir()],
             key=lambda d: d.stat().st_mtime,
@@ -568,12 +586,16 @@ def list_applications(
                 }
             )
 
+    scope = db_res.get("scope") or (
+        "queue" if (queue_only and not effective_scope) else "legacy_inventory"
+    )
     return {
         "items": items,
         "total": total,
         "offset": offset,
         "limit": limit,
-        "scope": "queue" if queue_only else "legacy_inventory",
+        "scope": scope,
+        "counts": db_res.get("counts", {}),
     }
 
 
@@ -932,11 +954,10 @@ def cleanup_applications(body: CleanupRequest) -> dict[str, Any]:
 
 @app.post("/api/applications/clear-failed")
 def clear_failed_applications() -> dict[str, Any]:
-    """Removes all application packages that failed submission from the queue and tracker CSV."""
+    """Removes all application packages that failed submission from the queue and SQLite."""
     if not output_apps_dir.exists():
         return {"status": "success", "removed_count": 0, "remaining_count": 0}
 
-    tracker_f = get_tracker_file()
     df = load_tracker()
 
     failed_urls = set()
@@ -993,16 +1014,20 @@ def clear_failed_applications() -> dict[str, Any]:
             except Exception as e:
                 print(f"Notice deleting failed folder {folder.name}: {e}")
 
-    # Also clean up failed records from the tracker CSV (always purge the database rows, even if folders are already missing)
+    # Also clean up failed records from SQLite applications table
     db_removed_count = 0
-    if not df.empty and "status" in df.columns:
-        initial_rows = len(df)
-        filtered_df = df[~df["status"].isin(["failed", "validation_failed"])]
-        db_removed_count = initial_rows - len(filtered_df)
+    try:
+        conn = get_connection()
         try:
-            filtered_df.to_csv(tracker_f, index=False)
-        except Exception as e:
-            print(f"Notice saving tracker after clear: {e}")
+            with conn:
+                cursor = conn.execute(
+                    "DELETE FROM applications WHERE LOWER(status) IN ('failed', 'validation_failed');"
+                )
+                db_removed_count = cursor.rowcount
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"Notice purging failed applications from SQLite: {e}")
 
     remaining = sum(1 for d in output_apps_dir.iterdir() if d.is_dir())
     message = (
@@ -2095,12 +2120,26 @@ def get_tracker_data(status: str | None = Query(None)) -> dict[str, Any]:
     }
 
 
+@app.get("/api/tracker/export")
+def export_tracker_csv_endpoint() -> Response:
+    """Streams a dynamically generated CSV export of all applications directly from SQLite."""
+    from job_applier.tracker import export_tracker_csv
+
+    csv_data = export_tracker_csv()
+    return Response(
+        content=csv_data,
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": 'attachment; filename="applications_tracker.csv"',
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+        },
+    )
+
+
 @app.post("/api/tracker/update-status")
 def update_tracker_job_status(body: StatusUpdateRequest) -> dict[str, str]:
     """Updates status for a tracked job (e.g. interviewing, offered, rejected)."""
-    record_application(
-        company="",
-        title="",
+    update_status(
         job_url=body.job_url,
         status=body.status,
         notes=body.notes,
@@ -2160,7 +2199,7 @@ def _requeue_single_item(
 ) -> dict[str, Any]:
     """Moves an application to applications/, sets SQLite status to pending, and enqueues to automation_jobs."""
     from job_applier.automation.queue import enqueue_job
-    from job_applier.tracker import detect_platform_from_url, record_application
+    from job_applier.tracker import detect_platform_from_url
 
     init_db()
     conn = get_connection()
@@ -2277,19 +2316,6 @@ def _requeue_single_item(
                 )
     finally:
         conn.close()
-
-    # Update applications_tracker.csv
-    try:
-        record_application(
-            company=company,
-            title=title,
-            job_url=final_job_url,
-            status="pending",
-            platform=platform,
-            notes="Sent back to queue from tracker",
-        )
-    except Exception as e:
-        print(f"Warning: Failed to update tracker CSV on requeue: {e}")
 
     # Enroll in automation_jobs
     job_id = None

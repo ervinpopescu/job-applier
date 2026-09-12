@@ -737,62 +737,156 @@ def get_applications(
     offset: int = 0,
     custom_path: Path | None = None,
     queue_only: bool = False,
+    filter_scope: str | None = None,
 ) -> dict[str, Any]:
-    """Queries applications, optionally restricted to automation-backed queue jobs."""
+    """Queries applications with unified status/scope filtering and joined queue/attempt metadata."""
     init_db(custom_path)
     conn = get_connection(custom_path)
 
     s_term = f"%{search.strip().lower()}%" if search else ""
     st_clean = status.strip() if status else ""
+    scope_clean = filter_scope.strip().lower() if filter_scope else ""
 
     with _DB_LOCK:
         try:
-            where_clauses: list[str] = []
-            params: list[Any] = []
-            job_join = ""
-            if queue_only:
-                job_join = """
-                    JOIN automation_jobs queue_job ON queue_job.app_id = a.id
-                        AND queue_job.id = (
-                            SELECT id FROM automation_jobs
-                            WHERE app_id = a.id
-                            ORDER BY created_at DESC, id DESC
-                            LIMIT 1
-                        )
+            if scope_clean:
+                effective_scope = scope_clean
+            elif queue_only:
+                effective_scope = "queue"
+            else:
+                effective_scope = "legacy_inventory"
+
+            total_row = conn.execute(
                 """
-                where_clauses.append("LOWER(a.status) NOT IN ('dismissed', 'skipped')")
-                where_clauses.append("LOWER(queue_job.state) != 'skipped'")
-
-            if st_clean:
-                where_clauses.append("LOWER(a.status) = LOWER(?)")
-                params.append(st_clean)
-
-            if s_term:
-                where_clauses.append(
-                    "(LOWER(a.company) LIKE ? OR LOWER(a.title) LIKE ?)"
-                )
-                params.extend([s_term, s_term])
-
-            where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-
-            count_sql = f"SELECT COUNT(*) FROM applications a {job_join} {where_sql};"
-            total_row = conn.execute(count_sql, params).fetchone()
-            total = total_row[0] if total_row else 0
-
-            query_sql = f"""
-                SELECT a.*, j.state as automation_state, j.id as job_id
+                SELECT COUNT(*)
                 FROM applications a
-                {job_join}
                 LEFT JOIN automation_jobs j ON j.app_id = a.id
                     AND j.id = (SELECT id FROM automation_jobs WHERE app_id = a.id ORDER BY created_at DESC, id DESC LIMIT 1)
-                {where_sql}
+                WHERE (? = '' OR (
+                    (? = 'queued' AND j.id IS NOT NULL AND LOWER(a.status) NOT IN ('dismissed', 'skipped') AND LOWER(j.state) != 'skipped')
+                    OR (? = 'queue' AND j.id IS NOT NULL AND LOWER(a.status) NOT IN ('dismissed', 'skipped') AND LOWER(j.state) != 'skipped')
+                    OR (? = 'action_required' AND j.id IS NOT NULL AND LOWER(j.state) IN ('auth_required', 'mfa_required', 'captcha_required', 'manual_takeover', 'site_changed', 'unknown_question', 'action_required', 'ambiguous_submission'))
+                    OR (? = 'pending' AND LOWER(a.status) IN ('pending', 'auto_filled'))
+                    OR (? = 'applied' AND (LOWER(a.status) = 'applied' OR LOWER(COALESCE(j.state, '')) = 'applied'))
+                    OR (? = 'skipped' AND (LOWER(a.status) IN ('skipped', 'dismissed') OR LOWER(COALESCE(j.state, '')) = 'skipped'))
+                    OR (? = 'failed' AND (LOWER(a.status) IN ('failed', 'validation_failed') OR LOWER(COALESCE(j.state, '')) = 'failed_permanent'))
+                    OR (? = 'all' AND LOWER(a.status) != 'dismissed')
+                    OR (? = 'legacy_inventory')
+                ))
+                AND (? = '' OR LOWER(a.status) = LOWER(?))
+                AND (? = '' OR (LOWER(a.company) LIKE ? OR LOWER(a.title) LIKE ? OR LOWER(a.job_url) LIKE ?));
+                """,
+                (
+                    effective_scope,
+                    effective_scope,
+                    effective_scope,
+                    effective_scope,
+                    effective_scope,
+                    effective_scope,
+                    effective_scope,
+                    effective_scope,
+                    effective_scope,
+                    effective_scope,
+                    st_clean,
+                    st_clean,
+                    s_term,
+                    s_term,
+                    s_term,
+                    s_term,
+                ),
+            ).fetchone()
+            total = total_row[0] if total_row else 0
+
+            rows = conn.execute(
+                """
+                SELECT a.*,
+                       j.state as automation_state,
+                       j.state as job_state,
+                       j.id as job_id,
+                       j.lease_owner as lease_owner,
+                       j.checkpoint as checkpoint,
+                       j.attempt_count as retry_count,
+                       j.error_code as error_code,
+                       j.error_message as error_message,
+                       att.outcome as attempt_status,
+                       att.attempt_number as attempt_number
+                FROM applications a
+                LEFT JOIN automation_jobs j ON j.app_id = a.id
+                    AND j.id = (SELECT id FROM automation_jobs WHERE app_id = a.id ORDER BY created_at DESC, id DESC LIMIT 1)
+                LEFT JOIN application_attempts att ON att.app_id = a.id
+                    AND att.id = (SELECT id FROM application_attempts WHERE app_id = a.id ORDER BY created_at DESC, id DESC LIMIT 1)
+                WHERE (? = '' OR (
+                    (? = 'queued' AND j.id IS NOT NULL AND LOWER(a.status) NOT IN ('dismissed', 'skipped') AND LOWER(j.state) != 'skipped')
+                    OR (? = 'queue' AND j.id IS NOT NULL AND LOWER(a.status) NOT IN ('dismissed', 'skipped') AND LOWER(j.state) != 'skipped')
+                    OR (? = 'action_required' AND j.id IS NOT NULL AND LOWER(j.state) IN ('auth_required', 'mfa_required', 'captcha_required', 'manual_takeover', 'site_changed', 'unknown_question', 'action_required', 'ambiguous_submission'))
+                    OR (? = 'pending' AND LOWER(a.status) IN ('pending', 'auto_filled'))
+                    OR (? = 'applied' AND (LOWER(a.status) = 'applied' OR LOWER(COALESCE(j.state, '')) = 'applied'))
+                    OR (? = 'skipped' AND (LOWER(a.status) IN ('skipped', 'dismissed') OR LOWER(COALESCE(j.state, '')) = 'skipped'))
+                    OR (? = 'failed' AND (LOWER(a.status) IN ('failed', 'validation_failed') OR LOWER(COALESCE(j.state, '')) = 'failed_permanent'))
+                    OR (? = 'all' AND LOWER(a.status) != 'dismissed')
+                    OR (? = 'legacy_inventory')
+                ))
+                AND (? = '' OR LOWER(a.status) = LOWER(?))
+                AND (? = '' OR (LOWER(a.company) LIKE ? OR LOWER(a.title) LIKE ? OR LOWER(a.job_url) LIKE ?))
                 ORDER BY a.updated_at DESC
                 LIMIT ? OFFSET ?;
-            """
-            rows = conn.execute(query_sql, params + [limit, offset]).fetchall()
+                """,
+                (
+                    effective_scope,
+                    effective_scope,
+                    effective_scope,
+                    effective_scope,
+                    effective_scope,
+                    effective_scope,
+                    effective_scope,
+                    effective_scope,
+                    effective_scope,
+                    effective_scope,
+                    st_clean,
+                    st_clean,
+                    s_term,
+                    s_term,
+                    s_term,
+                    s_term,
+                    limit,
+                    offset,
+                ),
+            ).fetchall()
+
+            counts_row = conn.execute(
+                """
+                    SELECT
+                      COUNT(CASE WHEN LOWER(a.status) != 'dismissed' THEN 1 END) as count_all,
+                      COUNT(CASE WHEN LOWER(a.status) NOT IN ('dismissed', 'skipped') AND j.id IS NOT NULL AND LOWER(j.state) != 'skipped' THEN 1 END) as count_queued,
+                      COUNT(CASE WHEN j.id IS NOT NULL AND LOWER(j.state) IN ('auth_required', 'mfa_required', 'captcha_required', 'manual_takeover', 'site_changed', 'unknown_question', 'action_required', 'ambiguous_submission') THEN 1 END) as count_action_required,
+                      COUNT(CASE WHEN LOWER(a.status) IN ('pending', 'auto_filled') THEN 1 END) as count_pending,
+                      COUNT(CASE WHEN LOWER(a.status) = 'applied' OR (j.id IS NOT NULL AND LOWER(j.state) = 'applied') THEN 1 END) as count_applied,
+                      COUNT(CASE WHEN LOWER(a.status) IN ('skipped', 'dismissed') OR (j.id IS NOT NULL AND LOWER(j.state) = 'skipped') THEN 1 END) as count_skipped,
+                      COUNT(CASE WHEN LOWER(a.status) IN ('failed', 'validation_failed') OR (j.id IS NOT NULL AND LOWER(j.state) = 'failed_permanent') THEN 1 END) as count_failed
+                    FROM applications a
+                    LEFT JOIN automation_jobs j ON j.app_id = a.id
+                        AND j.id = (SELECT id FROM automation_jobs WHERE app_id = a.id ORDER BY created_at DESC, id DESC LIMIT 1);
+                    """
+            ).fetchone()
+            counts = {
+                "all": counts_row[0] if counts_row else 0,
+                "queued": counts_row[1] if counts_row else 0,
+                "action_required": counts_row[2] if counts_row else 0,
+                "pending": counts_row[3] if counts_row else 0,
+                "applied": counts_row[4] if counts_row else 0,
+                "skipped": counts_row[5] if counts_row else 0,
+                "failed": counts_row[6] if counts_row else 0,
+            }
 
             items = [dict(r) for r in rows]
-            return {"items": items, "total": total, "limit": limit, "offset": offset}
+            return {
+                "items": items,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "scope": effective_scope,
+                "counts": counts,
+            }
         finally:
             conn.close()
 

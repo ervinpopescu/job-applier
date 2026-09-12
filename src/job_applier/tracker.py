@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import pandas as pd
 
@@ -38,19 +37,66 @@ def get_tracker_file(custom_path: Path | None = None) -> Path:
     return tracker_file
 
 
+def _resolve_db_path(custom_path: Path | None = None) -> Path | None:
+    """Helper to resolve the SQLite database path from an optional custom path."""
+    if not custom_path:
+        return None
+    if custom_path.suffix == ".csv":
+        return custom_path.with_suffix(".db")
+    return custom_path
+
+
 def load_tracker(custom_path: Path | None = None) -> pd.DataFrame:
-    """Loads the application tracker dataframe or initializes an empty one."""
-    file_path = get_tracker_file(custom_path)
-    if file_path.exists():
+    """Loads applications from SQLite applications table into a tracker DataFrame."""
+    from job_applier.db import get_connection, init_db
+
+    db_path = _resolve_db_path(custom_path)
+    try:
+        init_db(db_path)
+        conn = get_connection(db_path)
         try:
-            df = pd.read_csv(file_path, dtype=str)
-            # Ensure all standard columns exist
+            rows = conn.execute(
+                """
+                SELECT
+                    updated_at as timestamp,
+                    company,
+                    title,
+                    job_url,
+                    platform,
+                    status,
+                    submission_type,
+                    cv_filename as cv_path,
+                    proof_screenshot as proof_path,
+                    notes,
+                    folder_name,
+                    id
+                FROM applications
+                WHERE LOWER(status) != 'dismissed'
+                ORDER BY updated_at DESC;
+                """
+            ).fetchall()
+            if rows:
+                data = [dict(r) for r in rows]
+                df = pd.DataFrame(data)
+                for col in TRACKER_COLUMNS:
+                    if col not in df.columns:
+                        df[col] = ""
+                return df.fillna("")
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"Notice loading tracker from SQLite: {e}")
+
+    # Fallback to legacy CSV if custom_path explicitly points to an existing CSV file
+    if custom_path and custom_path.exists() and custom_path.suffix == ".csv":
+        try:
+            df = pd.read_csv(custom_path, dtype=str)
             for col in TRACKER_COLUMNS:
                 if col not in df.columns:
                     df[col] = ""
             return df.fillna("")
-        except Exception as e:
-            print(f"Warning: Could not read tracker file: {e}")
+        except Exception:
+            pass
 
     return pd.DataFrame({col: pd.Series(dtype="object") for col in TRACKER_COLUMNS})
 
@@ -105,109 +151,142 @@ def record_application(
     notes: str = "",
     custom_path: Path | None = None,
 ) -> pd.DataFrame:
-    """Records or updates an application entry in the tracker."""
-    tracker_file = get_tracker_file(custom_path)
-    df = load_tracker(custom_path)
+    """Records or updates an application entry in SQLite applications table."""
+    from job_applier.db import get_connection, init_db, upsert_application
+
+    db_path = _resolve_db_path(custom_path)
 
     # Auto-detect platform from URL if it's Generic
     effective_platform = platform.strip()
     if effective_platform == "Generic" and job_url.strip():
         effective_platform = detect_platform_from_url(job_url)
 
-    new_row = {
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "company": company.strip(),
-        "title": title.strip(),
-        "job_url": job_url.strip(),
-        "platform": effective_platform,
-        "status": status.strip(),
-        "submission_type": submission_type.strip(),
-        "cv_path": str(cv_path).strip(),
-        "proof_path": str(proof_path).strip(),
-        "notes": notes.strip(),
-    }
+    app_id = (
+        f"{company}_{title}".replace(" ", "_")
+        if company
+        else (Path(cv_path).parent.name if cv_path else f"job_{abs(hash(job_url))}")
+    )
+    if not app_id or app_id == ".":
+        app_id = f"job_{abs(hash(job_url))}"
 
-    # Do not create an entirely empty row
-    if not job_url.strip() and not company.strip() and not title.strip():
-        return df
+    # If already in SQLite by job_url, reuse existing app_id
+    if job_url.strip():
+        try:
+            init_db(db_path)
+            conn = get_connection(db_path)
+            try:
+                row = conn.execute(
+                    "SELECT id FROM applications WHERE job_url = ? LIMIT 1;",
+                    (job_url.strip(),),
+                ).fetchone()
+                if row:
+                    app_id = row[0]
+            finally:
+                conn.close()
+        except Exception:
+            pass
 
-    # If already in tracker by job_url, update existing row
-    updated = False
-    if job_url and "job_url" in df.columns and len(df) > 0:
-        mask = df["job_url"] == job_url
-        if mask.any():
-            for k, v in new_row.items():
-                # Only overwrite metadata if new value is non-empty
-                if v != "" or k in ["status", "notes", "timestamp", "submission_type"]:
-                    if v != "" or k == "notes":
-                        df.loc[mask, k] = v
-            updated = True
-
-    if not updated:
-        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-
-    try:
-        df.to_csv(tracker_file, index=False)
-    except Exception as e:
-        print(f"Error saving to tracker file: {e}")
+    cv_filename = Path(cv_path).name if cv_path else ""
+    folder_name = (
+        Path(cv_path).parent.name
+        if cv_path and Path(cv_path).parent.name != "."
+        else app_id
+    )
 
     try:
-        from job_applier.db import upsert_application
-
-        app_id = (
-            f"{company}_{title}".replace(" ", "_")
-            if company
-            else (Path(cv_path).parent.name if cv_path else f"job_{abs(hash(job_url))}")
-        )
-        if not app_id or app_id == ".":
-            app_id = f"job_{abs(hash(job_url))}"
-
         upsert_application(
             app_id=app_id,
-            company=company,
-            title=title,
-            job_url=job_url,
+            company=company.strip(),
+            title=title.strip(),
+            job_url=job_url.strip(),
             platform=effective_platform,
-            status=status,
-            submission_type=submission_type,
-            cv_filename=Path(cv_path).name if cv_path else "",
-            proof_screenshot=proof_path,
-            notes=notes,
+            status=status.strip(),
+            submission_type=submission_type.strip(),
+            cv_filename=cv_filename,
+            proof_screenshot=str(proof_path).strip(),
+            notes=notes.strip(),
+            folder_name=folder_name,
+            custom_path=db_path,
         )
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Error saving application to SQLite: {e}")
 
-    return df
+    return load_tracker(custom_path)
+
+
+def update_status(
+    job_url: str,
+    status: str,
+    notes: str = "",
+    custom_path: Path | None = None,
+) -> bool:
+    """Updates status for an application in SQLite applications table."""
+    from job_applier.db import update_status_by_url
+
+    db_path = _resolve_db_path(custom_path)
+    return update_status_by_url(
+        job_url=job_url,
+        status=status,
+        notes=notes,
+        custom_path=db_path,
+    )
 
 
 def remove_from_tracker(job_url: str, custom_path: Path | None = None) -> pd.DataFrame:
-    """Removes a job entry from the tracker CSV (e.g. when requeued back to pending)."""
-    tracker_file = get_tracker_file(custom_path)
-    df = load_tracker(custom_path)
-    if not df.empty and job_url and "job_url" in df.columns:
-        filtered = df[df["job_url"].str.strip() != job_url.strip()]
-        df = cast(pd.DataFrame, filtered)
+    """Resets application status in SQLite applications table."""
+    from job_applier.db import get_connection, init_db
+
+    db_path = _resolve_db_path(custom_path)
+    try:
+        init_db(db_path)
+        conn = get_connection(db_path)
         try:
-            df.to_csv(tracker_file, index=False)
-        except Exception as e:
-            print(f"Error saving to tracker file: {e}")
-    return df
+            with conn:
+                conn.execute(
+                    "UPDATE applications SET status = 'pending', updated_at = datetime('now') WHERE job_url = ?;",
+                    (job_url.strip(),),
+                )
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"Notice updating status on remove_from_tracker: {e}")
+
+    return load_tracker(custom_path)
 
 
 def cleanup_tracker(custom_path: Path | None = None) -> pd.DataFrame:
-    """Removes invalid, empty, or requeued rows from the tracker CSV."""
-    tracker_file = get_tracker_file(custom_path)
-    df = load_tracker(custom_path)
-    if not df.empty and "job_url" in df.columns:
-        # Filter out empty rows and rows that were marked auto_filled/pending
-        valid = (df["job_url"].str.strip() != "") & (df["status"] != "auto_filled")
-        filtered = df[valid]
-        df = cast(pd.DataFrame, filtered)
+    """Removes invalid or empty applications from SQLite applications table."""
+    from job_applier.db import get_connection, init_db
+
+    db_path = _resolve_db_path(custom_path)
+    try:
+        init_db(db_path)
+        conn = get_connection(db_path)
         try:
-            df.to_csv(tracker_file, index=False)
-        except Exception as e:
-            print(f"Error saving to tracker file: {e}")
-    return df
+            with conn:
+                conn.execute(
+                    "DELETE FROM applications WHERE job_url = '' OR job_url IS NULL;"
+                )
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"Notice cleaning tracker in SQLite: {e}")
+
+    return load_tracker(custom_path)
+
+
+def export_tracker_csv(
+    custom_path: Path | None = None,
+    output_path: Path | None = None,
+) -> str:
+    """Dynamically generates a CSV export from SQLite applications rows."""
+    df = load_tracker(custom_path)
+    csv_string = df.to_csv(index=False)
+    if output_path:
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(csv_string, encoding="utf-8")
+    return csv_string
 
 
 def get_tracker_stats(custom_path: Path | None = None) -> dict[str, Any]:
