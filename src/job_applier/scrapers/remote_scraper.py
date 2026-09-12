@@ -18,47 +18,82 @@ def scrape_remote_jobs(
     region_scope: RegionScope | None = None,
     emea_only: bool = True,
 ) -> pd.DataFrame:
-    """Scrapes remote tech jobs via Jobicy and RemoteOK APIs configured by regional scope."""
+    """
+    Scrapes remote tech opportunities directly from employer listings via RemoteOK API.
+    Jobicy is intentionally excluded because it serves indirect aggregator landing pages.
+    """
     scope = region_scope or (
         get_default_region_scope() if emea_only else RegionScope(region="GLOBAL")
     )
     matched_jobs: list[dict[str, Any]] = []
-    term_lower = search_term.lower()
-    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+    term_lower = (search_term or "").strip().lower()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    }
 
-    # 1. Jobicy API
+    # Query RemoteOK API with optional tag filter
     try:
-        geo_param = scope.get_jobicy_geo_param()
-        url = f"https://jobicy.com/api/v2/remote-jobs?count={min(count, 50)}{geo_param}"
-        resp = requests.get(url, headers=headers, timeout=6)
+        tag_slug = term_lower.replace(" ", "-") if term_lower else ""
+        url = (
+            f"https://remoteok.com/api?tag={tag_slug}"
+            if tag_slug
+            else "https://remoteok.com/api"
+        )
+        resp = requests.get(url, headers=headers, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
-            for j in data.get("jobs", []):
-                title = j.get("jobTitle", "")
-                title_lower = title.lower()
-                desc = j.get("jobDescription", "")
-                clean_desc = re.sub(r"<[^>]+>", " ", desc).strip()
-                job_geo = j.get("jobGeo", "Remote")
+            if isinstance(data, list):
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    # Skip metadata / legal entry
+                    if not item.get("id") or not item.get("company"):
+                        continue
 
-                if term_lower and not any(
-                    kw in title_lower for kw in term_lower.split()
-                ):
-                    continue
+                    title = item.get("position", "")
+                    title_lower = title.lower()
+                    company = item.get("company", "Unknown")
+                    location = item.get("location", "Remote") or "Remote"
+                    desc = item.get("description", "")
+                    clean_desc = re.sub(r"<[^>]+>", " ", desc).strip()
+                    tags = [
+                        t.lower() for t in item.get("tags", []) if isinstance(t, str)
+                    ]
 
-                is_ok, _ = scope.is_compatible(job_geo, clean_desc)
-                if not is_ok:
-                    continue
+                    # Validate regional scope (EMEA/location)
+                    is_ok, _ = scope.is_compatible(location, clean_desc)
+                    if not is_ok:
+                        continue
 
-                matched_jobs.append(
-                    {
-                        "site": "jobicy_remote",
-                        "company": j.get("companyName", "Unknown"),
-                        "title": title,
-                        "location": job_geo,
-                        "job_url": j.get("url", ""),
-                        "description": clean_desc[:4000],
-                    }
-                )
+                    # Filter by search_term in title, tags, or description
+                    if term_lower:
+                        term_words = term_lower.split()
+                        matches_term = (
+                            any(w in title_lower for w in term_words)
+                            or any(w in tags for w in term_words)
+                            or any(w in clean_desc.lower() for w in term_words)
+                        )
+                        if not matches_term:
+                            continue
+
+                    # Direct apply URL from RemoteOK
+                    job_url = item.get("apply_url") or item.get("url") or ""
+                    if not job_url:
+                        continue
+
+                    matched_jobs.append(
+                        {
+                            "site": "remoteok_remote",
+                            "company": company,
+                            "title": title,
+                            "location": location,
+                            "job_url": job_url,
+                            "description": clean_desc[:4000],
+                        }
+                    )
+                    if len(matched_jobs) >= count:
+                        break
     except requests.RequestException:
         pass
 
