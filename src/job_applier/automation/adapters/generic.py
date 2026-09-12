@@ -22,6 +22,7 @@ from job_applier.automation.adapters.models import (
     QuestionType,
     ValidationError,
 )
+from job_applier.automation.adapters.semantic import accessible_label
 from job_applier.automation.candidate_profile import CandidateProfile
 
 logger = logging.getLogger("job_applier.adapters.generic")
@@ -37,7 +38,7 @@ class GenericFormAdapter(BaseATSAdapter):
     """
 
     adapter_name: str = "generic"
-    adapter_version: str = "1.0.0"
+    adapter_version: str = "1.1.0"
     can_submit: bool = False
     display_name: str = "Generic Form (Fill-Only)"
 
@@ -58,12 +59,28 @@ class GenericFormAdapter(BaseATSAdapter):
                 f_id = (
                     inp.get_attribute("id") or inp.get_attribute("name") or f"input_{i}"
                 )
+                tag = inp.evaluate("(e) => e.tagName.toLowerCase()")
+                input_type = (inp.get_attribute("type") or "").lower()
+                if tag == "select":
+                    q_type = QuestionType.SELECT
+                elif tag == "textarea":
+                    q_type = QuestionType.TEXTAREA
+                elif input_type == "file":
+                    q_type = QuestionType.FILE
+                elif input_type == "radio":
+                    q_type = QuestionType.RADIO
+                elif input_type == "checkbox":
+                    q_type = QuestionType.CHECKBOX
+                else:
+                    q_type = QuestionType.TEXT
                 questions.append(
                     QuestionField(
                         field_id=f_id,
-                        label=f_id,
-                        question_type=QuestionType.TEXT,
-                        required=inp.get_attribute("required") is not None,
+                        label=accessible_label(inp) or f_id,
+                        question_type=q_type,
+                        required=inp.get_attribute("required") is not None
+                        or inp.get_attribute("aria-required") == "true",
+                        selector=f"#{f_id}" if inp.get_attribute("id") else "",
                     )
                 )
         except Exception:
@@ -113,18 +130,30 @@ class GenericFormAdapter(BaseATSAdapter):
         # 2. Heuristic field filling
         mappings = [
             (
-                "input[name*='first_name'], input[id*='first_name']",
+                "input[name*='first_name'], input[id*='first_name'], input[autocomplete='given-name'], input[aria-label*='First Name' i]",
                 profile.first_name,
                 "First Name",
             ),
             (
-                "input[name*='last_name'], input[id*='last_name']",
+                "input[name*='last_name'], input[id*='last_name'], input[autocomplete='family-name'], input[aria-label*='Last Name' i]",
                 profile.last_name,
                 "Last Name",
             ),
-            ("input[type='email'], input[name*='email']", profile.email, "Email"),
-            ("input[type='tel'], input[name*='phone']", profile.phone, "Phone"),
-            ("input[name*='city'], input[id*='city']", profile.city, "City"),
+            (
+                "input[type='email'], input[name*='email'], input[autocomplete='email'], input[aria-label*='Email' i]",
+                profile.email,
+                "Email",
+            ),
+            (
+                "input[type='tel'], input[name*='phone'], input[autocomplete='tel'], input[aria-label*='Phone' i]",
+                profile.phone,
+                "Phone",
+            ),
+            (
+                "input[name*='city'], input[id*='city'], input[name*='location'], input[id*='location'], input[autocomplete='address-level2'], input[aria-label*='City' i]",
+                profile.city,
+                "City",
+            ),
         ]
         for sel, val, label in mappings:
             if not val:
@@ -140,7 +169,9 @@ class GenericFormAdapter(BaseATSAdapter):
 
         # Cover letter
         if cover_letter:
-            cl = page.locator("textarea[name*='cover'], textarea[id*='cover']")
+            cl = page.locator(
+                "textarea[name*='cover'], textarea[id*='cover'], textarea[aria-label*='cover letter' i]"
+            )
             if cl.count() > 0 and cl.first.is_visible():
                 cl.first.fill(cover_letter)
                 report.cover_letter_filled = True

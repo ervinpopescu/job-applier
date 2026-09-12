@@ -24,6 +24,12 @@ from job_applier.automation.adapters.models import (
     QuestionType,
     ValidationError,
 )
+from job_applier.automation.adapters.semantic import (
+    accessible_label,
+    input_is_empty,
+    requires_manual_review,
+    select_semantic_option,
+)
 from job_applier.automation.candidate_profile import CandidateProfile
 
 logger = logging.getLogger("job_applier.adapters.greenhouse")
@@ -36,7 +42,7 @@ class GreenhouseAdapter(BaseATSAdapter):
     """
 
     adapter_name: str = "greenhouse"
-    adapter_version: str = "1.0.0"
+    adapter_version: str = "1.1.0"
     can_submit: bool = True
     display_name: str = "Greenhouse Job Board"
 
@@ -78,21 +84,26 @@ class GreenhouseAdapter(BaseATSAdapter):
             fields_map = [
                 (
                     "first_name",
-                    "#first_name, input[name*='first_name']",
+                    "#first_name, input[name*='first_name'], input[autocomplete='given-name']",
                     QuestionType.TEXT,
                     True,
                 ),
                 (
                     "last_name",
-                    "#last_name, input[name*='last_name']",
+                    "#last_name, input[name*='last_name'], input[autocomplete='family-name']",
                     QuestionType.TEXT,
                     True,
                 ),
-                ("email", "#email, input[name*='email']", QuestionType.TEXT, True),
+                (
+                    "email",
+                    "#email, input[name*='email'], input[autocomplete='email']",
+                    QuestionType.TEXT,
+                    True,
+                ),
                 ("phone", "#phone, input[name*='phone']", QuestionType.TEXT, False),
                 (
                     "resume",
-                    "#resume, input[type='file'][name*='resume']",
+                    "#resume, input[type='file'][name*='resume'], input[type='file'][id*='resume']",
                     QuestionType.FILE,
                     True,
                 ),
@@ -115,41 +126,59 @@ class GreenhouseAdapter(BaseATSAdapter):
                         )
                     )
 
-            # Discover custom fields
+            # Discover custom fields across legacy and React/ARIA Greenhouse forms.
             custom_elements = page.locator(
-                ".field, .application-question, [id^='job_application_answers_attributes_']"
+                ".field, .application-question, [id^='job_application_answers_attributes_'], "
+                "input[id^='question_'], textarea[id^='question_'], [role='combobox'][id^='question_']"
             )
             count = custom_elements.count()
+            seen_ids: set[str] = set()
             for i in range(count):
                 el = custom_elements.nth(i)
-                label_el = el.locator("label")
-                label_text = (
-                    label_el.inner_text().strip()
-                    if label_el.count() > 0
-                    else f"custom_field_{i}"
+                field_id = el.get_attribute("id") or f"custom_{i}"
+                if field_id in seen_ids:
+                    continue
+                seen_ids.add(field_id)
+                label_text = accessible_label(el) or f"custom_field_{i}"
+                is_req = (
+                    el.get_attribute("required") is not None
+                    or el.get_attribute("aria-required") == "true"
+                    or "*" in label_text
+                    or "required" in label_text.lower()
                 )
-                is_req = "*" in label_text or "required" in label_text.lower()
 
-                # Determine type
-                if el.locator("input[type='file']").count() > 0:
+                if (
+                    el.get_attribute("type") == "file"
+                    or el.locator("input[type='file']").count() > 0
+                ):
                     q_type = QuestionType.FILE
-                elif el.locator("select").count() > 0:
+                elif (
+                    el.get_attribute("role") == "combobox"
+                    or el.locator("select, [role='combobox']").count() > 0
+                ):
                     q_type = QuestionType.SELECT
-                elif el.locator("input[type='radio']").count() > 0:
+                elif (
+                    el.get_attribute("type") == "radio"
+                    or el.locator("input[type='radio']").count() > 0
+                ):
                     q_type = QuestionType.RADIO
-                elif el.locator("input[type='checkbox']").count() > 0:
+                elif (
+                    el.get_attribute("type") == "checkbox"
+                    or el.locator("input[type='checkbox']").count() > 0
+                ):
                     q_type = QuestionType.CHECKBOX
-                elif el.locator("textarea").count() > 0:
+                elif el.evaluate("(e) => e.tagName.toLowerCase()") == "textarea":
                     q_type = QuestionType.TEXTAREA
                 else:
                     q_type = QuestionType.TEXT
 
                 questions.append(
                     QuestionField(
-                        field_id=f"custom_{i}",
+                        field_id=field_id,
                         label=label_text,
                         question_type=q_type,
                         required=is_req,
+                        selector=f"#{field_id}" if el.get_attribute("id") else "",
                     )
                 )
 
@@ -200,12 +229,20 @@ class GreenhouseAdapter(BaseATSAdapter):
         # 2. Fill standard personal fields
         standard_mappings = [
             (
-                "#first_name, input[name*='first_name']",
+                "#first_name, input[name*='first_name'], input[autocomplete='given-name']",
                 profile.first_name,
                 "First Name",
             ),
-            ("#last_name, input[name*='last_name']", profile.last_name, "Last Name"),
-            ("#email, input[name*='email']", profile.email, "Email"),
+            (
+                "#last_name, input[name*='last_name'], input[autocomplete='family-name']",
+                profile.last_name,
+                "Last Name",
+            ),
+            (
+                "#email, input[name*='email'], input[autocomplete='email']",
+                profile.email,
+                "Email",
+            ),
             ("#phone, input[name*='phone']", profile.phone, "Phone"),
         ]
         for sel, val, name in standard_mappings:
@@ -223,7 +260,7 @@ class GreenhouseAdapter(BaseATSAdapter):
         # Fill cover letter if present
         if cover_letter:
             cl_loc = page.locator(
-                "#cover_letter, textarea[name*='cover_letter'], textarea[id*='cover_letter']"
+                "textarea#cover_letter, textarea[name*='cover_letter'], textarea[id*='cover_letter']"
             )
             if cl_loc.count() > 0 and cl_loc.first.is_visible():
                 try:
@@ -234,18 +271,45 @@ class GreenhouseAdapter(BaseATSAdapter):
                 except Exception as ex:
                     report.errors.append(f"Failed to fill cover letter: {ex}")
 
+        # Optional profile links are often rendered as question_* fields on new boards.
+        for sel, value, label in [
+            (
+                "input[aria-label*='LinkedIn' i], input[id^='question_'][id*='linkedin' i]",
+                profile.linkedin_url,
+                "LinkedIn",
+            ),
+            (
+                "input[aria-label*='Website' i], input[id^='question_'][id*='website' i]",
+                profile.portfolio_url or profile.github_url,
+                "Website",
+            ),
+        ]:
+            if value:
+                loc = page.locator(sel)
+                if (
+                    loc.count() > 0
+                    and loc.first.is_visible()
+                    and input_is_empty(loc.first)
+                ):
+                    loc.first.fill(value)
+                    report.fields_filled.append(label)
+                    report.answers_provenance[label] = "profile"
+
         # 3. Answer custom questions fail-closed
         custom_fields = page.locator(
-            ".field, .application-question, div[id^='custom_question']"
+            ".field, .application-question, div[id^='custom_question'], "
+            "input[id^='question_'], textarea[id^='question_'], [role='combobox'][id^='question_']"
         )
         count = custom_fields.count()
         for i in range(count):
             field_el = custom_fields.nth(i)
             try:
-                label_el = field_el.locator("label")
-                if label_el.count() == 0:
+                q_text = accessible_label(field_el)
+                if not q_text:
                     continue
-                q_text = label_el.first.inner_text().strip()
+                if requires_manual_review(q_text):
+                    report.unknown_questions.append(q_text)
+                    continue
                 if not q_text:
                     continue
 
@@ -253,7 +317,11 @@ class GreenhouseAdapter(BaseATSAdapter):
                 text_input = field_el.locator(
                     "input[type='text'], input:not([type]), textarea"
                 )
-                if text_input.count() > 0 and text_input.first.input_value():
+                if field_el.evaluate(
+                    "(e) => ['input', 'textarea'].includes(e.tagName.toLowerCase())"
+                ):
+                    text_input = field_el
+                if text_input.count() > 0 and not input_is_empty(text_input.first):
                     continue
 
                 # Collect options for dropdown or radio
@@ -287,8 +355,14 @@ class GreenhouseAdapter(BaseATSAdapter):
                         )
                         ans_value = ans_result.answer
 
-                        if select_el.count() > 0:
-                            select_el.first.select_option(label=ans_value)
+                        if (
+                            select_el.count() > 0
+                            or field_el.get_attribute("role") == "combobox"
+                        ):
+                            if not select_semantic_option(field_el, str(ans_value)):
+                                raise FormValidationError(
+                                    [f"Could not select answer for '{q_text}'"]
+                                )
                         elif radio_elements.count() > 0:
                             radio_input = field_el.locator(
                                 f"input[type='radio'][value='{ans_value}']"
@@ -342,18 +416,16 @@ class GreenhouseAdapter(BaseATSAdapter):
             except Exception as e:
                 logger.debug(f"Error processing Greenhouse custom field {i}: {e}")
 
-        # Check consent checkboxes if applicable
+        # Legal/privacy consent is intentionally never selected automatically.
         consent_boxes = page.locator(
             "input[type='checkbox'][name*='consent'], input[type='checkbox'][name*='privacy'], input[type='checkbox'][id*='gdpr']"
         )
         for c_idx in range(consent_boxes.count()):
-            cb = consent_boxes.nth(c_idx)
-            if not cb.is_checked():
-                cb.check()
-                report.fields_filled.append(f"Consent Checkbox {c_idx}")
-                report.answers_provenance[f"Consent Checkbox {c_idx}"] = (
-                    "standard_consent"
-                )
+            label = (
+                accessible_label(consent_boxes.nth(c_idx))
+                or f"Consent Checkbox {c_idx}"
+            )
+            report.unknown_questions.append(label)
 
         return report
 
@@ -377,6 +449,13 @@ class GreenhouseAdapter(BaseATSAdapter):
                 )
 
             file_input.first.set_input_files(str(resume_path.resolve()))
+
+            if cover_letter_path is not None and cover_letter_path.exists():
+                cover_input = page.locator(
+                    "#cover_letter, input[type='file'][name*='cover_letter'], input[type='file'][id*='cover_letter']"
+                )
+                if cover_input.count() > 0:
+                    cover_input.first.set_input_files(str(cover_letter_path.resolve()))
 
             # Verify that upload wasn't immediately rejected
             err = page.locator(".upload-error, .file-error, #resume-error")

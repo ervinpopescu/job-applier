@@ -17,6 +17,7 @@ from job_applier.automation.adapters import (
     get_adapter_for_url,
     list_supported_adapters,
 )
+from job_applier.automation.adapters.models import QuestionType
 from job_applier.automation.candidate_profile import CandidateProfile
 from job_applier.automation.question_solver import QuestionSolver
 
@@ -81,7 +82,7 @@ def test_adapter_registry_and_metadata():
     gh = get_adapter_by_name("greenhouse")
     assert isinstance(gh, GreenhouseAdapter)
     assert gh.can_submit is True
-    assert gh.adapter_version == "1.0.0"
+    assert gh.adapter_version == "1.1.0"
 
     generic = get_adapter_by_name("generic")
     assert isinstance(generic, GenericFormAdapter)
@@ -462,8 +463,124 @@ def test_ashby_multi_step_lifecycle(page, sample_profile, sample_cv, tmp_path):
 
 
 # =========================================================================
-# 5. Generic Form Adapter (Fill-Only Strict Protection)
+# 5. Live-shape regression fixtures (non-submitting)
 # =========================================================================
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "url"),
+    [
+        (
+            "greenhouse_canonical.html",
+            "https://job-boards.greenhouse.io/canonical/jobs/3003389",
+        ),
+        (
+            "greenhouse_relationalai.html",
+            "https://job-boards.greenhouse.io/relationalai/jobs/6175260004",
+        ),
+    ],
+)
+def test_greenhouse_live_shapes_use_semantic_fields(
+    page, sample_profile, sample_cv, tmp_path, monkeypatch, fixture_name, url
+):
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    fixture = Path(__file__).parent / "fixtures" / "ats" / fixture_name
+    page.goto(f"file://{fixture.resolve()}")
+    adapter = GreenhouseAdapter()
+
+    assert adapter.detect(url, page=page) is True
+    discovery = adapter.discover_form(page)
+    assert discovery.platform == "greenhouse"
+    assert {field.question_type for field in discovery.questions} >= {
+        QuestionType.FILE,
+        QuestionType.TEXT,
+    }
+
+    report = adapter.fill_fields(
+        page,
+        sample_profile,
+        cover_letter="Synthetic cover letter for fixture testing.",
+    )
+    assert "First Name" in report.fields_filled
+    assert "Last Name" in report.fields_filled
+    assert "Email" in report.fields_filled
+    assert "LinkedIn" in report.fields_filled
+    assert "Website" in report.fields_filled
+    privacy = page.locator("#question_privacy")
+    if privacy.count() > 0:
+        assert privacy.input_value() == ""
+        assert "Recruitment Privacy Policy" in " ".join(report.unknown_questions)
+
+    cover_letter = tmp_path / "cover-letter.txt"
+    cover_letter.write_text("Synthetic cover letter", encoding="utf-8")
+    assert adapter.upload_documents(page, sample_cv, cover_letter) is True
+    assert page.locator("#resume").evaluate("(e) => e.files.length") == 1
+
+    # The fixture has an inert submit marker; discovery/filling/upload never activate it.
+    assert page.locator("#submit_app").is_visible()
+
+
+def test_lever_quantum_metric_shape_maps_semantic_controls_without_consent(
+    page, sample_profile, sample_cv, tmp_path, monkeypatch
+):
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    fixture = Path(__file__).parent / "fixtures" / "ats" / "lever_quantummetric.html"
+    page.goto(f"file://{fixture.resolve()}")
+    adapter = LeverAdapter()
+    sample_profile.current_company = "Example Systems"
+
+    url = (
+        "https://jobs.lever.co/quantummetric/41546a4c-c536-4f4d-aabf-1f7bef72ac42/apply"
+    )
+    assert adapter.detect(url, page=page) is True
+    discovery = adapter.discover_form(page)
+    assert discovery.platform == "lever"
+    assert any(
+        field.question_type == QuestionType.RADIO for field in discovery.questions
+    )
+
+    report = adapter.fill_fields(
+        page, sample_profile, question_solver=QuestionSolver(sample_profile)
+    )
+    assert "Full Name" in report.fields_filled
+    assert "Email" in report.fields_filled
+    assert "Phone" in report.fields_filled
+    assert "Location" in report.fields_filled
+    assert "Current Company" in report.fields_filled
+    assert page.locator("input[name='sponsorship'][value='No']").is_checked()
+    assert not page.locator("input[name='consent']").is_checked()
+    assert any("consent" in q.lower() for q in report.unknown_questions)
+
+    cover_letter = tmp_path / "cover-letter.txt"
+    cover_letter.write_text("Synthetic cover letter", encoding="utf-8")
+    assert adapter.upload_documents(page, sample_cv, cover_letter) is True
+
+
+# =========================================================================
+# 6. Generic Form Adapter (Fill-Only Strict Protection)
+# =========================================================================
+
+
+def test_generic_semantic_attributes_fill_profile_fields(
+    page, sample_profile, tmp_path
+):
+    fixture = tmp_path / "generic_semantic_form.html"
+    fixture.write_text(
+        """<!doctype html><html><body>
+        <input autocomplete='given-name' aria-label='First name'>
+        <input autocomplete='family-name' aria-label='Last name'>
+        <input autocomplete='email' aria-label='Email'>
+        <input autocomplete='tel' aria-label='Phone'>
+        <input name='location' aria-label='Current location'>
+        </body></html>""",
+        encoding="utf-8",
+    )
+    page.goto(f"file://{fixture.resolve()}")
+
+    report = GenericFormAdapter().fill_fields(page, sample_profile)
+    assert report.fields_filled == ["First Name", "Last Name", "Email", "Phone", "City"]
+    assert page.locator("input[autocomplete='given-name']").input_value() == "Alex"
+    assert page.locator("input[name='location']").input_value() == "Bucharest"
 
 
 def test_generic_form_fill_only_strict_protection(
