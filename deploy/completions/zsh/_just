@@ -1,0 +1,109 @@
+#compdef just
+
+_just_services() {
+    local -a services=(
+        'web:FastAPI backend & Angular dashboard'
+        'gateway:Caddy edge reverse proxy'
+        'runtime:Playwright automator & VNC desktop runtime'
+        'cloudflared:Cloudflare Zero Trust tunnel daemon'
+        'ntfy:Push notification alert service'
+    )
+    _describe -t services 'service' services
+}
+
+_just_platforms() {
+    local -a platforms=(
+        'linkedin:LinkedIn platform'
+        'bestjobs:BestJobs Romania'
+        'ejobs:eJobs Romania'
+        'google:Google Jobs & authentication'
+    )
+    _describe -t platforms 'platform' platforms
+}
+
+_just() {
+    local curcontext="$curcontext" state line
+    typeset -A opt_args
+
+    if (( CURRENT == 2 )); then
+        source <(JUST_COMPLETE=zsh just 2>/dev/null)
+        _clap_dynamic_completer_just "$@"
+        return
+    fi
+
+    local recipe="${words[2]}"
+    case "$recipe" in
+        services-restart|services-reload|services-logs|services-pull|services-build|services-up|services-down|services-status|services-ps|up|down|reload|logs)
+            _just_services
+            return
+            ;;
+        services-exec)
+            if (( CURRENT == 3 )); then
+                _just_services
+                return
+            else
+                _command_names -e
+                return
+            fi
+            ;;
+        login)
+            if (( CURRENT == 3 )); then
+                _just_platforms
+                return
+            fi
+            ;;
+        export|import)
+            if (( CURRENT == 3 )); then
+                _files -g "*.zip"
+                return
+            fi
+            ;;
+        ops-restore)
+            if (( CURRENT == 3 )); then
+                _files -g "*.zip*(.)"
+                return
+            fi
+            ;;
+    esac
+
+    # Dynamic argument pattern extraction from justfile if present
+    if (( CURRENT > 2 )) && command -v python3 >/dev/null 2>&1; then
+        local p_idx=$(( CURRENT - 3 ))
+        local -a dyn_items
+        dyn_items=("${(@f)$(python3 -c '
+import json, sys, subprocess
+res = subprocess.run(["just", "--json"], capture_output=True, text=True)
+if res.returncode == 0:
+    data = json.loads(res.stdout)
+    rec_name = "'"$recipe"'"
+    p_idx = int("'"$p_idx"'")
+    rec = data.get("recipes", {}).get(rec_name)
+    if not rec:
+        for alias_name, target in data.get("aliases", {}).items():
+            if alias_name == rec_name:
+                rec = data.get("recipes", {}).get(target.get("target"))
+                break
+    if rec and "parameters" in rec:
+        params = rec.get("parameters", [])
+        param = params[p_idx] if p_idx < len(params) else (params[-1] if params and params[-1].get("kind") in ("star", "plus") else None)
+        if param:
+            patterns = param.get("pattern") or []
+            help_text = param.get("help") or param.get("name") or "choice"
+            for p in patterns:
+                for opt in p.split("|"):
+                    opt = opt.strip("^$")
+                    if opt:
+                        print(f"{opt}:{help_text}")
+' 2>/dev/null)}")
+        if (( ${#dyn_items[@]} > 0 )); then
+            _describe -t dyn_items 'choices' dyn_items
+            return
+        fi
+    fi
+
+    # Fallback to standard just dynamic completion
+    source <(JUST_COMPLETE=zsh just 2>/dev/null)
+    _clap_dynamic_completer_just "$@"
+}
+
+_just "$@"

@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-mkdir -p /app/data /app/output/applications /app/output/applied /app/.browser_profile
+mkdir -p /app/data /app/output/applications /app/output/applied /app/.browser_profile /app/.browser_profile_firefox
 
 seed_file() {
     destination="$1"
