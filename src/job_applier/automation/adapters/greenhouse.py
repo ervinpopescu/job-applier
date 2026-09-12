@@ -27,6 +27,8 @@ from job_applier.automation.adapters.models import (
 from job_applier.automation.adapters.semantic import (
     accessible_label,
     input_is_empty,
+    is_sensitive_or_excluded_checkbox,
+    is_standard_consent_checkbox,
     requires_manual_review,
     select_semantic_option,
 )
@@ -310,8 +312,44 @@ class GreenhouseAdapter(BaseATSAdapter):
                 if requires_manual_review(q_text):
                     report.unknown_questions.append(q_text)
                     continue
-                if not q_text:
-                    continue
+
+                # Auto-accept standard consent question controls (combobox or checkbox)
+                if is_standard_consent_checkbox(q_text):
+                    cb = field_el.locator("input[type='checkbox']")
+                    if field_el.evaluate(
+                        "(e) => e.tagName.toLowerCase() === 'input' && e.type === 'checkbox'"
+                    ):
+                        cb = field_el
+                    if cb.count() > 0:
+                        try:
+                            if not cb.first.is_checked():
+                                cb.first.check()
+                            report.fields_filled.append(q_text)
+                            report.answers_provenance[q_text] = "auto_consent"
+                            logger.info(
+                                f"Greenhouse auto-consented to checkbox: {q_text}"
+                            )
+                            continue
+                        except Exception as ex:
+                            report.errors.append(
+                                f"Failed to check consent '{q_text}': {ex}"
+                            )
+                    elif (
+                        field_el.get_attribute("role") == "combobox"
+                        or field_el.locator("select").count() > 0
+                    ):
+                        selected = False
+                        for opt_text in ["I agree", "Yes", "Agree", "I accept"]:
+                            if select_semantic_option(field_el, opt_text):
+                                report.fields_filled.append(q_text)
+                                report.answers_provenance[q_text] = "auto_consent"
+                                logger.info(
+                                    f"Greenhouse auto-consented '{opt_text}' for: {q_text}"
+                                )
+                                selected = True
+                                break
+                        if selected:
+                            continue
 
                 # Skip if already filled
                 text_input = field_el.locator(
@@ -416,16 +454,24 @@ class GreenhouseAdapter(BaseATSAdapter):
             except Exception as e:
                 logger.debug(f"Error processing Greenhouse custom field {i}: {e}")
 
-        # Legal/privacy consent is intentionally never selected automatically.
-        consent_boxes = page.locator(
-            "input[type='checkbox'][name*='consent'], input[type='checkbox'][name*='privacy'], input[type='checkbox'][id*='gdpr']"
-        )
-        for c_idx in range(consent_boxes.count()):
-            label = (
-                accessible_label(consent_boxes.nth(c_idx))
-                or f"Consent Checkbox {c_idx}"
-            )
-            report.unknown_questions.append(label)
+        # Auto-accept standard consent checkboxes across the page
+        all_checkboxes = page.locator("input[type='checkbox']")
+        for c_idx in range(all_checkboxes.count()):
+            cb = all_checkboxes.nth(c_idx)
+            cb_label = accessible_label(cb)
+            if is_standard_consent_checkbox(cb_label):
+                try:
+                    if not cb.is_checked():
+                        cb.check()
+                    name = cb_label or "Recruitment Privacy Policy"
+                    if name not in report.fields_filled:
+                        report.fields_filled.append(name)
+                        report.answers_provenance[name] = "auto_consent"
+                    logger.info(f"Greenhouse auto-consented to checkbox: {name}")
+                except Exception as ex:
+                    logger.debug(f"Failed checking Greenhouse consent checkbox: {ex}")
+            elif is_sensitive_or_excluded_checkbox(cb_label):
+                report.unknown_questions.append(cb_label or f"Consent Checkbox {c_idx}")
 
         return report
 
