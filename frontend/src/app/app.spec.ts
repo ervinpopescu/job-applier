@@ -171,7 +171,7 @@ describe('App Component - State & Degraded Mode Recovery', () => {
     expect(fixture.nativeElement.textContent).toContain('Example project');
   });
 
-  it('opens inline PDF preview on Open PDF action instead of triggering download and preserves explicit download action', () => {
+  it('provides distinct, non-duplicated controls for viewing structured resume, previewing PDF, and downloading artifact', () => {
     mockApi.getMainResume = vi.fn().mockReturnValue(
       of({
         status: 'ready',
@@ -197,52 +197,92 @@ describe('App Component - State & Degraded Mode Recovery', () => {
     app.openResumeViewer();
     fixture.detectChanges();
 
-    // Verify Open PDF button and Download PDF link exist in structured view
-    const openPdfBtn = fixture.nativeElement.querySelector(
-      'button[aria-label="Open PDF inline preview"]',
-    ) as HTMLButtonElement;
-    expect(openPdfBtn).not.toBeNull();
-    expect(openPdfBtn.textContent).toContain('Open PDF');
+    // 1. In structured view: mode tabs and exactly one download action in the header
+    const tablist = fixture.nativeElement.querySelector(
+      'div[role="tablist"][aria-label="Resume view modes"]',
+    ) as HTMLElement;
+    expect(tablist).not.toBeNull();
 
-    const downloadLink = fixture.nativeElement.querySelector(
+    const tabs = Array.from(tablist.querySelectorAll('button[role="tab"]')) as HTMLButtonElement[];
+    expect(tabs.length).toBe(2);
+    const [structuredTab, previewTab] = tabs;
+
+    expect(structuredTab.textContent?.trim()).toContain('Structured');
+    expect(structuredTab.getAttribute('aria-selected')).toBe('true');
+    expect(previewTab.textContent?.trim()).toContain('PDF Preview');
+    expect(previewTab.getAttribute('aria-selected')).toBe('false');
+
+    // Exactly one persistent Download PDF link exists in the viewer (in header)
+    const downloadLinks = fixture.nativeElement.querySelectorAll(
       'a[aria-label="Download main resume PDF"]',
-    ) as HTMLAnchorElement;
-    expect(downloadLink).not.toBeNull();
+    );
+    expect(downloadLinks.length).toBe(1);
+    const downloadLink = downloadLinks[0] as HTMLAnchorElement;
     expect(downloadLink.getAttribute('download')).toBe('main-resume.pdf');
     expect(downloadLink.getAttribute('href')).toContain('/api/resume/main.pdf?download=true');
 
-    // Clicking Open PDF must open the inline preview without triggering a download
-    openPdfBtn.click();
+    // Structured resume content is visible
+    expect(fixture.nativeElement.textContent).toContain('Synthetic Candidate');
+
+    // Verify duplicate controls are absent: no duplicate Open PDF button
+    expect(
+      fixture.nativeElement.querySelector('button[aria-label="Open PDF inline preview"]'),
+    ).toBeNull();
+
+    // 2. Switch to PDF preview via the mode switcher tab
+    previewTab.click();
     fixture.detectChanges();
 
+    expect(structuredTab.getAttribute('aria-selected')).toBe('false');
+    expect(previewTab.getAttribute('aria-selected')).toBe('true');
+
+    // PDF preview iframe is displayed
     const iframe = fixture.nativeElement.querySelector(
       'iframe[title="Main resume PDF inline preview"]',
     ) as HTMLIFrameElement;
     expect(iframe).not.toBeNull();
     expect(iframe.getAttribute('src')).toContain('/api/resume/main.pdf');
 
-    // In preview mode, the explicit download action and back button must be available
-    const previewDownloadLink = fixture.nativeElement.querySelector(
-      '.resume-pdf-preview a[aria-label="Download main resume PDF"]',
+    // In preview mode: Open in new tab is available
+    const openInNewTabLink = fixture.nativeElement.querySelector(
+      'a[aria-label="Open PDF preview in new tab"]',
     ) as HTMLAnchorElement;
-    expect(previewDownloadLink).not.toBeNull();
-    expect(previewDownloadLink.getAttribute('download')).toBe('main-resume.pdf');
-    expect(previewDownloadLink.getAttribute('href')).toContain(
-      '/api/resume/main.pdf?download=true',
-    );
+    expect(openInNewTabLink).not.toBeNull();
+    expect(openInNewTabLink.getAttribute('href')).toContain('/api/resume/main.pdf');
+    expect(openInNewTabLink.getAttribute('target')).toBe('_blank');
 
-    const backBtn = fixture.nativeElement.querySelector(
-      'button[aria-label="Back to structured resume view"]',
-    ) as HTMLButtonElement;
-    expect(backBtn).not.toBeNull();
-    backBtn.click();
+    // Verify duplicate controls are absent in preview mode:
+    // No duplicate Back to structured view button (switching is owned by the header tablist)
+    expect(
+      fixture.nativeElement.querySelector('button[aria-label="Back to structured resume view"]'),
+    ).toBeNull();
+    // No duplicate Download PDF link in preview toolbar (still exactly one in header)
+    expect(
+      fixture.nativeElement.querySelectorAll('a[aria-label="Download main resume PDF"]').length,
+    ).toBe(1);
+
+    // 3. Switch back to structured view via the mode switcher tab
+    structuredTab.click();
     fixture.detectChanges();
 
-    // Switched back to structured view
+    expect(structuredTab.getAttribute('aria-selected')).toBe('true');
+    expect(previewTab.getAttribute('aria-selected')).toBe('false');
     expect(
       fixture.nativeElement.querySelector('iframe[title="Main resume PDF inline preview"]'),
     ).toBeNull();
     expect(fixture.nativeElement.textContent).toContain('Synthetic Candidate');
+
+    // 4. Close the viewer via the dedicated close button
+    const closeBtn = fixture.nativeElement.querySelector(
+      'button[aria-label="Close main resume viewer"]',
+    ) as HTMLButtonElement;
+    expect(closeBtn).not.toBeNull();
+    closeBtn.click();
+    fixture.detectChanges();
+
+    expect(
+      fixture.nativeElement.querySelector('[aria-labelledby="resume-viewer-title"]'),
+    ).toBeNull();
   });
 
   it('renders resume viewer buttons with matching Lucide file-text icon, accessible labeling, and correct spacing', async () => {
