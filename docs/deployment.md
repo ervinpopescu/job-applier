@@ -27,7 +27,13 @@ Edit `.env` and set at least `GOOGLE_API_KEY`. Forks should also change `JOB_APP
 JOB_APPLIER_IMAGE=ghcr.io/owner/job-applier:latest
 GOOGLE_API_KEY=replace-me
 JOB_APPLIER_BIND_ADDRESS=127.0.0.1
-JOB_APPLIER_PORT=8000
+JOB_APPLIER_PORT=8001
+GATEWAY_PORT=8088
+PUBLIC_ORIGIN=https://jobs.archnet.lol
+CLOUDFLARE_TUNNEL_TOKEN=eyJh...
+CF_ACCESS_AUD=0cf8...
+CF_ACCESS_TEAM_DOMAIN=aged-sunset-0292.cloudflareaccess.com
+CF_ACCESS_ALLOWED_IDENTITIES=ervin.popescu10@gmail.com
 ```
 
 Start the application:
@@ -38,18 +44,18 @@ docker compose up -d
 docker compose ps
 ```
 
-Open it through an SSH tunnel:
+Open it through an SSH tunnel (for local inspection):
 
 ```bash
-ssh -L 8000:127.0.0.1:8000 user@server
+ssh -L 8088:127.0.0.1:8088 -L 8001:127.0.0.1:8001 user@server
 ```
 
-Then visit <http://127.0.0.1:8000> locally.
+Then visit <http://127.0.0.1:8088> (through gateway) or <http://127.0.0.1:8001> (direct web) locally.
 
 The first startup creates privacy-safe candidate and resume templates in the persistent data volume. Complete the candidate profile in the dashboard. To replace the master resume JSON while preserving container ownership:
 
 ```bash
-docker compose exec -T app sh -c 'cat > /app/data/master_resume.json' < master_resume.json
+docker compose exec -T web sh -c 'cat > /app/data/master_resume.json' < master_resume.json
 ```
 
 ## Build locally instead of using GHCR
@@ -68,13 +74,16 @@ The Docker build excludes repository `data/`, `output/`, `.env`, and `.browser_p
 
 ## Persistent data and backups
 
-Compose creates three named volumes:
+Compose creates six named volumes:
 
 - `job-applier-data` — profile, master resume, SQLite database, and tracker data
 - `job-applier-output` — generated application packages and PDFs
 - `job-applier-browser-profile` — persistent Playwright sessions
+- `job-applier-ntfy-data` — persistent notification cache and user db
+- `caddy-data` — internal reverse proxy state
+- `caddy-config` — internal reverse proxy runtime configuration
 
-Upgrades preserve all three volumes:
+Upgrades preserve all named volumes:
 
 ```bash
 docker compose pull
@@ -84,7 +93,9 @@ docker compose up -d --remove-orphans
 Create an application-level portable backup from the dashboard or with:
 
 ```bash
-curl -f http://127.0.0.1:8000/api/export -o job-applier-backup.zip
+curl -f http://127.0.0.1:8088/api/export -o job-applier-backup.zip
+# or directly from the web container port:
+# curl -f http://127.0.0.1:8001/api/export -o job-applier-backup.zip
 ```
 
 Removing the Compose stack with `docker compose down` preserves data. Adding `--volumes` permanently deletes the volumes and must only be used when intentionally resetting the installation.
@@ -97,7 +108,21 @@ Chromium receives a 1 GiB shared-memory allocation through Compose. Increase `sh
 
 ## Reverse proxy and authentication
 
-Keep `JOB_APPLIER_BIND_ADDRESS=127.0.0.1` when using Caddy, Nginx, Traefik, Cloudflare Tunnel, or Tailscale. Terminate HTTPS and require authentication at that layer. The application currently does not provide its own multi-user authentication boundary.
+For production zero-trust deployments, see the full guide in [Edge Authentication & Zero-Trust Deployment](edge_auth_deployment.md).
+
+Key architectural points:
+
+- **Canonical Origin**: `https://jobs.archnet.lol/` (with `jobs.aslan.net` and `aslan.archnet.lol/job-applier/` supported as migration/secondary aliases; root path directly targets dashboard and APIs; legacy `/job-applier` route requires full authentication and issues a permanent redirect).
+- **Topology**: `cloudflared` -> internal `gateway` (Caddy :80) -> `web:8000` / `runtime:6080` / `ntfy:80`.
+- **No Public Origin Ports**: No container ports (`8000`, `6080`, `5900`, `80`) are exposed to the public internet (`0.0.0.0`). Only loopback `127.0.0.1` binds are permitted for local inspection.
+- **Edge Access Policy**: Cloudflare Access with exact identity allowlists (`CF_ACCESS_ALLOWED_IDENTITIES`). Cryptographic RS256 JWT validation, bounded JWKS caching, and fail-closed startup verification.
+- **Gateway Viewer Authorization**: Caddy enforces `/api/auth/viewer-gate` subrequest authorization on all noVNC HTTP and WebSocket upgrade traffic.
+- **Viewer Lifetime**: Server-side WebSocket proxy terminates connection at `min(300, token_exp - now)` seconds (strict 5-minute maximum lifetime).
+- **Preserved Volumes**: `job-applier-data`, `job-applier-output`, `job-applier-browser-profile`, `job-applier-ntfy-data`, `caddy-data`, `caddy-config`.
+
+Keep `JOB_APPLIER_BIND_ADDRESS=127.0.0.1` when using Caddy, Nginx, Traefik, Cloudflare Tunnel, or Tailscale. Terminate HTTPS and require authentication at that layer.
+
+For the Hetzner Nginx alias `aslan.archnet.lol/job-applier/`, proxy to the Docker Compose web port `127.0.0.1:8001` (not the separate development port `8000`). Preserve the `/job-applier/` prefix rewrite and forwarded-prefix header so the alias uses the same authenticated web container and database as the canonical origin.
 
 Do not proxy the dashboard publicly without access control. It can expose resumes, contact details, generated documents, and authenticated browser state.
 
