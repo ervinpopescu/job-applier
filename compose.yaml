@@ -1,25 +1,69 @@
 name: job-applier
 
+networks:
+  internal-net:
+    driver: bridge
+    internal: false
+
 services:
-  app:
+  gateway:
+    image: caddy:2.9-alpine
+    restart: unless-stopped
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - "no-new-privileges:true"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    ports:
+      # Bound to loopback only on host; tunnel targets internal gateway
+      - "${GATEWAY_BIND_ADDRESS:-127.0.0.1}:${GATEWAY_PORT:-8088}:80"
+    networks:
+      - internal-net
+    depends_on:
+      - web
+      - runtime
+
+  web:
     image: ${JOB_APPLIER_IMAGE:-ghcr.io/ervinpopescu/job-applier:latest}
     build:
       context: .
     restart: unless-stopped
     init: true
+    user: "10001:10001"
+    privileged: false
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
     environment:
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.8-flash}
       JOOBLE_API_KEY: ${JOOBLE_API_KEY:-}
       JOB_APPLIER_DB_PATH: /app/data/job_applier.db
       JOB_APPLIER_TRACKER_PATH: /app/data/applications_tracker.csv
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-https://jobs.archnet.lol}
+      NTFY_URL: ${NTFY_URL:-http://ntfy:80}
+      NTFY_TOPIC: ${NTFY_TOPIC:-job-alerts}
+      NTFY_TOKEN: ${NTFY_TOKEN:-}
+      CF_ACCESS_ENABLED: ${CF_ACCESS_ENABLED:-true}
+      CF_ACCESS_AUD: ${CF_ACCESS_AUD:-}
+      CF_ACCESS_TEAM_DOMAIN: ${CF_ACCESS_TEAM_DOMAIN:-}
+      CF_ACCESS_ALLOWED_IDENTITIES: ${CF_ACCESS_ALLOWED_IDENTITIES:-ervin.popescu10@gmail.com}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-jobs.archnet.lol,jobs.aslan.net,aslan.archnet.lol,localhost,127.0.0.1,web,gateway}
     ports:
-      - "${JOB_APPLIER_BIND_ADDRESS:-127.0.0.1}:${JOB_APPLIER_PORT:-8000}:8000"
+      - "${JOB_APPLIER_BIND_ADDRESS:-127.0.0.1}:${JOB_APPLIER_PORT:-8001}:8000"
     volumes:
       - job-applier-data:/app/data
       - job-applier-output:/app/output
-      - job-applier-browser-profile:/app/.browser_profile
-    shm_size: "1gb"
+    networks:
+      - internal-net
     healthcheck:
       test:
         [
@@ -33,7 +77,92 @@ services:
       retries: 5
       start_period: 30s
 
+  runtime:
+    image: ${JOB_APPLIER_IMAGE:-ghcr.io/ervinpopescu/job-applier:latest}
+    build:
+      context: .
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    privileged: false
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    shm_size: "1gb"
+    environment:
+      JOB_APPLIER_DB_PATH: /app/data/job_applier.db
+      JOB_APPLIER_TRACKER_PATH: /app/data/applications_tracker.csv
+      JOB_APPLIER_PROFILE_DIR: /app/.browser_profile
+      JOB_APPLIER_RUNTIME_MODE: service
+      DISPLAY: ":99"
+      HOME: /tmp
+      VNC_PORT: "5900"
+      WEBSOCKIFY_PORT: "6080"
+      PROXY_PORT: "8899"
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      JOOBLE_API_KEY: ${JOOBLE_API_KEY:-}
+      NTFY_URL: ${NTFY_URL:-http://ntfy:80}
+      NTFY_TOPIC: ${NTFY_TOPIC:-job-alerts}
+      NTFY_TOKEN: ${NTFY_TOKEN:-}
+    volumes:
+      - job-applier-data:/app/data
+      - job-applier-output:/app/output
+      - job-applier-browser-profile:/app/.browser_profile
+    networks:
+      - internal-net
+    command: ["/app/.venv/bin/python", "-m", "job_applier.cli.runtime_daemon"]
+    healthcheck:
+      # Fail closed unless noVNC serves an asset and websockify completes an
+      # actual WebSocket-to-RFB handshake with the local x11vnc server.
+      test: ["CMD", "/app/.venv/bin/python", "-m", "job_applier.cli.runtime_healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    user: "10001:10001"
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    networks:
+      - internal-net
+
+  ntfy:
+    image: binwiederhier/ntfy:latest
+    restart: unless-stopped
+    user: "10001:10001"
+    command: serve
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    volumes:
+      - job-applier-ntfy-data:/var/cache/ntfy
+    environment:
+      NTFY_BASE_URL: ${NTFY_BASE_URL:-https://notify.jobs.archnet.lol}
+      NTFY_BEHIND_PROXY: "true"
+      NTFY_ATTACHMENT_CACHE_DIR: /var/cache/ntfy/attachments
+      NTFY_AUTH_FILE: /var/cache/ntfy/user.db
+      NTFY_AUTH_DEFAULT_ACCESS: ${NTFY_AUTH_DEFAULT_ACCESS:-read-write}
+      NTFY_UPSTREAM_BASE_URL: "https://ntfy.sh"
+      NTFY_VISITOR_SUBSCRIPTION_LIMIT: "30"
+      NTFY_VISITOR_REQUEST_LIMIT_BURST: "60"
+      NTFY_VISITOR_REQUEST_LIMIT_REPLENISH: "1s"
+    networks:
+      - internal-net
+
 volumes:
   job-applier-data:
   job-applier-output:
   job-applier-browser-profile:
+  job-applier-ntfy-data:
+  caddy-data:
+  caddy-config:
