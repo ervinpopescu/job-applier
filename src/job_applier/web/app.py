@@ -313,15 +313,33 @@ class AuthLoginRequest(BaseModel):
 
 
 def get_safe_app_folder(app_id: str) -> Path:
-    """Safely resolves an application folder inside output_apps_dir preventing path traversal."""
+    """Safely resolve an application's persisted artifact folder.
+
+    Application IDs and folder names can differ when a generated package receives a
+    collision suffix. The database folder mapping is authoritative; falling back to
+    the ID preserves support for legacy folder-only applications.
+    """
     safe_name = Path(app_id).name
-    folder = (output_apps_dir / safe_name).resolve()
+    folder_name = safe_name
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT folder_name FROM applications WHERE id = ?;", (app_id,)
+        ).fetchone()
+        if row and row["folder_name"]:
+            candidate = str(row["folder_name"]).strip()
+            if Path(candidate).name == candidate:
+                folder_name = candidate
+    finally:
+        conn.close()
+
     base_resolved = output_apps_dir.resolve()
-    if (
-        not str(folder).startswith(str(base_resolved))
-        or not folder.exists()
-        or not folder.is_dir()
-    ):
+    folder = (output_apps_dir / folder_name).resolve()
+    try:
+        folder.relative_to(base_resolved)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Application not found") from exc
+    if not folder.exists() or not folder.is_dir():
         raise HTTPException(status_code=404, detail="Application not found")
     return folder
 

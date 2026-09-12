@@ -76,6 +76,54 @@ def test_health(client):
     assert response.json() == {"status": "ok", "service": "job-applier"}
 
 
+def test_application_details_use_persisted_collision_folder_for_hipo_queue_row(
+    client, tmp_path, monkeypatch
+):
+    """A queue row's ID may omit the suffix used by its generated artifact folder."""
+    import importlib
+
+    from job_applier import db as db_module
+
+    app_module = importlib.import_module("job_applier.web.app")
+    db_file = tmp_path / "hipo.db"
+    output_dir = tmp_path / "applications"
+    output_dir.mkdir()
+    monkeypatch.setenv("JOB_APPLIER_DB_PATH", str(db_file))
+    monkeypatch.setattr(app_module, "output_apps_dir", output_dir)
+    db_module.init_db(db_file)
+
+    app_id = "Hipo_Employer_Software_Requirements_Engineer"
+    job_url = "https://www.hipo.ro/locuri-de-munca/locuri_de_munca/262082/"
+    folder_name = f"{app_id}_112"
+    db_module.upsert_application(
+        app_id,
+        "Hipo Employer",
+        "Software Requirements Engineer",
+        job_url,
+        platform="Hipo",
+        folder_name=folder_name,
+        cv_filename="CV_Hipo_Employer_Software_Requirements_Engineer.pdf",
+        custom_path=db_file,
+    )
+    enqueue_job(app_id, adapter="hipo", custom_path=db_file)
+
+    app_folder = output_dir / folder_name
+    app_folder.mkdir()
+    (app_folder / "APPLY_HERE.txt").write_text(job_url, encoding="utf-8")
+    (app_folder / "CV_Hipo_Employer_Software_Requirements_Engineer.pdf").write_bytes(
+        b"pdf"
+    )
+    (app_folder / "autofill_bookmarklet.txt").write_text(
+        "javascript:void(0)", encoding="utf-8"
+    )
+
+    response = client.get(f"/api/applications/{app_id}")
+
+    assert response.status_code == 200
+    assert response.json()["id"] == app_id
+    assert response.json()["job_url"] == job_url
+
+
 def test_dismiss_application_persists_and_removes_queue_card(
     client, tmp_path, monkeypatch
 ):
