@@ -120,8 +120,25 @@ def test_application_details_use_persisted_collision_folder_for_hipo_queue_row(
     response = client.get(f"/api/applications/{app_id}")
 
     assert response.status_code == 200
-    assert response.json()["id"] == app_id
-    assert response.json()["job_url"] == job_url
+    body = response.json()
+    assert body["id"] == app_id
+    assert body["job_url"] == job_url
+    assert body["cv_pdf_url"] == (
+        "/files/applications/Hipo_Employer_Software_Requirements_Engineer_112/"
+        "CV_Hipo_Employer_Software_Requirements_Engineer.pdf"
+    )
+    pdf_response = client.get(body["cv_pdf_url"])
+    assert pdf_response.status_code == 200
+    assert pdf_response.headers["content-type"] == "application/pdf"
+
+    # Legacy links using the unsuffixed application ID remain valid after a collision.
+    from job_applier.web.app import ApplicationStaticFiles
+
+    static_files = ApplicationStaticFiles(directory=str(output_dir))
+    _, stat_result = static_files.lookup_path(
+        f"{app_id}/CV_Hipo_Employer_Software_Requirements_Engineer.pdf"
+    )
+    assert stat_result is not None
 
 
 def test_dismiss_application_persists_and_removes_queue_card(
