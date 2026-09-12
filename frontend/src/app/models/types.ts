@@ -236,21 +236,37 @@ export interface CandidateProfile {
   linkedin_url: string;
   github_url: string;
   portfolio_url: string;
-  languages: string;
+  languages: string | Record<string, string>;
   current_company: string;
   current_title: string;
   years_of_experience: string;
   education_institution: string;
   education_degree: string;
-  work_authorization: string;
+  work_authorization:
+    | string
+    | {
+        authorized_in_us?: boolean;
+        authorized_in_eu?: boolean;
+        requires_sponsorship?: boolean;
+        requires_us_sponsorship?: boolean;
+        requires_eu_sponsorship?: boolean;
+      };
   sponsorship_required: string;
   notice_period: string;
-  salary_expectation: string;
-  willing_to_relocate: string;
+  salary_expectation:
+    | string
+    | {
+        minimum?: number;
+        desired?: number;
+        currency?: string;
+        period?: string;
+      };
+  willing_to_relocate: string | boolean;
   remote_preference: string;
   gender: string;
   veteran_status: string;
   disability_status: string;
+  eeo_defaults?: Record<string, string>;
   target_roles?: string[];
   target_locations?: string[];
   target_region?: string;

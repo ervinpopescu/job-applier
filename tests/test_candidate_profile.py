@@ -90,3 +90,42 @@ def test_save_candidate_profile(tmp_path):
         data = json.load(f)
     assert data["full_name"] == "Alex Brown"
     assert data["email"] == "alex@example.com"
+
+
+def test_candidate_profile_enriched_defaults_and_helpers():
+    profile = CandidateProfile(
+        salary_expectation={
+            "minimum": 60000,
+            "desired": 75000,
+            "currency": "EUR",
+            "period": "yearly",
+        },
+        work_authorization={
+            "authorized_in_us": False,
+            "authorized_in_eu": True,
+            "requires_sponsorship": False,
+        },
+        languages={"English": "Fluent", "Romanian": "Native"},
+        willing_to_relocate=False,
+        eeo_defaults={
+            "gender": "Decline to self-identify",
+            "race": "Decline to self-identify",
+            "veteran": "I am not a protected veteran",
+            "disability": "I do not have a disability",
+        },
+    )
+
+    assert profile.get_salary_desired() == 75000
+    assert profile.get_salary_minimum() == 60000
+    assert profile.get_salary_currency() == "EUR"
+    assert profile.is_authorized_to_work("Romania") is True
+    assert profile.is_authorized_to_work("United States") is False
+    assert profile.requires_visa_sponsorship("EU") is False
+    assert profile.get_language_proficiency("english") == "Fluent"
+    assert profile.get_language_proficiency("romanian") == "Native"
+    assert profile.get_language_proficiency("spanish") is None
+    assert profile.is_willing_to_relocate() is False
+    assert profile.get_eeo_answer("gender") == "Decline to self-identify"
+    assert profile.get_eeo_answer("race") == "Decline to self-identify"
+    assert profile.get_eeo_answer("veteran") == "I am not a protected veteran"
+    assert profile.get_eeo_answer("disability") == "I do not have a disability"
