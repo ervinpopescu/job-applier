@@ -95,6 +95,36 @@ class SafeStaticFiles(StaticFiles):
         await super().__call__(scope, receive, send)
 
 
+class ApplicationStaticFiles(SafeStaticFiles):
+    """Serve artifact files through both application IDs and persisted folder names."""
+
+    def lookup_path(self, path: str):
+        full_path, stat_result = super().lookup_path(path)
+        if stat_result is not None:
+            return full_path, stat_result
+
+        path_parts = Path(path).parts
+        if len(path_parts) < 2:
+            return full_path, stat_result
+
+        app_id = path_parts[0]
+        conn = get_connection()
+        try:
+            row = conn.execute(
+                "SELECT folder_name FROM applications WHERE id = ?;", (app_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row or not row["folder_name"]:
+            return full_path, stat_result
+
+        folder_name = str(row["folder_name"]).strip()
+        if Path(folder_name).name != folder_name or folder_name == app_id:
+            return full_path, stat_result
+        mapped_path = "/".join((folder_name, *path_parts[1:]))
+        return super().lookup_path(mapped_path)
+
+
 class CacheAwareStaticFiles(SafeStaticFiles):
     """Serve SPA HTML with revalidation and fingerprinted assets immutably."""
 
@@ -155,7 +185,7 @@ resume_generation_state: dict[str, Any] = {
 # Mount files directories
 app.mount(
     "/files/applications",
-    SafeStaticFiles(directory=str(output_apps_dir)),
+    ApplicationStaticFiles(directory=str(output_apps_dir)),
     name="applications_files",
 )
 app.mount(
@@ -651,16 +681,16 @@ def get_application(app_id: str) -> dict[str, Any]:
         "title": info["title"],
         "job_url": info["job_url"],
         "cv_filename": info["cv_name"],
-        "cv_pdf_url": f"/files/applications/{app_id}/{info['cv_name']}"
+        "cv_pdf_url": f"/files/applications/{app_folder.name}/{info['cv_name']}"
         if info["cv_name"] != "None"
         else "",
         "cover_letter": info["cover_letter_text"],
         "tailored_resume": tailored_data,
         "bookmarklet": bookmarklet_str,
-        "proof_screenshot_url": f"/files/applications/{app_id}/submission_proof.png"
+        "proof_screenshot_url": f"/files/applications/{app_folder.name}/submission_proof.png"
         if proof_img.exists()
         else "",
-        "fail_screenshot_url": f"/files/applications/{app_id}/submission_failed.png"
+        "fail_screenshot_url": f"/files/applications/{app_folder.name}/submission_failed.png"
         if fail_img.exists()
         else "",
     }
