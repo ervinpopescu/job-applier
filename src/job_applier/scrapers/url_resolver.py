@@ -39,6 +39,8 @@ def is_direct_ats_url(url: str) -> bool:
             "ejobs.ro",
             "undelucram.ro",
             "jooble.org",
+            "jobicy.com",
+            "jobicy.",
         ]
     )
 
