@@ -320,7 +320,7 @@
               type="button"
               role="tab"
               [attr.aria-selected]="resumeViewerMode() === 'preview'"
-              (click)="openPdfPreview()"
+              (click)="setResumeViewerMode('preview')"
               [class]="
                 resumeViewerMode() === 'preview'
                   ? 'bg-slate-800 text-white shadow-sm'
@@ -332,6 +332,18 @@
               <span>PDF Preview</span>
             </button>
           </div>
+
+          <a
+            *ngIf="resumeArtifactDownloadUrl()"
+            [href]="resumeArtifactDownloadUrl()"
+            download="main-resume.pdf"
+            class="flex items-center gap-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 px-3 py-1.5 text-xs font-semibold text-slate-200 transition"
+            title="Download main resume PDF"
+            aria-label="Download main resume PDF"
+          >
+            <app-icon name="download" className="h-3.5 w-3.5"></app-icon>
+            <span>Download PDF</span>
+          </a>
 
           <button
             type="button"
@@ -384,45 +396,19 @@
         *ngIf="resumeViewerMode() === 'preview' && resumeArtifactUrl()"
         class="resume-pdf-preview flex flex-col min-h-[60vh] h-[72vh]"
       >
-        <div
-          class="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/80 pb-3"
-        >
-          <button
-            type="button"
-            (click)="setResumeViewerMode('structured')"
-            class="flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium text-slate-300 hover:bg-slate-800 hover:text-white transition"
-            aria-label="Back to structured resume view"
+        <div class="mb-3 flex items-center justify-end gap-2 border-b border-slate-800/80 pb-3">
+          <a
+            *ngIf="resumeArtifactUrl()"
+            [href]="resumeArtifactUrl()"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="flex items-center gap-1 font-mono text-[11px] text-emerald-400 hover:underline"
+            title="Open PDF preview in a new browser tab"
+            aria-label="Open PDF preview in new tab"
           >
-            <app-icon name="arrow-left" className="h-3.5 w-3.5"></app-icon>
-            <span>Back to structured view</span>
-          </button>
-
-          <div class="flex items-center gap-2">
-            <a
-              *ngIf="resumeArtifactDownloadUrl()"
-              [href]="resumeArtifactDownloadUrl()"
-              download="main-resume.pdf"
-              class="flex items-center gap-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 px-3 py-1.5 text-xs font-semibold text-slate-200 transition"
-              title="Download main resume PDF"
-              aria-label="Download main resume PDF"
-            >
-              <app-icon name="download" className="h-3.5 w-3.5"></app-icon>
-              <span>Download PDF</span>
-            </a>
-
-            <a
-              *ngIf="resumeArtifactUrl()"
-              [href]="resumeArtifactUrl()"
-              target="_blank"
-              rel="noopener noreferrer"
-              class="flex items-center gap-1 font-mono text-[11px] text-emerald-400 hover:underline"
-              title="Open PDF preview in a new browser tab"
-              aria-label="Open PDF preview in new tab"
-            >
-              <span>Open in new tab</span>
-              <app-icon name="external-link" className="h-3 w-3"></app-icon>
-            </a>
-          </div>
+            <span>Open in new tab</span>
+            <app-icon name="external-link" className="h-3 w-3"></app-icon>
+          </a>
         </div>
 
         <iframe
@@ -523,35 +509,6 @@
               <span *ngIf="project.description">: {{ project.description }}</span>
             </article>
           </section>
-        </div>
-        <div
-          class="mt-7 flex flex-wrap items-center justify-end gap-2 border-t border-slate-800 pt-4"
-        >
-          <span *ngIf="!resumeArtifactUrl()" class="text-xs text-slate-500"
-            >PDF preview will be available after generation.</span
-          >
-          <a
-            *ngIf="resumeArtifactDownloadUrl()"
-            [href]="resumeArtifactDownloadUrl()"
-            download="main-resume.pdf"
-            class="flex items-center gap-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 px-4 py-2 text-xs font-semibold text-slate-200 transition"
-            title="Download main resume PDF"
-            aria-label="Download main resume PDF"
-          >
-            <app-icon name="download" className="h-3.5 w-3.5"></app-icon>
-            <span>Download PDF</span>
-          </a>
-          <button
-            type="button"
-            *ngIf="resumeArtifactUrl()"
-            (click)="openPdfPreview()"
-            class="flex items-center gap-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 px-4 py-2 text-xs font-semibold text-white transition"
-            title="Open inline PDF preview"
-            aria-label="Open PDF inline preview"
-          >
-            <app-icon name="file-text" className="h-3.5 w-3.5"></app-icon>
-            <span>Open PDF</span>
-          </button>
         </div>
       </ng-container>
     </section>
