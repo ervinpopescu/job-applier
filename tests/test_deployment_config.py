@@ -12,8 +12,11 @@ def test_compose_web_port_matches_secondary_nginx_alias_documentation() -> None:
     deployment = (PROJECT_ROOT / "docs" / "deployment.md").read_text(encoding="utf-8")
 
     assert "JOB_APPLIER_PORT:-8001}:8000" in compose
+    assert "GATEWAY_PORT:-8089}:80" in compose
     assert "aslan.archnet.lol/job-applier/" in deployment
     assert "127.0.0.1:8001" in deployment
+    assert "127.0.0.1:8089" in deployment
+    assert "GATEWAY_PORT=8089" in deployment
     assert "separate development port `8000`" in deployment
 
 
