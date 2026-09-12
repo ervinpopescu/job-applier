@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,9 @@ class CandidateProfile:
     linkedin_url: str = ""
     github_url: str = ""
     portfolio_url: str = ""
-    languages: str = ""
+    languages: str | dict[str, str] = field(
+        default_factory=lambda: {"English": "Fluent", "Romanian": "Native"}
+    )
 
     # Current Employment & Education
     current_company: str = ""
@@ -32,15 +35,39 @@ class CandidateProfile:
     education_degree: str = ""
 
     # Common Screening Answers
-    work_authorization: str = "Yes"  # Authorized to work in the country
+    work_authorization: str | dict[str, Any] = field(
+        default_factory=lambda: {
+            "authorized_in_us": False,
+            "authorized_in_eu": True,
+            "requires_sponsorship": False,
+            "requires_us_sponsorship": False,
+            "requires_eu_sponsorship": False,
+        }
+    )
     sponsorship_required: str = "No"  # Requires visa sponsorship
-    notice_period: str = "Negotiable / Standard"
-    salary_expectation: str = "Negotiable"
-    willing_to_relocate: str = "No"
-    remote_preference: str = "Remote or Hybrid"
-    gender: str = "Prefer not to say"
+    notice_period: str = "Immediate"
+    salary_expectation: str | dict[str, Any] = field(
+        default_factory=lambda: {
+            "minimum": 60000,
+            "desired": 75000,
+            "currency": "EUR",
+            "period": "yearly",
+        }
+    )
+    willing_to_relocate: str | bool = False
+    remote_preference: str = "Remote only"
+    gender: str = "Decline to self-identify"
     veteran_status: str = "I am not a protected veteran"
-    disability_status: str = "No, I do not have a disability"
+    disability_status: str = "I do not have a disability"
+
+    eeo_defaults: dict[str, str] = field(
+        default_factory=lambda: {
+            "gender": "Decline to self-identify",
+            "race": "Decline to self-identify",
+            "veteran": "I am not a protected veteran",
+            "disability": "I do not have a disability",
+        }
+    )
 
     # Search & AI Customization Preferences
     target_roles: list[str] = field(default_factory=list)
@@ -57,8 +84,123 @@ class CandidateProfile:
         return asdict(self)
 
     def get_field(self, key: str, default: str = "") -> str:
-        """Safe retrieval of profile field."""
-        return str(getattr(self, key, default) or default)
+        """Safe retrieval of profile field as string."""
+        val = getattr(self, key, default)
+        if val is None:
+            return default
+        if isinstance(val, dict):
+            if "desired" in val and "currency" in val:
+                return f"{val['desired']} {val['currency']}"
+            return json.dumps(val)
+        if isinstance(val, bool):
+            return "Yes" if val else "No"
+        return str(val or default)
+
+    def get_salary_desired(self) -> int | float | None:
+        if isinstance(self.salary_expectation, dict):
+            return self.salary_expectation.get("desired")
+        if isinstance(self.salary_expectation, (int, float)):
+            return self.salary_expectation
+        if isinstance(self.salary_expectation, str):
+            digits = re.findall(r"\d+", self.salary_expectation.replace(",", ""))
+            if digits:
+                return float(digits[0])
+        return None
+
+    def get_salary_minimum(self) -> int | float | None:
+        if isinstance(self.salary_expectation, dict):
+            return self.salary_expectation.get("minimum")
+        return self.get_salary_desired()
+
+    def get_salary_currency(self) -> str:
+        if isinstance(self.salary_expectation, dict):
+            return str(self.salary_expectation.get("currency", "EUR"))
+        return "EUR"
+
+    def is_authorized_to_work(self, location: str = "") -> bool:
+        if isinstance(self.work_authorization, dict):
+            loc_low = location.lower()
+            if "us" in loc_low or "united states" in loc_low:
+                return bool(self.work_authorization.get("authorized_in_us", False))
+            if "eu" in loc_low or "europe" in loc_low or "romania" in loc_low:
+                return bool(self.work_authorization.get("authorized_in_eu", True))
+            return bool(self.work_authorization.get("authorized_in_eu", True))
+        if isinstance(self.work_authorization, str):
+            return self.work_authorization.strip().lower() in (
+                "yes",
+                "true",
+                "authorized",
+                "eligible",
+            )
+        return True
+
+    def requires_visa_sponsorship(self, location: str = "") -> bool:
+        if isinstance(self.work_authorization, dict):
+            loc_low = location.lower()
+            if "us" in loc_low or "united states" in loc_low:
+                return bool(
+                    self.work_authorization.get(
+                        "requires_us_sponsorship",
+                        self.work_authorization.get("requires_sponsorship", False),
+                    )
+                )
+            if "eu" in loc_low or "europe" in loc_low or "romania" in loc_low:
+                return bool(
+                    self.work_authorization.get(
+                        "requires_eu_sponsorship",
+                        self.work_authorization.get("requires_sponsorship", False),
+                    )
+                )
+            return bool(self.work_authorization.get("requires_sponsorship", False))
+        if isinstance(self.sponsorship_required, str):
+            return self.sponsorship_required.strip().lower() in (
+                "yes",
+                "true",
+                "required",
+            )
+        return False
+
+    def get_language_proficiency(self, language: str) -> str | None:
+        lang_low = language.lower().strip()
+        if isinstance(self.languages, dict):
+            for k, v in self.languages.items():
+                if k.lower() in lang_low or lang_low in k.lower():
+                    return v
+        elif isinstance(self.languages, str):
+            if lang_low in self.languages.lower():
+                return "Fluent"
+        return None
+
+    def is_willing_to_relocate(self) -> bool:
+        if isinstance(self.willing_to_relocate, bool):
+            return self.willing_to_relocate
+        if isinstance(self.willing_to_relocate, str):
+            return self.willing_to_relocate.strip().lower() in ("yes", "true")
+        return False
+
+    def get_eeo_answer(self, category: str) -> str:
+        cat_low = category.lower().strip()
+        if "gender" in cat_low or "sex" in cat_low:
+            return (
+                self.eeo_defaults.get("gender")
+                or self.gender
+                or "Decline to self-identify"
+            )
+        if "race" in cat_low or "ethnic" in cat_low:
+            return self.eeo_defaults.get("race") or "Decline to self-identify"
+        if "veteran" in cat_low:
+            return (
+                self.eeo_defaults.get("veteran")
+                or self.veteran_status
+                or "I am not a protected veteran"
+            )
+        if "disability" in cat_low or "handicap" in cat_low:
+            return (
+                self.eeo_defaults.get("disability")
+                or self.disability_status
+                or "I do not have a disability"
+            )
+        return "Decline to self-identify"
 
 
 def load_candidate_profile(
@@ -72,7 +214,6 @@ def load_candidate_profile(
     if master_resume_path is None:
         master_resume_path = project_root / "data" / "master_resume.json"
 
-    # Start with baseline profile
     profile = CandidateProfile()
 
     # 1. First populate from master_resume.json if available
@@ -115,7 +256,9 @@ def load_candidate_profile(
                 if len(loc_parts) >= 2:
                     profile.country = loc_parts[1]
 
-            profile.languages = contact.get("languages", "")
+            langs = contact.get("languages", "")
+            if langs:
+                profile.languages = langs
 
             # Extract current company and title from first experience entry
             experience = resume_data.get("experience", [])
@@ -138,7 +281,7 @@ def load_candidate_profile(
             with open(profile_path, encoding="utf-8") as f:
                 overrides = json.load(f)
             for k, v in overrides.items():
-                if hasattr(profile, k):
+                if hasattr(profile, k) and v is not None:
                     setattr(profile, k, v)
         except Exception as e:
             print(f"Warning: Could not load candidate_profile.json: {e}")
