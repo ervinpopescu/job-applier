@@ -17,6 +17,7 @@ import { catchError, tap } from 'rxjs/operators';
 import { IconComponent } from './components/icon.component';
 import { ApiService, resolveFileUrl } from './services/api.service';
 import {
+  type AppFilterCounts,
   type ApplicationDetail,
   type ApplicationItem,
   type MainResume,
@@ -58,12 +59,36 @@ export class App implements OnInit, OnDestroy {
   @ViewChild('moreActionsButton') moreActionsButton?: ElementRef<HTMLButtonElement>;
 
   // Tabs
-  activeTab = signal<'queue' | 'tracker' | 'scraper' | 'console' | 'profile'>('queue');
+  activeTab = signal<
+    'applications' | 'metrics' | 'scraper' | 'console' | 'profile' | 'queue' | 'tracker'
+  >('applications');
 
   // Core Data Signals
   stats = signal<TrackerStats | null>(null);
   automationFunnel = signal<AutomationFunnel | null>(null);
   applications = signal<ApplicationItem[]>([]);
+  appFilter = signal<'all' | 'queued' | 'action_required' | 'pending' | 'applied' | 'skipped'>(
+    'all',
+  );
+  appFilterCounts = signal<AppFilterCounts>({
+    all: 0,
+    queued: 0,
+    action_required: 0,
+    pending: 0,
+    applied: 0,
+    skipped: 0,
+    failed: 0,
+  });
+
+  // Unified Applications Multi-Selection
+  selectedAppIds = signal<Set<string>>(new Set());
+  selectedAppCount = computed(() => this.selectedAppIds().size);
+  isAllAppsSelected = computed(() => {
+    const apps = this.applications();
+    if (apps.length === 0) return false;
+    const selected = this.selectedAppIds();
+    return apps.every((a) => selected.has(a.id));
+  });
   selectedApp = signal<ApplicationDetail | null>(null);
   trackerRecords = signal<TrackerRecord[]>([]);
   pipelineStatus = signal<PipelineStatus | null>(null);
@@ -73,6 +98,7 @@ export class App implements OnInit, OnDestroy {
 
   // Takeover & noVNC Viewer State
   vncModalOpen = signal(false);
+  activeTakeoverJobId = signal<string | null>(null);
   takeoverStatus = signal<TakeoverStatus | null>(null);
   takeoverCountdown = signal(300);
   isClaimingTakeover = signal(false);
@@ -527,9 +553,12 @@ export class App implements OnInit, OnDestroy {
 
   fetchApplications() {
     this.setResourceStatus('applications', 'loading');
-    return this.api.getApplications(this.searchQuery()).pipe(
+    return this.api.getApplications(this.searchQuery(), 100, 0, undefined, this.appFilter()).pipe(
       tap((data) => {
         this.applications.set(data.items || []);
+        if (data.counts) {
+          this.appFilterCounts.set(data.counts);
+        }
         this.setResourceStatus('applications', 'ready', null, true);
       }),
       catchError((err) => {
@@ -545,6 +574,159 @@ export class App implements OnInit, OnDestroy {
 
   loadApplications() {
     this.fetchApplications().subscribe();
+  }
+
+  setAppFilter(filter: 'all' | 'queued' | 'action_required' | 'pending' | 'applied' | 'skipped') {
+    this.appFilter.set(filter);
+    this.selectedAppIds.set(new Set());
+    this.loadApplications();
+  }
+
+  toggleSelectAllApps() {
+    if (this.isAllAppsSelected()) {
+      this.selectedAppIds.set(new Set());
+    } else {
+      this.selectedAppIds.set(new Set(this.applications().map((a) => a.id)));
+    }
+  }
+
+  toggleAppSelection(appId: string, event?: Event) {
+    if (event) {
+      event.stopPropagation();
+    }
+    this.selectedAppIds.update((current) => {
+      const next = new Set(current);
+      if (next.has(appId)) {
+        next.delete(appId);
+      } else {
+        next.add(appId);
+      }
+      return next;
+    });
+  }
+
+  isAppSelected(appId: string): boolean {
+    return this.selectedAppIds().has(appId);
+  }
+
+  queueSelectedApps() {
+    const ids = Array.from(this.selectedAppIds());
+    if (ids.length === 0) return;
+    this.api.batchApply(ids.length, 'assisted', ids).subscribe({
+      next: () => {
+        this.showToast(`Enqueued ${ids.length} selected applications!`, 'success');
+        this.selectedAppIds.set(new Set());
+        this.loadApplications();
+        this.loadStats();
+      },
+      error: (err) => {
+        this.showToast(err?.message || 'Failed to enqueue selected applications.', 'error');
+      },
+    });
+  }
+
+  queueAllPending() {
+    this.api.batchRequeue({ requeue_all: true, status_filter: 'pending' }).subscribe({
+      next: (res) => {
+        const count = (res as { count?: number })?.count ?? res?.['requeued_count'] ?? 'all';
+        this.showToast(`Enqueued ${count} pending applications!`, 'success');
+        this.loadApplications();
+        this.loadStats();
+      },
+      error: (err) => {
+        this.showToast(err?.message || 'Failed to enqueue pending applications.', 'error');
+      },
+    });
+  }
+
+  exportCsv() {
+    const url = this.api.getTrackerExportCsvUrl();
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', 'applications_tracker.csv');
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+
+  isAppCancellable(app: ApplicationItem): boolean {
+    return (
+      Boolean(app.job_id) &&
+      ['ready', 'claimed', 'navigating', 'filling', 'validating', 'retry_wait'].includes(
+        (app.job_state || app.automation_state || '').toLowerCase(),
+      )
+    );
+  }
+
+  toggleQueueApp(app: ApplicationItem, event?: Event) {
+    if (event) event.stopPropagation();
+    const isQueued = this.isAppCancellable(app);
+
+    if (isQueued && app.job_id) {
+      this.api.cancelJob(app.job_id).subscribe({
+        next: () => {
+          this.showToast(`Cancelled queue job for ${app.company}.`, 'info');
+          this.loadApplications();
+          this.loadStats();
+        },
+        error: (err) => this.showToast(err?.message || 'Failed to cancel job', 'error'),
+      });
+    } else {
+      this.api.batchApply(1, 'assisted', [app.id]).subscribe({
+        next: () => {
+          this.showToast(`Enqueued ${app.company} to automation queue!`, 'success');
+          this.loadApplications();
+          this.loadStats();
+        },
+        error: (err) => this.showToast(err?.message || 'Failed to enqueue application', 'error'),
+      });
+    }
+  }
+
+  openTakeoverForJob(jobId?: string | null, event?: Event) {
+    if (event) event.stopPropagation();
+    this.activeTakeoverJobId.set(jobId || null);
+    this.claimTakeover();
+    this.openTakeoverModal();
+  }
+
+  appQueueStatusLabel(app: ApplicationItem): string {
+    const state = (app.job_state || app.automation_state || '').toLowerCase();
+    if (!state || state === 'none') return 'Not Queued';
+    if (state === 'ready') return 'Ready in Queue';
+    if (['claimed', 'navigating', 'filling', 'validating', 'submit_intent'].includes(state))
+      return 'Running';
+    if (['auth_required', 'mfa_required', 'captcha_required'].includes(state))
+      return 'Login Required';
+    if (state === 'manual_takeover') return 'Takeover Active';
+    if (state === 'retry_wait') return 'Retrying';
+    if (state === 'completed') return 'Completed';
+    if (state === 'skipped') return 'Skipped';
+    return state.replace(/_/g, ' ');
+  }
+
+  appQueueStatusClass(app: ApplicationItem): string {
+    const state = (app.job_state || app.automation_state || '').toLowerCase();
+    if (!state || state === 'none') return 'bg-slate-900 text-slate-500 border-slate-800';
+    if (state === 'ready') return 'bg-teal-950/60 text-teal-300 border-teal-800/80';
+    if (['claimed', 'navigating', 'filling', 'validating', 'submit_intent'].includes(state))
+      return 'bg-blue-950/60 text-blue-300 border-blue-800/80 animate-pulse';
+    if (['auth_required', 'mfa_required', 'captcha_required', 'manual_takeover'].includes(state))
+      return 'bg-amber-950/60 text-amber-300 border-amber-800/80 font-bold';
+    if (state === 'retry_wait') return 'bg-indigo-950/60 text-indigo-300 border-indigo-800/80';
+    if (state === 'completed') return 'bg-emerald-950/60 text-emerald-300 border-emerald-800/80';
+    return 'bg-slate-900 text-slate-400 border-slate-800';
+  }
+
+  appStatusClass(status?: string): string {
+    const st = (status || 'pending').toLowerCase();
+    if (st === 'applied') return 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30';
+    if (st === 'auto_filled') return 'bg-blue-500/15 text-blue-400 border-blue-500/30';
+    if (st === 'failed' || st === 'validation_failed')
+      return 'bg-rose-500/15 text-rose-400 border-rose-500/30';
+    if (st === 'skipped' || st === 'dismissed')
+      return 'bg-slate-800 text-slate-400 border-slate-700';
+    return 'bg-amber-500/15 text-amber-400 border-amber-500/30';
   }
 
   automationStateLabel(app: ApplicationItem): string {
@@ -1285,13 +1467,13 @@ export class App implements OnInit, OnDestroy {
     this.resumeArtifactUrl.set(
       response.artifact_url ? resolveFileUrl(response.artifact_url) : null,
     );
-    this.resumeArtifactDownloadUrl.set(
-      response.download_url
-        ? resolveFileUrl(response.download_url)
-        : response.artifact_url
-          ? `${resolveFileUrl(response.artifact_url)}?download=true`
-          : null,
-    );
+    let downloadUrl: string | null = null;
+    if (response.download_url) {
+      downloadUrl = resolveFileUrl(response.download_url);
+    } else if (response.artifact_url) {
+      downloadUrl = `${resolveFileUrl(response.artifact_url)}?download=true`;
+    }
+    this.resumeArtifactDownloadUrl.set(downloadUrl);
     this.resumeViewStatus.set(response.status);
     this.resumeViewError.set(response.error);
   }
@@ -1409,13 +1591,13 @@ export class App implements OnInit, OnDestroy {
                 'warning',
               );
             } else if (importedApps > 0) {
-              this.activeTab.set('queue');
+              this.activeTab.set('applications');
               this.showToast(
                 `Successfully imported ${importedApps} applications and ${mergedRecords} records!`,
                 'success',
               );
             } else {
-              this.activeTab.set('tracker');
+              this.activeTab.set('applications');
               this.showToast(`Successfully imported ${mergedRecords} tracker records!`, 'success');
             }
           } catch {
@@ -1687,6 +1869,7 @@ export class App implements OnInit, OnDestroy {
 
   closeTakeoverModal() {
     this.vncModalOpen.set(false);
+    this.activeTakeoverJobId.set(null);
   }
 
   claimTakeover() {
@@ -1726,7 +1909,9 @@ export class App implements OnInit, OnDestroy {
 
   reopenAuthSession() {
     this.isReopeningAuth.set(true);
-    const jobId = (this.automationStatus()?.active_job as { id?: string } | undefined)?.id;
+    const jobId =
+      this.activeTakeoverJobId() ||
+      (this.automationStatus()?.active_job as { id?: string } | undefined)?.id;
     this.api.reopenAuthSession(jobId).subscribe({
       next: (res) => {
         this.showToast(
@@ -1750,7 +1935,10 @@ export class App implements OnInit, OnDestroy {
 
   resumeFromTakeover() {
     this.isResumingTakeover.set(true);
-    this.api.resumeTakeover().subscribe({
+    const jobId =
+      this.activeTakeoverJobId() ||
+      (this.automationStatus()?.active_job as { id?: string } | undefined)?.id;
+    this.api.resumeTakeover(jobId).subscribe({
       next: (res) => {
         this.showToast(
           res.message || 'Safe resume revalidation succeeded! Automation unpaused.',
