@@ -24,6 +24,12 @@ from job_applier.automation.adapters.models import (
     QuestionType,
     ValidationError,
 )
+from job_applier.automation.adapters.semantic import (
+    accessible_label,
+    input_is_empty,
+    requires_manual_review,
+    select_semantic_option,
+)
 from job_applier.automation.candidate_profile import CandidateProfile
 
 logger = logging.getLogger("job_applier.adapters.lever")
@@ -36,7 +42,7 @@ class LeverAdapter(BaseATSAdapter):
     """
 
     adapter_name: str = "lever"
-    adapter_version: str = "1.0.0"
+    adapter_version: str = "1.1.0"
     can_submit: bool = True
     display_name: str = "Lever Job Board"
 
@@ -72,13 +78,39 @@ class LeverAdapter(BaseATSAdapter):
 
         try:
             standard_fields = [
-                ("name", "input[name='name']", QuestionType.TEXT, True),
-                ("email", "input[name='email']", QuestionType.TEXT, True),
-                ("phone", "input[name='phone']", QuestionType.TEXT, False),
-                ("org", "input[name='org']", QuestionType.TEXT, False),
+                (
+                    "name",
+                    "input[name='name'], input[data-qa='name-input']",
+                    QuestionType.TEXT,
+                    True,
+                ),
+                (
+                    "email",
+                    "input[name='email'], input[data-qa='email-input']",
+                    QuestionType.TEXT,
+                    True,
+                ),
+                (
+                    "phone",
+                    "input[name='phone'], input[data-qa='phone-input']",
+                    QuestionType.TEXT,
+                    False,
+                ),
+                (
+                    "location",
+                    "input[name='location'], input[data-qa='location-input']",
+                    QuestionType.TEXT,
+                    False,
+                ),
+                (
+                    "org",
+                    "input[name='org'], input[data-qa='org-input']",
+                    QuestionType.TEXT,
+                    False,
+                ),
                 (
                     "resume",
-                    "input[name='resume'], input[type='file']",
+                    "input[name='resume'], input[data-qa='input-resume'], input[type='file']",
                     QuestionType.FILE,
                     True,
                 ),
@@ -101,12 +133,7 @@ class LeverAdapter(BaseATSAdapter):
             )
             for i in range(custom_items.count()):
                 el = custom_items.nth(i)
-                label_el = el.locator(".text, label, .application-label")
-                label_text = (
-                    label_el.inner_text().strip()
-                    if label_el.count() > 0
-                    else f"question_{i}"
-                )
+                label_text = accessible_label(el) or f"question_{i}"
                 is_req = "*" in label_text or "required" in label_text.lower()
 
                 if el.locator("input[type='radio']").count() > 0:
@@ -175,29 +202,49 @@ class LeverAdapter(BaseATSAdapter):
 
         # 2. Fill standard personal fields
         # Lever uses full name in a single input or separate fields
-        name_input = page.locator("input[name='name']")
+        name_input = page.locator("input[name='name'], input[data-qa='name-input']")
         if name_input.count() > 0 and name_input.first.is_visible():
             name_input.first.fill(profile.full_name)
             report.fields_filled.append("Full Name")
             report.answers_provenance["Full Name"] = "profile"
 
-        email_input = page.locator("input[name='email']")
+        email_input = page.locator("input[name='email'], input[data-qa='email-input']")
         if email_input.count() > 0 and email_input.first.is_visible():
             email_input.first.fill(profile.email)
             report.fields_filled.append("Email")
             report.answers_provenance["Email"] = "profile"
 
-        phone_input = page.locator("input[name='phone']")
+        phone_input = page.locator("input[name='phone'], input[data-qa='phone-input']")
         if phone_input.count() > 0 and phone_input.first.is_visible() and profile.phone:
             phone_input.first.fill(profile.phone)
             report.fields_filled.append("Phone")
             report.answers_provenance["Phone"] = "profile"
 
-        # URLs (LinkedIn, GitHub, Portfolio)
+        # Current location/company and URLs use semantic names that vary by Lever form.
+        simple_mappings = [
+            (
+                "input[name='location'], input[data-qa='location-input']",
+                profile.city,
+                "Location",
+            ),
+            (
+                "input[name='org'], input[data-qa='org-input']",
+                profile.current_company,
+                "Current Company",
+            ),
+        ]
+        for sel, val, label in simple_mappings:
+            if val:
+                loc = page.locator(sel)
+                if loc.count() > 0 and loc.first.is_visible():
+                    loc.first.fill(val)
+                    report.fields_filled.append(label)
+                    report.answers_provenance[label] = "profile"
+
         url_mappings = [
-            ("input[name='urls[LinkedIn]']", profile.linkedin_url, "LinkedIn"),
-            ("input[name='urls[GitHub]']", profile.github_url, "GitHub"),
-            ("input[name='urls[Portfolio]']", profile.portfolio_url, "Portfolio"),
+            ("input[name^='urls[LinkedIn']", profile.linkedin_url, "LinkedIn"),
+            ("input[name^='urls[GitHub']", profile.github_url, "GitHub"),
+            ("input[name^='urls[Portfolio']", profile.portfolio_url, "Portfolio"),
         ]
         for sel, val, label in url_mappings:
             if val:
@@ -228,16 +275,18 @@ class LeverAdapter(BaseATSAdapter):
         for i in range(count):
             q_el = custom_questions.nth(i)
             try:
-                label_el = q_el.locator(".text, .application-label, label")
-                if label_el.count() == 0:
+                q_text = accessible_label(q_el)
+                if not q_text:
                     continue
-                q_text = label_el.first.inner_text().strip()
+                if requires_manual_review(q_text):
+                    report.unknown_questions.append(q_text)
+                    continue
                 if not q_text:
                     continue
 
                 # Skip if already filled
-                txt = q_el.locator("input[type='text'], textarea")
-                if txt.count() > 0 and txt.first.input_value():
+                txt = q_el.locator("input[type='text'], input:not([type]), textarea")
+                if txt.count() > 0 and not input_is_empty(txt.first):
                     continue
 
                 options: list[str] = []
@@ -265,8 +314,14 @@ class LeverAdapter(BaseATSAdapter):
                         )
                         ans_value = ans_result.answer
 
-                        if select_el.count() > 0:
-                            select_el.first.select_option(label=ans_value)
+                        if (
+                            select_el.count() > 0
+                            or q_el.get_attribute("role") == "combobox"
+                        ):
+                            if not select_semantic_option(q_el, str(ans_value)):
+                                raise FormValidationError(
+                                    [f"Could not select answer for '{q_text}'"]
+                                )
                         elif radio_el.count() > 0:
                             radio_input = q_el.locator(
                                 f"input[type='radio'][value='{ans_value}']"
@@ -317,14 +372,15 @@ class LeverAdapter(BaseATSAdapter):
             except Exception as e:
                 logger.debug(f"Error processing Lever custom question {i}: {e}")
 
-        # Check consent checkbox
+        # Legal/privacy consent is intentionally never selected automatically.
         consent_loc = page.locator(
             "input[type='checkbox'][name*='consent'], input[type='checkbox'][id*='consent']"
         )
-        if consent_loc.count() > 0 and not consent_loc.first.is_checked():
-            consent_loc.first.check()
-            report.fields_filled.append("Consent Checkbox")
-            report.answers_provenance["Consent Checkbox"] = "standard_consent"
+        for c_idx in range(consent_loc.count()):
+            label = (
+                accessible_label(consent_loc.nth(c_idx)) or f"Consent Checkbox {c_idx}"
+            )
+            report.unknown_questions.append(label)
 
         return report
 
@@ -339,12 +395,19 @@ class LeverAdapter(BaseATSAdapter):
 
         try:
             file_input = page.locator(
-                "input[name='resume'], input[type='file'][data-qa='resume-upload'], input[type='file']"
+                "input[name='resume'], input[data-qa='input-resume'], input[type='file'][data-qa='resume-upload']"
             )
             if file_input.count() == 0:
                 raise UploadRejectedError("No file upload input found for Lever resume")
 
             file_input.first.set_input_files(str(resume_path.resolve()))
+
+            if cover_letter_path is not None and cover_letter_path.exists():
+                cover_input = page.locator(
+                    "input[name='cover_letter'], input[name*='coverLetter'], input[data-qa='input-cover-letter']"
+                )
+                if cover_input.count() > 0:
+                    cover_input.first.set_input_files(str(cover_letter_path.resolve()))
 
             # Verify that upload wasn't rejected
             err = page.locator(".error-message:has-text('resume'), .template--error")
