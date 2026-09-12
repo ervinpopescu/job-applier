@@ -9,32 +9,50 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from job_applier.automation.adapters import (
+    AuthenticationRequiredError,
+    CaptchaDetectedError,
+    get_adapter_for_url,
+)
+from job_applier.automation.adapters.models import ConfirmationEvidence
+from job_applier.automation.browser_runtime import (
+    VirtualDisplayManager,
+    get_default_profile_dir,
+    get_sanitized_browser_env,
+    is_display_available,
+    resolve_browser_engine,
+    validate_browser_engine,
+)
+from job_applier.automation.profile_lock import (
+    ProfileOwnershipError,
+    ProfileOwnershipLock,
+)
+from job_applier.automation.network_security import (
+    attach_security_routes,
+    validate_target_url,
+)
+from job_applier.automation.safety_guard import (
+    DailySubmissionLimitExceededError,
+    SubmissionPacingViolationError,
+)
 from job_applier.automation.candidate_profile import (  # type: ignore[import-not-found]
     CandidateProfile,
     load_candidate_profile,
 )
 from job_applier.automation.cloudflare import (  # type: ignore[import-not-found]
-    VirtualDisplayManager,
     extract_ray_id,
     is_cloudflare_challenge,
-    solve_cloudflare_turnstile,
 )
 from job_applier.automation.question_solver import (  # type: ignore[import-not-found]
     QuestionSolver,
+    SensitiveQuestionError,
+    UnknownQuestionError,
 )
 from job_applier.logger import log_event  # type: ignore[import-not-found]
 from job_applier.scrapers.activity_checker import (  # type: ignore[import-not-found]
     is_job_active,
 )
 from job_applier.tracker import record_application  # type: ignore[import-not-found]
-from job_applier.utils import get_project_root
-
-
-def is_display_available() -> bool:
-    """Checks if a graphical display server (X11 or Wayland) is available."""
-    if sys.platform.startswith("linux"):
-        return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-    return True
 
 
 def clean_stale_chrome_locks(profile_dir: Path) -> None:
@@ -88,26 +106,43 @@ class BrowserAutomator:
         profile_dir: Path | None = None,
         api_key: str | None = None,
         status_callback: Callable[[str, str, str, dict[str, Any]], None] | None = None,
+        browser: str | None = None,
+        owner_type: str | None = None,
+        proxy: str | None = None,
+        skip_profile_lock: bool = False,
     ):
         self.profile = profile or load_candidate_profile()
         self.status_callback = status_callback
+        runtime_mode = os.environ.get("JOB_APPLIER_RUNTIME_MODE", "cli").lower()
+        self.owner_type = owner_type or (
+            "runtime" if runtime_mode == "service" else "cli"
+        )
+        self.skip_profile_lock = skip_profile_lock
+        self.profile_lock: ProfileOwnershipLock | None = None
+        self.proxy = proxy or os.environ.get("JOB_APPLIER_OUTBOUND_PROXY")
 
-        # Auto-detect display: check if an X11 display is available or can be provided by Xvfb
+        self.raw_browser = validate_browser_engine(browser)
+        self.engine, self.executable_path = resolve_browser_engine(self.raw_browser)
+
+        # Auto-detect display: check if an X11/Wayland/native display is available or can be provided by Xvfb
         display_ok = is_display_available()
         if not display_ok:
-            disp = VirtualDisplayManager.ensure_display()
+            disp = VirtualDisplayManager.ensure_display(allow_xvfb=True)
             if disp:
                 display_ok = True
 
         if headless is None:
             self.headless = not display_ok
-        elif not headless and not display_ok:
-            print(
-                "Notice: No graphical display detected ($DISPLAY not set). Running in headless mode."
-            )
-            self.headless = True
+        elif not headless:
+            if not display_ok:
+                raise RuntimeError(
+                    "Headed mode requested (headless=False), but no graphical display server "
+                    "(DISPLAY or WAYLAND_DISPLAY) was detected and virtual display is unavailable. "
+                    "Run in headless mode or ensure a display server is running."
+                )
+            self.headless = False
         else:
-            self.headless = headless
+            self.headless = True
 
         self.use_persistent_profile = use_persistent_profile
         self.api_key = api_key
@@ -115,13 +150,14 @@ class BrowserAutomator:
         self.waiting_for_code: bool = False
         self.provided_code: str | None = None
 
-        project_root = get_project_root()
-        self.profile_dir = profile_dir or (project_root / ".browser_profile")
+        self.profile_dir = profile_dir or get_default_profile_dir(self.engine)
 
         self.playwright: Any = None
         self.browser: Any = None
         self.context: Any = None
         self.page: Any = None
+        self.last_evidence: ConfirmationEvidence | None = None
+        self.cancellation_check: Callable[[], bool] | None = None
 
     def _notify(
         self,
@@ -152,75 +188,167 @@ class BrowserAutomator:
             global ACTIVE_AUTOMATOR
             ACTIVE_AUTOMATOR = self
 
-            # Prefer installed Google Chrome
-            chrome_path = "/usr/bin/google-chrome"
-            launch_args = [
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--start-maximized",
-            ]
-
-            if self.use_persistent_profile:
-                self.profile_dir.mkdir(parents=True, exist_ok=True)
-                clean_stale_chrome_locks(self.profile_dir)
-                kwargs: dict[str, Any] = {
-                    "user_data_dir": str(self.profile_dir),
-                    "headless": self.headless,
-                    "args": launch_args,
-                    "viewport": {"width": 1280, "height": 900}
-                    if not self.headless
-                    else {"width": 1920, "height": 1080},
-                }
-                if Path(chrome_path).exists():
-                    kwargs["executable_path"] = chrome_path
-
+            if self.use_persistent_profile and not self.skip_profile_lock:
+                self.profile_lock = ProfileOwnershipLock(
+                    profile_dir=self.profile_dir,
+                    owner_type=self.owner_type,
+                )
                 try:
-                    self.context = self.playwright.chromium.launch_persistent_context(
-                        **kwargs
-                    )
-                except Exception as pe:
-                    print(
-                        f"Notice: Persistent browser launch failed ({pe}). Cleaning locks and retrying..."
-                    )
-                    clean_stale_chrome_locks(self.profile_dir)
-                    time.sleep(1)
-                    # Retry with persistent context to preserve authenticated cookies
-                    self.context = self.playwright.chromium.launch_persistent_context(
-                        **kwargs
-                    )
+                    self.profile_lock.acquire()
+                except ProfileOwnershipError:
+                    self.profile_lock = None
+                    raise
 
-                self.page = (
-                    self.context.pages[0]
-                    if self.context.pages
-                    else self.context.new_page()
-                )
+            sanitized_env = get_sanitized_browser_env()
+
+            if self.engine == "firefox":
+                browser_type = self.playwright.firefox
+                if self.use_persistent_profile:
+                    self.profile_dir.mkdir(parents=True, exist_ok=True)
+                    kwargs: dict[str, Any] = {
+                        "user_data_dir": str(self.profile_dir),
+                        "headless": self.headless,
+                        "env": sanitized_env,
+                        "viewport": {"width": 1280, "height": 900}
+                        if not self.headless
+                        else {"width": 1920, "height": 1080},
+                    }
+                    if self.proxy:
+                        kwargs["proxy"] = {"server": self.proxy}
+                    self.context = browser_type.launch_persistent_context(**kwargs)
+                    self.page = (
+                        self.context.pages[0]
+                        if self.context.pages
+                        else self.context.new_page()
+                    )
+                else:
+                    self.browser = browser_type.launch(
+                        headless=self.headless, env=sanitized_env
+                    )
+                    self.context = self.browser.new_context(
+                        viewport={"width": 1280, "height": 900}
+                        if not self.headless
+                        else {"width": 1920, "height": 1080},
+                    )
+                    self.page = self.context.new_page()
             else:
-                kwargs = {
-                    "headless": self.headless,
-                    "args": launch_args,
-                }
-                if Path(chrome_path).exists():
-                    kwargs["executable_path"] = chrome_path
+                browser_type = self.playwright.chromium
+                launch_args = [
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--start-maximized",
+                ]
 
-                self.browser = self.playwright.chromium.launch(**kwargs)
-                self.context = self.browser.new_context(
-                    viewport={"width": 1280, "height": 900}
-                    if not self.headless
-                    else {"width": 1920, "height": 1080},
-                    user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-                )
-                self.page = self.context.new_page()
+                if self.use_persistent_profile:
+                    self.profile_dir.mkdir(parents=True, exist_ok=True)
+                    clean_stale_chrome_locks(self.profile_dir)
+                    kwargs = {
+                        "user_data_dir": str(self.profile_dir),
+                        "headless": self.headless,
+                        "args": launch_args,
+                        "env": sanitized_env,
+                        "viewport": {"width": 1280, "height": 900}
+                        if not self.headless
+                        else {"width": 1920, "height": 1080},
+                    }
+                    if self.proxy:
+                        kwargs["proxy"] = {"server": self.proxy}
+                    if self.executable_path and Path(self.executable_path).exists():
+                        kwargs["executable_path"] = self.executable_path
+
+                    try:
+                        self.context = browser_type.launch_persistent_context(**kwargs)
+                    except Exception as pe:
+                        print(
+                            f"Notice: Persistent browser launch failed ({pe}). Cleaning locks and retrying..."
+                        )
+                        clean_stale_chrome_locks(self.profile_dir)
+                        time.sleep(1)
+                        # Retry with persistent context to preserve authenticated cookies
+                        self.context = browser_type.launch_persistent_context(**kwargs)
+
+                    self.page = (
+                        self.context.pages[0]
+                        if self.context.pages
+                        else self.context.new_page()
+                    )
+                else:
+                    kwargs = {
+                        "headless": self.headless,
+                        "args": launch_args,
+                        "env": sanitized_env,
+                    }
+                    if self.executable_path and Path(self.executable_path).exists():
+                        kwargs["executable_path"] = self.executable_path
+
+                    self.browser = browser_type.launch(**kwargs)
+                    self.context = self.browser.new_context(
+                        viewport={"width": 1280, "height": 900}
+                        if not self.headless
+                        else {"width": 1920, "height": 1080},
+                        user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+                    )
+                    self.page = self.context.new_page()
+
+            # Track OAuth popups and other operator-visible tabs. Persistent contexts
+            # may open Google authentication in a new page; selecting it keeps the
+            # visible VNC session aligned with the page the operator is using.
+            if self.context:
+                self.context.on("page", self._handle_new_page)
+                for existing_page in self.context.pages:
+                    self._watch_page(existing_page)
 
             # Set sensible navigation timeouts
             self.page.set_default_navigation_timeout(30000)
             self.page.set_default_timeout(10000)
 
+            # Enforce network security routing on context
+            if self.context:
+                is_test_env = bool(os.environ.get("PYTEST_CURRENT_TEST")) or (
+                    os.environ.get("JOB_APPLIER_ALLOW_FILE_SCHEME") == "1"
+                )
+                attach_security_routes(self.context, allow_file_scheme=is_test_env)
+
         except Exception as e:
             print(f"Error starting Playwright browser: {e}")
             self.close()
             raise
+
+    def _watch_page(self, page: Any) -> None:
+        """Register lifecycle handling for a page without exposing its URL."""
+        try:
+            page.on("close", lambda: self._handle_page_close(page))
+        except Exception:
+            pass
+
+    def _handle_new_page(self, page: Any) -> None:
+        """Make a popup, including an OAuth popup, the active visible page."""
+        self._watch_page(page)
+        self.page = page
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+
+    def _handle_page_close(self, page: Any) -> None:
+        """Fall back to the newest remaining page when a popup closes."""
+        if self.page is not page or self.context is None:
+            return
+        try:
+            remaining = [
+                candidate
+                for candidate in self.context.pages
+                if not candidate.is_closed()
+            ]
+        except Exception:
+            remaining = []
+        if remaining:
+            self.page = remaining[-1]
+            try:
+                self.page.bring_to_front()
+            except Exception:
+                pass
 
     def close(self) -> None:
         """Closes browser and stops Playwright engine."""
@@ -234,6 +362,12 @@ class BrowserAutomator:
         except Exception:
             pass
         finally:
+            if self.profile_lock is not None:
+                try:
+                    self.profile_lock.release()
+                except Exception:
+                    pass
+                self.profile_lock = None
             self.context = None
             self.browser = None
             self.playwright = None
@@ -268,6 +402,12 @@ class BrowserAutomator:
         if not self.page:
             self.start()
 
+        if not job_url.startswith("file://"):
+            allowed, reason = validate_target_url(job_url)
+            if not allowed:
+                print(f"🛡️ Navigation rejected by security policy: {reason}")
+                return False
+
         print(f" Navigating to: {job_url}")
         try:
             self.page.goto(job_url, wait_until="domcontentloaded")
@@ -278,25 +418,31 @@ class BrowserAutomator:
 
         # Check if Cloudflare challenge is present
         if is_cloudflare_challenge(self.page):
-            solve_cloudflare_turnstile(self.page)
+            raise CaptchaDetectedError(
+                "Cloudflare verification challenge detected; automated bypass prohibited by policy. Operator takeover required."
+            )
 
         # Dismiss modal overlays and cookie consent banners
         self._dismiss_overlays()
 
-        # Check if page indicates the job is closed or expired
-        try:
-            page_html = self.page.content()
-            active_ok, active_reason = is_job_active(job_url, html=page_html)
-            if not active_ok:
-                print(f"⚠️ Page indicates job is not active: {active_reason}")
-                self._notify(
-                    "job_expired",
-                    f"Job posting is inactive: {active_reason}",
-                    level="WARN",
-                )
-                return False
-        except Exception:
-            pass
+        # A login wall can hide the apply button from the unauthenticated page. Do
+        # not classify that state as an expired posting: the operator still needs
+        # the live browser to authenticate before the posting can be evaluated.
+        login_wall, _ = self._detect_login_wall()
+        if not login_wall:
+            try:
+                page_html = self.page.content()
+                active_ok, active_reason = is_job_active(job_url, html=page_html)
+                if not active_ok:
+                    print(f"⚠️ Page indicates job is not active: {active_reason}")
+                    self._notify(
+                        "job_expired",
+                        f"Job posting is inactive: {active_reason}",
+                        level="WARN",
+                    )
+                    return False
+            except Exception:
+                pass
 
         # If it opened a new tab/popup upon clicking an apply button
         initial_pages_count = len(self.context.pages)
@@ -494,7 +640,9 @@ class BrowserAutomator:
 
         # Check if Cloudflare challenge is present before filling
         if is_cloudflare_challenge(self.page):
-            solve_cloudflare_turnstile(self.page)
+            raise CaptchaDetectedError(
+                "Cloudflare verification challenge detected; automated bypass prohibited by policy. Operator takeover required."
+            )
 
         report: dict[str, Any] = {
             "fields_filled": [],
@@ -768,10 +916,21 @@ class BrowserAutomator:
                     matched_val = self.question_solver._match_to_options(
                         self.profile.country, options
                     )
-                elif any(w in desc for w in ["authorized", "eligib", "right to work"]):
-                    matched_val = self.question_solver._match_to_options("Yes", options)
-                elif any(w in desc for w in ["sponsorship", "visa"]):
-                    matched_val = self.question_solver._match_to_options("No", options)
+                elif any(
+                    w in desc
+                    for w in [
+                        "authorized",
+                        "eligib",
+                        "right to work",
+                        "sponsorship",
+                        "visa",
+                    ]
+                ):
+                    matched_val = self.question_solver.answer_question(
+                        desc,
+                        options=options,
+                        strict=True,
+                    )
                 elif "gender" in desc:
                     matched_val = self.question_solver._match_to_options(
                         self.profile.gender, options
@@ -782,6 +941,8 @@ class BrowserAutomator:
                     self._highlight_element(el)
                     report["fields_filled"].append(f"Dropdown: {matched_val}")
 
+            except (UnknownQuestionError, SensitiveQuestionError):
+                raise
             except Exception:
                 continue
 
@@ -810,6 +971,7 @@ class BrowserAutomator:
                         label_text,
                         job_title=job_title,
                         company=company,
+                        strict=True,
                     )
                     if answer:
                         el.fill(answer)
@@ -819,6 +981,8 @@ class BrowserAutomator:
                         )
                         report["fields_filled"].append(f"Question: {label_text[:30]}")
 
+            except (UnknownQuestionError, SensitiveQuestionError):
+                raise
             except Exception:
                 continue
 
@@ -1037,12 +1201,45 @@ class BrowserAutomator:
             print(
                 f" Waiting for verification code via API / Web Dashboard (timeout: {timeout}s)..."
             )
+            from job_applier.automation.queue import (
+                consume_pending_verification_code,
+                set_runtime_browser_state,
+            )
+
+            try:
+                set_runtime_browser_state(
+                    active=True,
+                    url=self.page.url if self.page else "",
+                    is_closed=False,
+                    is_waiting_for_code=True,
+                )
+            except Exception:
+                pass
+
             start = time.time()
             while time.time() - start < timeout:
                 if self.provided_code:
                     code = self.provided_code
                     break
+                try:
+                    pending = consume_pending_verification_code()
+                    if pending:
+                        code = pending
+                        self.provided_code = code
+                        break
+                except Exception:
+                    pass
                 time.sleep(1)
+
+            try:
+                set_runtime_browser_state(
+                    active=True,
+                    url=self.page.url if self.page else "",
+                    is_closed=False,
+                    is_waiting_for_code=False,
+                )
+            except Exception:
+                pass
 
         self.waiting_for_code = False
 
@@ -1128,6 +1325,58 @@ class BrowserAutomator:
 
         return False, "Submission could not be confirmed by destination site"
 
+    def is_auth_or_challenge_screen(self) -> bool:
+        """Determines if the active page is an authentication, login, or MFA challenge screen."""
+        if not self.page:
+            return False
+        try:
+            is_login, _ = self._detect_login_wall()
+            if is_login:
+                return True
+            is_chal, _ = self._detect_verification_challenge()
+            if is_chal:
+                return True
+            cur_url = (self.page.url or "").lower()
+            if any(
+                w in cur_url
+                for w in [
+                    "/login",
+                    "/signin",
+                    "/sign-in",
+                    "/auth",
+                    "/mfa",
+                    "/challenge",
+                    "/sso",
+                    "accounts.google",
+                    "github.com/login",
+                    "okta.com",
+                    "auth0.com",
+                    "duosecurity.com",
+                ]
+            ):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def safe_screenshot(self, target_path: Path) -> bool:
+        """
+        Captures screenshot ONLY if the current page is not an authentication, login, or MFA screen.
+        Prevents credential and verification challenge leakage to disk or evidence bundles.
+        """
+        if not self.page:
+            return False
+        if self.is_auth_or_challenge_screen():
+            print(
+                f"Notice: Suppressed screenshot on authentication/challenge screen ({target_path.name})"
+            )
+            return False
+        try:
+            self.page.screenshot(path=str(target_path))
+            return True
+        except Exception:
+            return False
+
     def _save_diagnostics(
         self,
         app_dir: Path,
@@ -1137,7 +1386,8 @@ class BrowserAutomator:
         report: dict[str, Any],
         reason: str,
     ) -> None:
-        """Saves diagnostics JSON and DOM HTML snippet upon submission issues."""
+        """Saves diagnostics JSON and DOM HTML snippet upon submission issues, redacting auth screens."""
+        is_sensitive = self.is_auth_or_challenge_screen()
         diag_file = app_dir / "diagnostics.json"
         try:
             with open(diag_file, "w", encoding="utf-8") as f:
@@ -1148,11 +1398,19 @@ class BrowserAutomator:
                         "job_url": job_url,
                         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "status": "failed",
-                        "reason": reason,
+                        "reason": "[REDACTED_AUTHENTICATION]"
+                        if is_sensitive
+                        else reason,
                         "platform": report.get("platform", "Unknown"),
-                        "fields_filled": report.get("fields_filled", []),
+                        "fields_filled": (
+                            ["[REDACTED_AUTHENTICATION_SCREEN]"]
+                            if is_sensitive
+                            else report.get("fields_filled", [])
+                        ),
                         "resume_uploaded": report.get("resume_uploaded", False),
-                        "validation_errors": self._detect_validation_errors(),
+                        "validation_errors": (
+                            [] if is_sensitive else self._detect_validation_errors()
+                        ),
                     },
                     f,
                     indent=2,
@@ -1163,7 +1421,12 @@ class BrowserAutomator:
         dom_file = app_dir / "diagnostic_dom.html"
         try:
             with open(dom_file, "w", encoding="utf-8") as f:
-                f.write(self.page.content() if self.page else "")
+                if is_sensitive:
+                    f.write(
+                        "<!-- Redacted: Sensitive authentication / challenge DOM captured suppressed by security policy. -->"
+                    )
+                else:
+                    f.write(self.page.content() if self.page else "")
         except OSError as err:
             print(f"Notice: Could not save diagnostic_dom.html: {err}")
 
@@ -1180,7 +1443,7 @@ class BrowserAutomator:
         1. Navigates to job URL and opens application form.
         2. Fills all fields, attaches tailored CV PDF, fills cover letter, answers questions.
         3. Highlights submit button and presents a review prompt to the user.
-        4. User can confirm submit with [Enter] or submit manually in Chrome.
+        4. User can confirm submit with [Enter] or submit manually in the browser.
         """
         print(f"\n🚀 Starting Assisted Auto-Apply for {company} - {job_title}")
         success = self.navigate_and_open_form(job_url)
@@ -1226,7 +1489,9 @@ class BrowserAutomator:
             print(" Non-interactive/headless mode: Auto-confirming submit...")
             choice = ""
         else:
-            print("\n👉 Chrome is open with the filled application form.")
+            print(
+                f"\n👉 {self.engine.capitalize()} is open with the filled application form."
+            )
             print("   Review the fields in your browser window.")
             print("   Options:")
             print("     [Enter] -> Auto-click the Submit button")
@@ -1267,10 +1532,7 @@ class BrowserAutomator:
             proof_path = app_dir / (
                 "submission_proof.png" if submitted_ok else "submission_failed.png"
             )
-            try:
-                self.page.screenshot(path=str(proof_path))
-            except Exception:
-                pass
+            self.safe_screenshot(proof_path)
 
             if submitted_ok or choice == "m":
                 self._notify(
@@ -1318,73 +1580,166 @@ class BrowserAutomator:
         job_url: str,
         company: str,
         job_title: str,
+        on_submit_intent: Any | None = None,
+        on_verifying: Any | None = None,
+        adapter_override: Any | None = None,
     ) -> tuple[str, str]:
         """
         Autonomous Apply Mode:
         Completely automated: Navigates -> Fills form -> Attaches CV -> Submits -> Records proof.
+        Guarded by versioned ATS adapters and central safety rules.
         """
         print(f"\n⚡ Starting Autonomous Auto-Apply for {company} - {job_title}")
+        if callable(self.cancellation_check) and self.cancellation_check():
+            raise RuntimeError("Worker lost lease on job; aborting autonomous apply.")
+
         success = self.navigate_and_open_form(job_url)
         if not success:
             return "failed", "Could not navigate to job URL"
 
-        report = self.fill_application_form(
-            app_dir, job_title=job_title, company=company
-        )
-        time.sleep(2)
+        # Resolve typed ATS adapter
+        adapter = adapter_override or get_adapter_for_url(job_url, page=self.page)
 
-        submit_btn = self.find_submit_button()
-        if not submit_btn:
-            # Save screenshot for diagnosis
-            fail_shot = app_dir / "submission_failed.png"
+        # Pre-execution challenge checks via adapter
+        is_stale, stale_msg = adapter.detect_stale_job(self.page)
+        if is_stale:
+            return "failed", f"Stale job posting: {stale_msg}"
+
+        has_login, log_msg = adapter.check_auth_state(self.page)
+        if has_login:
+            raise AuthenticationRequiredError(f"Login required: {log_msg}")
+
+        has_cap, cap_msg = adapter.detect_captcha(self.page)
+        if has_cap:
+            raise CaptchaDetectedError(f"Captcha challenge detected: {cap_msg}")
+
+        # Locate documents for upload
+        cv_pdf = next(app_dir.glob("CV_*.pdf"), None)
+        if not cv_pdf or not cv_pdf.exists():
+            cv_pdf = app_dir / "CV.pdf"
+        cover_letter_file = app_dir / "COVER_LETTER.txt"
+        if not cover_letter_file.exists():
+            cover_letter_file = app_dir / "cover_letter.txt"
+        cover_letter_text = ""
+        if cover_letter_file.exists():
             try:
-                self.page.screenshot(path=str(fail_shot))
+                cover_letter_text = cover_letter_file.read_text(
+                    encoding="utf-8"
+                ).strip()
             except Exception:
                 pass
-            self._save_diagnostics(
-                app_dir,
-                company,
-                job_title,
-                job_url,
-                report,
-                "Submit button could not be located",
+
+        # Delegate form filling directly to the versioned ATS adapter
+        fill_report = adapter.fill_fields(
+            self.page,
+            self.profile,
+            question_solver=self.question_solver,
+            cover_letter=cover_letter_text,
+        )
+
+        # Upload resume and optional cover letter via adapter
+        if cv_pdf and cv_pdf.exists():
+            adapter.upload_documents(
+                self.page,
+                resume_path=cv_pdf,
+                cover_letter_path=cover_letter_file
+                if cover_letter_file.exists()
+                else None,
             )
+
+        report = {
+            "platform": adapter.adapter_name,
+            "fields_filled": fill_report.fields_filled,
+            "unknown_questions": fill_report.unknown_questions,
+        }
+        time.sleep(2)
+
+        # SAFETY CONTRACT: Generic forms are fill-only!
+        if not adapter.can_submit:
+            fill_shot = app_dir / "submission_fill_only.png"
+            self.safe_screenshot(fill_shot)
             self._notify(
-                "button_not_found",
-                f"Submit button not found for {company} - {job_title}",
-                level="WARN",
+                "fill_only",
+                f"Generic form filled for {company} - {job_title}. Automated submission disabled (fill-only).",
+                level="INFO",
             )
             record_application(
                 company=company,
                 title=job_title,
                 job_url=job_url,
-                status="failed",
-                platform=report["platform"],
+                status="filled_only",
+                platform=str(adapter.adapter_name),
                 submission_type="autonomous_browser",
-                notes="Submit button could not be located",
+                proof_path=str(fill_shot) if fill_shot.exists() else "",
+                notes="Generic form fill-only: automated submission prohibited by safety policy.",
             )
-            return "failed", "Submit button not found"
+            return (
+                "fill_only",
+                "Generic form filled successfully; submission prohibited by safety policy.",
+            )
+
+        # Multi-step progression (e.g. Ashby multi-page forms)
+        max_steps = 5
+        step_idx = 1
+        while step_idx < max_steps and adapter.advance_step(self.page):
+            step_idx += 1
+            time.sleep(1)
+            self._notify(
+                "navigating",
+                f"Advancing to step {step_idx} of {adapter.adapter_name} application form...",
+                level="INFO",
+            )
+            # Fill fields on the advanced step
+            adapter.fill_fields(
+                self.page,
+                self.profile,
+                question_solver=self.question_solver,
+                cover_letter=cover_letter_text,
+            )
+
+        # Adapter validation check before submission
+        val_errors = adapter.validate_form(self.page)
+        if val_errors:
+            err_summary = "; ".join(e.message for e in val_errors)
+            return "failed", f"Validation errors: {err_summary}"
+
+        if callable(self.cancellation_check) and self.cancellation_check():
+            raise RuntimeError(
+                "Worker lost lease on job; aborting before submit intent."
+            )
 
         try:
             self._notify(
                 "submitting",
-                f"Auto-submitting application for {company} - {job_title}...",
+                f"Auto-submitting application for {company} - {job_title} via {adapter.adapter_name} v{adapter.adapter_version}...",
                 level="INFO",
             )
-            print(" Auto-submitting application...")
-            submit_btn.click()
-            time.sleep(5)
 
-            submitted_ok, verif_msg = self._verify_submission()
+            print(" Auto-submitting application via adapter...")
+            # on_submit_intent is passed directly into adapter.submit() and invoked ONLY
+            # after confirming that a visible, enabled submit button affordance exists.
+            adapter.submit(self.page, on_submit_intent=on_submit_intent)
+
+            # Move to verifying state while waiting for confirmation
+            if on_verifying:
+                try:
+                    on_verifying()
+                except Exception as vex:
+                    print(f"Notice: on_verifying hook failed: {vex}")
+
+            time.sleep(4)
+
+            # Confirm submission via adapter-specific evidence
+            evidence = adapter.confirm_submission(self.page)
+            self.last_evidence = evidence
             proof_path = app_dir / (
-                "submission_proof.png" if submitted_ok else "submission_failed.png"
+                "submission_proof.png"
+                if evidence.confirmed
+                else "submission_failed.png"
             )
-            try:
-                self.page.screenshot(path=str(proof_path))
-            except Exception:
-                pass
+            self.safe_screenshot(proof_path)
 
-            if submitted_ok:
+            if evidence.confirmed and not evidence.is_ambiguous:
                 self._notify(
                     "submitted",
                     f"Verified application submission for {company} - {job_title}",
@@ -1395,19 +1750,52 @@ class BrowserAutomator:
                     title=job_title,
                     job_url=job_url,
                     status="applied",
-                    platform=report["platform"],
+                    platform=str(adapter.adapter_name),
                     submission_type="autonomous_browser",
                     proof_path=str(proof_path) if proof_path.exists() else "",
-                    notes=f"Submission verified. Fields filled: {len(report['fields_filled'])}",
+                    notes=f"Submission verified via {adapter.adapter_name}. Fields filled: {len(report['fields_filled'])}",
                 )
-                return "applied", f"Successfully auto-submitted ({verif_msg})"
+                return (
+                    "applied",
+                    f"Successfully auto-submitted ({evidence.confirmation_text})",
+                )
+            elif evidence.is_ambiguous:
+                self._save_diagnostics(
+                    app_dir,
+                    company,
+                    job_title,
+                    job_url,
+                    report,
+                    evidence.confirmation_text,
+                )
+                self._notify(
+                    "submission_ambiguous",
+                    f"Submission unconfirmed/ambiguous for {company} - {job_title}: {evidence.confirmation_text}",
+                    level="WARN",
+                )
+                record_application(
+                    company=company,
+                    title=job_title,
+                    job_url=job_url,
+                    status="ambiguous",
+                    platform=str(adapter.adapter_name),
+                    submission_type="autonomous_browser",
+                    proof_path=str(proof_path) if proof_path.exists() else "",
+                    notes=f"Ambiguous: {evidence.confirmation_text}",
+                )
+                return "ambiguous_submission", evidence.confirmation_text
             else:
                 self._save_diagnostics(
-                    app_dir, company, job_title, job_url, report, verif_msg
+                    app_dir,
+                    company,
+                    job_title,
+                    job_url,
+                    report,
+                    evidence.confirmation_text,
                 )
                 self._notify(
                     "submission_failed",
-                    f"Submission unconfirmed for {company} - {job_title}: {verif_msg}",
+                    f"Submission unconfirmed for {company} - {job_title}: {evidence.confirmation_text}",
                     level="WARN",
                 )
                 record_application(
@@ -1415,20 +1803,22 @@ class BrowserAutomator:
                     title=job_title,
                     job_url=job_url,
                     status="failed",
-                    platform=report["platform"],
+                    platform=str(adapter.adapter_name),
                     submission_type="autonomous_browser",
                     proof_path=str(proof_path) if proof_path.exists() else "",
-                    notes=f"Unconfirmed: {verif_msg}",
+                    notes=f"Unconfirmed: {evidence.confirmation_text}",
                 )
-                return "failed", verif_msg
+                return "failed", evidence.confirmation_text
 
+        except (SubmissionPacingViolationError, DailySubmissionLimitExceededError):
+            raise
         except Exception as e:
             record_application(
                 company=company,
                 title=job_title,
                 job_url=job_url,
                 status="failed",
-                platform=report["platform"],
+                platform=str(adapter.adapter_name),
                 submission_type="autonomous_browser",
                 notes=f"Error during submission: {e}",
             )
