@@ -23,7 +23,7 @@ services:
       - caddy-config:/config
     ports:
       # Bound to loopback only on host; tunnel targets internal gateway
-      - "${GATEWAY_BIND_ADDRESS:-127.0.0.1}:${GATEWAY_PORT:-8088}:80"
+      - "${GATEWAY_BIND_ADDRESS:-127.0.0.1}:${GATEWAY_PORT:-8089}:80"
     networks:
       - internal-net
     depends_on:

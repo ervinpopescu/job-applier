@@ -28,7 +28,7 @@ JOB_APPLIER_IMAGE=ghcr.io/owner/job-applier:latest
 GOOGLE_API_KEY=replace-me
 JOB_APPLIER_BIND_ADDRESS=127.0.0.1
 JOB_APPLIER_PORT=8001
-GATEWAY_PORT=8088
+GATEWAY_PORT=8089
 PUBLIC_ORIGIN=https://jobs.archnet.lol
 CLOUDFLARE_TUNNEL_TOKEN=eyJh...
 CF_ACCESS_AUD=0cf8...
@@ -47,10 +47,10 @@ docker compose ps
 Open it through an SSH tunnel (for local inspection):
 
 ```bash
-ssh -L 8088:127.0.0.1:8088 -L 8001:127.0.0.1:8001 user@server
+ssh -L 8089:127.0.0.1:8089 -L 8001:127.0.0.1:8001 user@server
 ```
 
-Then visit <http://127.0.0.1:8088> (through gateway) or <http://127.0.0.1:8001> (direct web) locally.
+Then visit <http://127.0.0.1:8089> (through gateway) or <http://127.0.0.1:8001> (direct web) locally.
 
 The first startup creates privacy-safe candidate and resume templates in the persistent data volume. Complete the candidate profile in the dashboard. To replace the master resume JSON while preserving container ownership:
 
@@ -93,7 +93,7 @@ docker compose up -d --remove-orphans
 Create an application-level portable backup from the dashboard or with:
 
 ```bash
-curl -f http://127.0.0.1:8088/api/export -o job-applier-backup.zip
+curl -f http://127.0.0.1:8089/api/export -o job-applier-backup.zip
 # or directly from the web container port:
 # curl -f http://127.0.0.1:8001/api/export -o job-applier-backup.zip
 ```
