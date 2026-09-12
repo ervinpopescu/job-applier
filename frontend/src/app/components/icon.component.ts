@@ -69,6 +69,23 @@ import { CommonModule } from '@angular/common';
         <line x1="12" y1="3" x2="12" y2="15" />
       </g>
 
+      <!-- arrow-left -->
+      <g *ngSwitchCase="'arrow-left'">
+        <line x1="19" y1="12" x2="5" y2="12" />
+        <polyline points="12 19 5 12 12 5" />
+      </g>
+
+      <!-- file-text / resume -->
+      <g *ngSwitchCase="'file-text'">
+        <path
+          d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z"
+        />
+        <path d="M14 2v5a1 1 0 0 0 1 1h5" />
+        <path d="M10 9H8" />
+        <path d="M16 13H8" />
+        <path d="M16 17H8" />
+      </g>
+
       <!-- refresh-cw / sync -->
       <g *ngSwitchCase="'refresh-cw'">
         <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" />
@@ -178,6 +195,65 @@ import { CommonModule } from '@angular/common';
         <path
           d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"
         />
+      </g>
+
+      <!-- bell / notification -->
+      <g *ngSwitchCase="'bell'">
+        <path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" />
+        <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
+      </g>
+
+      <!-- bell-off -->
+      <g *ngSwitchCase="'bell-off'">
+        <path d="M8.7 3A6 6 0 0 1 18 8a21.3 21.3 0 0 0 .6 5" />
+        <path d="M17 17H3s3-2 3-9a4.67 4.67 0 0 1 .3-1.7" />
+        <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
+        <line x1="1" y1="1" x2="23" y2="23" />
+      </g>
+
+      <!-- volume-2 -->
+      <g *ngSwitchCase="'volume-2'">
+        <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+        <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+        <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+      </g>
+
+      <!-- volume-x -->
+      <g *ngSwitchCase="'volume-x'">
+        <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+        <line x1="23" y1="9" x2="17" y2="15" />
+        <line x1="17" y1="9" x2="23" y2="15" />
+      </g>
+
+      <!-- pause -->
+      <g *ngSwitchCase="'pause'">
+        <rect x="6" y="4" width="4" height="16" />
+        <rect x="14" y="4" width="4" height="16" />
+      </g>
+
+      <!-- play -->
+      <polygon *ngSwitchCase="'play'" points="5 3 19 12 5 21 5 3" />
+
+      <!-- square / stop -->
+      <rect *ngSwitchCase="'square'" x="3" y="3" width="18" height="18" rx="2" ry="2" />
+
+      <!-- skip-forward -->
+      <g *ngSwitchCase="'skip-forward'">
+        <polygon points="5 4 15 12 5 20 5 4" />
+        <line x1="19" y1="5" x2="19" y2="19" />
+      </g>
+
+      <!-- monitor / novnc -->
+      <g *ngSwitchCase="'monitor'">
+        <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
+        <line x1="8" y1="21" x2="16" y2="21" />
+        <line x1="12" y1="17" x2="12" y2="21" />
+      </g>
+
+      <!-- check-circle -->
+      <g *ngSwitchCase="'check-circle'">
+        <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+        <polyline points="22 4 12 14.01 9 11.01" />
       </g>
     </svg>
   `,
