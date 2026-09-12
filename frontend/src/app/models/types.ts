@@ -12,7 +12,24 @@ export interface ApplicationItem {
   status?: string;
   submission_type?: string;
   automation_state?: string | null;
+  job_state?: string | null;
   job_id?: string | null;
+  lease_owner?: string | null;
+  retry_count?: number | null;
+  checkpoint?: string | null;
+  attempt_status?: string | null;
+  error_message?: string | null;
+  folder_name?: string;
+}
+
+export interface AppFilterCounts {
+  all: number;
+  queued: number;
+  action_required: number;
+  pending: number;
+  applied: number;
+  skipped: number;
+  failed: number;
 }
 
 export interface AutomationJobStatus {

@@ -12,7 +12,7 @@
         <!-- Logo & Brand -->
         <div
           class="brand flex min-w-0 shrink items-center space-x-2.5 sm:space-x-3.5 cursor-pointer select-none"
-          (click)="activeTab.set('queue')"
+          (click)="activeTab.set('applications')"
         >
           <div
             class="w-9 h-9 rounded-xl bg-gradient-to-tr from-emerald-600 to-teal-400 flex items-center justify-center shadow-md shadow-emerald-950/60 ring-1 ring-emerald-400/30"
@@ -40,56 +40,54 @@
           class="primary-nav order-3 flex min-w-0 w-full items-center gap-1 overflow-visible bg-slate-950/70 p-1 rounded-xl border border-slate-800/80 shadow-inner lg:order-none lg:w-auto lg:gap-1.5 lg:p-1.5"
           aria-label="Dashboard sections"
         >
-          <!-- Queue Tab -->
+          <!-- Applications Tab -->
           <button
             type="button"
-            title="Application queue"
-            aria-label="Application queue"
-            (click)="activeTab.set('queue')"
+            title="Unified applications dashboard"
+            aria-label="Applications dashboard"
+            (click)="activeTab.set('applications')"
             [class]="
-              activeTab() === 'queue'
+              activeTab() === 'applications' || activeTab() === 'queue' || activeTab() === 'tracker'
                 ? 'bg-slate-800 text-emerald-400 shadow-sm font-semibold'
                 : 'text-slate-400 hover:text-slate-200'
             "
             class="min-w-0 flex-1 justify-center px-1 py-1.5 text-xs rounded-lg transition-all flex items-center gap-1 select-none sm:flex-none sm:justify-start sm:gap-2 sm:px-4"
           >
             <app-icon name="layers" className="w-3.5 h-3.5"></app-icon>
-            <span class="nav-label hidden sm:inline">Queue</span>
+            <span class="nav-label hidden sm:inline">Applications</span>
             <span
               class="hidden sm:inline px-1.5 py-0.2 rounded-full text-[10px] bg-slate-900 border border-slate-700 text-slate-300 font-mono font-bold"
               [title]="
-                'Active queue: ' +
-                (stats()?.queue?.active_jobs ?? stats()?.queue?.total_jobs ?? 0) +
-                ' | Pending backlog: ' +
-                (stats()?.pending || 0)
+                'Total applications: ' +
+                (appFilterCounts().all || stats()?.tracker?.total_records || 0)
               "
             >
-              {{ stats()?.queue?.active_jobs ?? stats()?.queue?.total_jobs ?? 0 }}
+              {{ appFilterCounts().all || stats()?.tracker?.total_records || 0 }}
             </span>
             <span
-              *ngIf="(stats()?.pending || 0) > 0"
-              class="hidden md:inline px-1 py-0.2 rounded-full text-[9px] bg-slate-900/60 border border-slate-800 text-slate-500 font-mono"
-              [title]="'Pending backlog: ' + (stats()?.pending || 0)"
+              *ngIf="(appFilterCounts().queued || 0) > 0"
+              class="hidden md:inline px-1 py-0.2 rounded-full text-[9px] bg-emerald-950/60 border border-emerald-800 text-emerald-400 font-mono"
+              [title]="'Queued: ' + (appFilterCounts().queued || 0)"
             >
-              {{ stats()?.pending || 0 }}
+              {{ appFilterCounts().queued }}
             </span>
           </button>
 
-          <!-- Tracker Tab -->
+          <!-- Metrics Tab -->
           <button
             type="button"
-            title="Application tracker"
-            aria-label="Application tracker"
-            (click)="activeTab.set('tracker')"
+            title="Automation and pipeline metrics"
+            aria-label="Automation metrics"
+            (click)="activeTab.set('metrics')"
             [class]="
-              activeTab() === 'tracker'
+              activeTab() === 'metrics'
                 ? 'bg-slate-800 text-emerald-400 shadow-sm font-semibold'
                 : 'text-slate-400 hover:text-slate-200'
             "
             class="min-w-0 flex-1 justify-center px-1 py-1.5 text-xs rounded-lg transition-all flex items-center gap-1 select-none sm:flex-none sm:justify-start sm:gap-2 sm:px-4"
           >
             <app-icon name="activity" className="w-3.5 h-3.5"></app-icon>
-            <span class="nav-label hidden sm:inline">Tracker</span>
+            <span class="nav-label hidden sm:inline">Metrics</span>
           </button>
 
           <!-- Scraper Tab -->
@@ -916,10 +914,10 @@
       </div>
     </div>
 
-    <!-- TAB 1: APPLICATIONS QUEUE -->
-    <section *ngIf="activeTab() === 'queue'">
-      <!-- Toolbar -->
-      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
+    <!-- TAB 1: UNIFIED APPLICATIONS DASHBOARD -->
+    <section *ngIf="activeTab() === 'applications' || activeTab() === 'queue'">
+      <!-- Search & Primary Actions Toolbar -->
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-4">
         <div class="relative flex-1 max-w-md">
           <app-icon
             name="search"
@@ -929,74 +927,21 @@
             type="text"
             [ngModel]="searchQuery()"
             (ngModelChange)="searchQuery.set($event); loadApplications()"
-            placeholder="Search queue by role or company..."
+            placeholder="Search applications by role, company, or URL..."
             class="w-full bg-slate-900 border border-slate-800 rounded-xl pl-10 pr-4 py-2 text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-emerald-500 transition shadow-sm"
           />
         </div>
 
         <div class="queue-actions flex items-center flex-wrap gap-2">
-          <!-- Batch Next 5 -->
+          <!-- Export CSV -->
           <button
-            (click)="triggerBatchApply()"
-            [disabled]="isBatchRunning() || applications().length === 0"
-            class="px-3.5 py-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 shadow-md shadow-emerald-950/40"
+            type="button"
+            (click)="exportCsv()"
+            class="px-3.5 py-2 bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700/80 rounded-xl text-xs font-semibold transition flex items-center gap-1.5 shadow-sm"
+            title="Export applications dynamically from SQLite as CSV"
           >
-            <app-icon name="zap" className="w-3.5 h-3.5 fill-white"></app-icon>
-            <span>Auto-Apply Next 5</span>
-          </button>
-
-          <!-- Prune Duplicates -->
-          <button
-            (click)="pruneDuplicates()"
-            [disabled]="isPruningDupes() || applications().length === 0"
-            class="px-3 py-2 bg-purple-950/40 border border-purple-800/80 hover:bg-purple-900/60 text-purple-300 rounded-xl text-xs font-medium transition flex items-center gap-1.5"
-            title="Purge duplicate application packages with matching roles or URLs"
-          >
-            <app-icon
-              name="copy-check"
-              className="w-3.5 h-3.5"
-              [class.animate-spin]="isPruningDupes()"
-            ></app-icon>
-            <span>{{ isPruningDupes() ? 'Deduplicating...' : 'Prune Duplicates' }}</span>
-          </button>
-
-          <!-- Prune Expired -->
-          <button
-            (click)="pruneInactive()"
-            [disabled]="isPruning() || applications().length === 0"
-            class="px-3 py-2 bg-amber-950/40 border border-amber-800/80 hover:bg-amber-900/60 text-amber-300 rounded-xl text-xs font-medium transition flex items-center gap-1.5"
-            title="Purge closed/expired job postings"
-          >
-            <app-icon
-              name="filter-x"
-              className="w-3.5 h-3.5"
-              [class.animate-spin]="isPruning()"
-            ></app-icon>
-            <span>{{ isPruning() ? 'Pruning...' : 'Prune Expired' }}</span>
-          </button>
-
-          <!-- EMEA Only Filter -->
-          <button
-            (click)="pruneNonEmea()"
-            [disabled]="isPruningEmea() || applications().length === 0"
-            class="px-3 py-2 bg-blue-950/40 border border-blue-800/80 hover:bg-blue-900/60 text-blue-300 rounded-xl text-xs font-medium transition flex items-center gap-1.5"
-            title="Prune applications with US/non-EMEA residency restrictions"
-          >
-            <app-icon
-              name="globe"
-              className="w-3.5 h-3.5"
-              [class.animate-spin]="isPruningEmea()"
-            ></app-icon>
-            <span>{{ isPruningEmea() ? 'Filtering...' : 'EMEA Only Filter' }}</span>
-          </button>
-
-          <!-- Clear Failed -->
-          <button
-            (click)="clearFailed()"
-            class="px-3 py-2 bg-rose-950/40 border border-rose-800/80 hover:bg-rose-900/60 text-rose-300 rounded-xl text-xs font-medium transition flex items-center gap-1.5"
-          >
-            <app-icon name="alert-triangle" className="w-3.5 h-3.5"></app-icon>
-            <span>Clear Failed</span>
+            <app-icon name="download" className="w-3.5 h-3.5 text-emerald-400"></app-icon>
+            <span>Export CSV</span>
           </button>
 
           <!-- Stale indicator if applications in error but cached items exist -->
@@ -1020,6 +965,213 @@
               className="w-4 h-4"
               [class.animate-spin]="isLoading()"
             ></app-icon>
+          </button>
+        </div>
+      </div>
+
+      <!-- Status Filter Pills -->
+      <div class="flex items-center gap-2 overflow-x-auto pb-2 mb-4 scrollbar-thin">
+        <button
+          type="button"
+          (click)="setAppFilter('all')"
+          [class]="
+            appFilter() === 'all'
+              ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/50 font-bold'
+              : 'bg-slate-900/80 text-slate-400 hover:text-slate-200 border-slate-800'
+          "
+          class="px-3 py-1.5 rounded-xl border text-xs flex items-center gap-2 transition whitespace-nowrap"
+        >
+          <span>All</span>
+          <span class="px-1.5 py-0.2 rounded-full text-[10px] bg-slate-950 font-mono">
+            {{ appFilterCounts().all || 0 }}
+          </span>
+        </button>
+
+        <button
+          type="button"
+          (click)="setAppFilter('queued')"
+          [class]="
+            appFilter() === 'queued'
+              ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/50 font-bold'
+              : 'bg-slate-900/80 text-slate-400 hover:text-slate-200 border-slate-800'
+          "
+          class="px-3 py-1.5 rounded-xl border text-xs flex items-center gap-2 transition whitespace-nowrap"
+        >
+          <span class="w-2 h-2 rounded-full bg-teal-400"></span>
+          <span>Queued</span>
+          <span class="px-1.5 py-0.2 rounded-full text-[10px] bg-slate-950 font-mono">
+            {{ appFilterCounts().queued || 0 }}
+          </span>
+        </button>
+
+        <button
+          type="button"
+          *ngIf="(appFilterCounts().action_required || 0) > 0 || appFilter() === 'action_required'"
+          (click)="setAppFilter('action_required')"
+          [class]="
+            appFilter() === 'action_required'
+              ? 'bg-amber-500/20 text-amber-300 border-amber-500/50 font-bold'
+              : 'bg-amber-950/30 text-amber-400 hover:text-amber-200 border-amber-800/60'
+          "
+          class="px-3 py-1.5 rounded-xl border text-xs flex items-center gap-2 transition whitespace-nowrap"
+        >
+          <app-icon name="alert-triangle" className="w-3 h-3 text-amber-400"></app-icon>
+          <span>Action Required</span>
+          <span
+            class="px-1.5 py-0.2 rounded-full text-[10px] bg-slate-950 font-mono font-bold text-amber-300"
+          >
+            {{ appFilterCounts().action_required || 0 }}
+          </span>
+        </button>
+
+        <button
+          type="button"
+          (click)="setAppFilter('pending')"
+          [class]="
+            appFilter() === 'pending'
+              ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/50 font-bold'
+              : 'bg-slate-900/80 text-slate-400 hover:text-slate-200 border-slate-800'
+          "
+          class="px-3 py-1.5 rounded-xl border text-xs flex items-center gap-2 transition whitespace-nowrap"
+        >
+          <span>Pending Review</span>
+          <span class="px-1.5 py-0.2 rounded-full text-[10px] bg-slate-950 font-mono">
+            {{ appFilterCounts().pending || 0 }}
+          </span>
+        </button>
+
+        <button
+          type="button"
+          (click)="setAppFilter('applied')"
+          [class]="
+            appFilter() === 'applied'
+              ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/50 font-bold'
+              : 'bg-slate-900/80 text-slate-400 hover:text-slate-200 border-slate-800'
+          "
+          class="px-3 py-1.5 rounded-xl border text-xs flex items-center gap-2 transition whitespace-nowrap"
+        >
+          <span>Applied</span>
+          <span class="px-1.5 py-0.2 rounded-full text-[10px] bg-slate-950 font-mono">
+            {{ appFilterCounts().applied || 0 }}
+          </span>
+        </button>
+
+        <button
+          type="button"
+          (click)="setAppFilter('skipped')"
+          [class]="
+            appFilter() === 'skipped'
+              ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/50 font-bold'
+              : 'bg-slate-900/80 text-slate-400 hover:text-slate-200 border-slate-800'
+          "
+          class="px-3 py-1.5 rounded-xl border text-xs flex items-center gap-2 transition whitespace-nowrap"
+        >
+          <span>Skipped</span>
+          <span class="px-1.5 py-0.2 rounded-full text-[10px] bg-slate-950 font-mono">
+            {{ appFilterCounts().skipped || 0 }}
+          </span>
+        </button>
+      </div>
+
+      <!-- Bulk Actions Bar -->
+      <div
+        class="flex items-center justify-between flex-wrap gap-3 bg-slate-900/70 border border-slate-800 rounded-2xl p-3 mb-6"
+      >
+        <div class="flex items-center gap-3 flex-wrap">
+          <label class="flex items-center gap-2 text-xs text-slate-300 select-none cursor-pointer">
+            <input
+              type="checkbox"
+              [checked]="isAllAppsSelected()"
+              (change)="toggleSelectAllApps()"
+              aria-label="Select all applications"
+              class="rounded bg-slate-950 border-slate-700 text-emerald-500 focus:ring-emerald-500/20 cursor-pointer"
+            />
+            <span>Select All ({{ applications().length }})</span>
+          </label>
+
+          <button
+            *ngIf="selectedAppCount() > 0"
+            (click)="queueSelectedApps()"
+            class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition shadow-sm"
+          >
+            <app-icon name="layers" className="w-3.5 h-3.5"></app-icon>
+            <span>Queue Selected ({{ selectedAppCount() }})</span>
+          </button>
+
+          <button
+            (click)="queueAllPending()"
+            class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-medium flex items-center gap-1.5 transition border border-slate-700/60"
+            title="Enqueue all pending applications into the automation queue"
+          >
+            <app-icon name="play" className="w-3.5 h-3.5 text-emerald-400"></app-icon>
+            <span>Queue All Pending</span>
+          </button>
+
+          <!-- Auto-Apply Next 5 -->
+          <button
+            (click)="triggerBatchApply()"
+            [disabled]="isBatchRunning() || applications().length === 0"
+            class="px-3 py-1.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition flex items-center gap-1.5 shadow-md shadow-emerald-950/40"
+          >
+            <app-icon name="zap" className="w-3.5 h-3.5 fill-white"></app-icon>
+            <span>Auto-Apply Next 5</span>
+          </button>
+        </div>
+
+        <div class="flex items-center gap-2 flex-wrap">
+          <!-- Prune Duplicates -->
+          <button
+            (click)="pruneDuplicates()"
+            [disabled]="isPruningDupes() || applications().length === 0"
+            class="px-2.5 py-1.5 bg-purple-950/40 border border-purple-800/80 hover:bg-purple-900/60 text-purple-300 rounded-xl text-xs font-medium transition flex items-center gap-1"
+            title="Purge duplicate application packages with matching roles or URLs"
+          >
+            <app-icon
+              name="copy-check"
+              className="w-3 h-3"
+              [class.animate-spin]="isPruningDupes()"
+            ></app-icon>
+            <span>Prune Duplicates</span>
+          </button>
+
+          <!-- Prune Expired -->
+          <button
+            (click)="pruneInactive()"
+            [disabled]="isPruning() || applications().length === 0"
+            class="px-2.5 py-1.5 bg-amber-950/40 border border-amber-800/80 hover:bg-amber-900/60 text-amber-300 rounded-xl text-xs font-medium transition flex items-center gap-1"
+            title="Purge closed/expired job postings"
+          >
+            <app-icon
+              name="filter-x"
+              className="w-3 h-3"
+              [class.animate-spin]="isPruning()"
+            ></app-icon>
+            <span>Prune Expired</span>
+          </button>
+
+          <!-- EMEA Only Filter -->
+          <button
+            (click)="pruneNonEmea()"
+            [disabled]="isPruningEmea() || applications().length === 0"
+            class="px-2.5 py-1.5 bg-blue-950/40 border border-blue-800/80 hover:bg-blue-900/60 text-blue-300 rounded-xl text-xs font-medium transition flex items-center gap-1"
+            title="Prune applications with US/non-EMEA residency restrictions"
+          >
+            <app-icon
+              name="globe"
+              className="w-3 h-3"
+              [class.animate-spin]="isPruningEmea()"
+            ></app-icon>
+            <span>EMEA Filter</span>
+          </button>
+
+          <!-- Clear Failed -->
+          <button
+            (click)="clearFailed()"
+            class="px-2.5 py-1.5 bg-rose-950/40 border border-rose-800/80 hover:bg-rose-900/60 text-rose-300 rounded-xl text-xs font-medium transition flex items-center gap-1"
+            title="Purge failed application records"
+          >
+            <app-icon name="alert-triangle" className="w-3 h-3"></app-icon>
+            <span>Clear Failed</span>
           </button>
         </div>
       </div>
@@ -1201,20 +1353,58 @@
         >
           <div>
             <div class="flex items-start justify-between gap-3 mb-2">
-              <div>
-                <h3
-                  class="font-bold text-white text-base leading-snug line-clamp-1 group-hover:text-emerald-300 transition-colors"
-                >
-                  {{ app.company }}
-                </h3>
-                <h4 class="text-xs font-medium text-slate-300 mt-0.5 line-clamp-1">
-                  {{ app.title }}
-                </h4>
+              <div class="flex items-start gap-2.5 min-w-0">
+                <input
+                  type="checkbox"
+                  [checked]="isAppSelected(app.id)"
+                  (click)="$event.stopPropagation()"
+                  (change)="toggleAppSelection(app.id, $event)"
+                  [aria-label]="'Select ' + (app.company || 'application')"
+                  class="mt-1 rounded bg-slate-950 border-slate-700 text-emerald-500 focus:ring-emerald-500/20 cursor-pointer shrink-0"
+                />
+                <div class="min-w-0">
+                  <h3
+                    class="font-bold text-white text-base leading-snug line-clamp-1 group-hover:text-emerald-300 transition-colors"
+                  >
+                    {{ app.company }}
+                  </h3>
+                  <h4 class="text-xs font-medium text-slate-300 mt-0.5 line-clamp-1">
+                    {{ app.title }}
+                  </h4>
+                </div>
               </div>
               <span
                 class="text-[10px] font-mono px-2 py-0.5 rounded-md bg-slate-950 border border-slate-800 text-slate-400 shrink-0"
               >
                 {{ app.created_at }}
+              </span>
+            </div>
+
+            <!-- Dual Status Badges & Platform -->
+            <div class="flex items-center gap-1.5 flex-wrap my-2">
+              <!-- Application Status -->
+              <span
+                class="px-2 py-0.5 rounded-md border text-[10px] font-semibold uppercase tracking-wider"
+                [ngClass]="appStatusClass(app.status)"
+              >
+                {{ app.status || 'pending' }}
+              </span>
+
+              <!-- Queue Status -->
+              <span
+                class="px-2 py-0.5 rounded-md border text-[10px] font-medium flex items-center gap-1"
+                [ngClass]="appQueueStatusClass(app)"
+              >
+                <span class="w-1.5 h-1.5 rounded-full bg-current"></span>
+                <span>{{ appQueueStatusLabel(app) }}</span>
+              </span>
+
+              <!-- Platform Badge -->
+              <span
+                *ngIf="app.platform"
+                class="px-2 py-0.5 rounded-md bg-slate-950 border border-slate-800 text-slate-400 text-[10px]"
+              >
+                {{ app.platform }}
               </span>
             </div>
 
@@ -1317,7 +1507,7 @@
           <div
             class="card-actions pt-4 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2"
           >
-            <div class="flex items-center gap-1.5">
+            <div class="flex items-center gap-1.5 flex-wrap">
               <button
                 (click)="openReviewModal(app.id)"
                 class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-semibold transition flex items-center gap-1"
@@ -1326,6 +1516,41 @@
               >
                 <app-icon name="file-text" className="w-3 h-3"></app-icon>
                 <span>Review CV</span>
+              </button>
+
+              <!-- Queue / Cancel Queue Toggle -->
+              <button
+                type="button"
+                (click)="toggleQueueApp(app, $event)"
+                [class]="
+                  isAppCancellable(app)
+                    ? 'px-3 py-1.5 bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-800/60 rounded-xl text-xs font-semibold transition flex items-center gap-1'
+                    : 'px-3 py-1.5 bg-teal-950/40 hover:bg-teal-900/60 text-teal-300 border border-teal-800/60 rounded-xl text-xs font-semibold transition flex items-center gap-1'
+                "
+                [title]="isAppCancellable(app) ? 'Cancel queue job' : 'Add to automation queue'"
+              >
+                <app-icon
+                  [name]="isAppCancellable(app) ? 'x' : 'play'"
+                  className="w-3 h-3"
+                ></app-icon>
+                <span>{{ isAppCancellable(app) ? 'Cancel Queue' : 'Queue' }}</span>
+              </button>
+
+              <!-- Takeover (when action required) -->
+              <button
+                *ngIf="
+                  app.job_state === 'auth_required' ||
+                  app.job_state === 'mfa_required' ||
+                  app.job_state === 'captcha_required' ||
+                  app.automation_state === 'auth_required'
+                "
+                type="button"
+                (click)="openTakeoverForJob(app.job_id, $event)"
+                class="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-xl text-xs transition flex items-center gap-1 shadow-md shadow-amber-950/50 animate-pulse"
+                title="Takeover browser to solve authentication"
+              >
+                <app-icon name="key" className="w-3 h-3"></app-icon>
+                <span>Takeover</span>
               </button>
 
               <button
@@ -1375,16 +1600,18 @@
       </div>
     </section>
 
-    <!-- TAB 2: APPLICATION TRACKER -->
-    <section *ngIf="activeTab() === 'tracker'">
-      <div class="bg-slate-900/90 border border-slate-800 rounded-2xl overflow-hidden shadow-sm">
+    <!-- TAB 2: AUTOMATION & PIPELINE METRICS -->
+    <section *ngIf="activeTab() === 'metrics'">
+      <div
+        class="bg-slate-900/90 border border-slate-800 rounded-2xl overflow-hidden shadow-sm mb-6"
+      >
         <div
           class="p-4 border-b border-slate-800 flex items-center justify-between flex-wrap gap-4"
         >
           <div>
             <h3 class="text-base font-bold text-white flex items-center gap-2">
               <app-icon name="activity" className="w-4 h-4 text-emerald-400"></app-icon>
-              <span>Application Pipeline History</span>
+              <span>Application Pipeline & Automation Metrics</span>
             </h3>
             <p class="text-xs text-slate-400">
               Track statuses, dates, platforms, and submission proofs.

@@ -103,6 +103,7 @@ describe('App Component - State & Degraded Mode Recovery', () => {
       importBackup: vi.fn(),
       resolveUrl: vi.fn().mockImplementation((path: string) => path),
       getExportUrl: vi.fn().mockReturnValue('/api/export'),
+      getTrackerExportCsvUrl: vi.fn().mockReturnValue('/api/tracker/export'),
     };
 
     TestBed.configureTestingModule({
@@ -131,8 +132,8 @@ describe('App Component - State & Degraded Mode Recovery', () => {
     expect(nav.className).not.toContain('overflow-x-auto');
     expect(tabs.every((tab) => tab.className.includes('flex-1'))).toBe(true);
     expect(tabs.map((tab) => tab.getAttribute('aria-label'))).toEqual([
-      'Application queue',
-      'Application tracker',
+      'Applications dashboard',
+      'Automation metrics',
       'Scraper configuration',
       'Execution console',
       'Candidate profile',
@@ -625,7 +626,7 @@ describe('App Component - State & Degraded Mode Recovery', () => {
       expect(app.isImporting()).toBe(false);
       expect(app.searchQuery()).toBe('');
       expect(app.trackerFilter()).toBe('');
-      expect(app.activeTab()).toBe('queue');
+      expect(app.activeTab()).toBe('applications');
       expect(app.toast().visible).toBe(true);
       expect(app.toast().type).toBe('success');
       expect(app.toast().message).toContain('5 applications and 12 records');
@@ -694,6 +695,205 @@ describe('App Component - State & Degraded Mode Recovery', () => {
     it('computes vncUrl pointing to vnc_lite.html with scale and path=browser/websockify', () => {
       const urlStr = String(app.vncUrl());
       expect(urlStr).toContain('/browser/vnc_lite.html?scale=true&path=browser/websockify');
+    });
+  });
+
+  describe('Unified Applications Dashboard', () => {
+    it('switches status filter pills and loads filtered applications', () => {
+      mockApi.getApplications = vi.fn().mockReturnValue(
+        of({
+          items: [
+            {
+              id: 'app-queued-1',
+              company: 'Stripe',
+              title: 'Infrastructure Engineer',
+              job_url: 'https://stripe.com/jobs/1',
+              cv_filename: 'cv.pdf',
+              has_cover_letter: true,
+              cover_letter_preview: 'Preview',
+              pdf_url: '/files/cv.pdf',
+              created_at: '2026-09-12',
+              status: 'pending',
+              job_state: 'ready',
+              job_id: 'job-1',
+            },
+          ],
+          total: 1,
+          counts: { all: 10, queued: 1, action_required: 0, pending: 8, applied: 1, skipped: 0 },
+        }),
+      );
+
+      app.setAppFilter('queued');
+      expect(app.appFilter()).toBe('queued');
+      expect(mockApi.getApplications).toHaveBeenCalledWith('', 100, 0, undefined, 'queued');
+      expect(app.applications()).toHaveLength(1);
+      expect(app.appFilterCounts().all).toBe(10);
+      expect(app.appFilterCounts().queued).toBe(1);
+    });
+
+    it('toggles multi-selection and executes bulk enqueue', () => {
+      app.applications.set([
+        {
+          id: 'app-1',
+          company: 'GitHub',
+          title: 'Staff Engineer',
+          job_url: 'https://github.com/jobs/1',
+          cv_filename: '',
+          has_cover_letter: false,
+          cover_letter_preview: '',
+          pdf_url: '',
+          created_at: '2026-09-12',
+        },
+        {
+          id: 'app-2',
+          company: 'Vercel',
+          title: 'Frontend Engineer',
+          job_url: 'https://vercel.com/jobs/2',
+          cv_filename: '',
+          has_cover_letter: false,
+          cover_letter_preview: '',
+          pdf_url: '',
+          created_at: '2026-09-12',
+        },
+      ]);
+
+      expect(app.isAllAppsSelected()).toBe(false);
+      app.toggleSelectAllApps();
+      expect(app.isAllAppsSelected()).toBe(true);
+      expect(app.selectedAppCount()).toBe(2);
+
+      mockApi.batchApply = vi.fn().mockReturnValue(of({ status: 'queued', queued_count: 2 }));
+      app.queueSelectedApps();
+      expect(mockApi.batchApply).toHaveBeenCalledWith(2, 'assisted', ['app-1', 'app-2']);
+      expect(app.selectedAppCount()).toBe(0);
+      expect(app.toast().visible).toBe(true);
+      expect(app.toast().message).toContain('Enqueued 2 selected applications');
+    });
+
+    it('toggles queue status for a single application', () => {
+      mockApi.cancelJob = vi.fn().mockReturnValue(of({ status: 'cancelled' }));
+      const queuedApp = {
+        id: 'app-queued',
+        company: 'Figma',
+        title: 'Design Technologist',
+        job_url: 'https://figma.com/jobs/1',
+        cv_filename: '',
+        has_cover_letter: false,
+        cover_letter_preview: '',
+        pdf_url: '',
+        created_at: '2026-09-12',
+        job_id: 'job-figma',
+        job_state: 'ready',
+      };
+
+      app.toggleQueueApp(queuedApp);
+      expect(mockApi.cancelJob).toHaveBeenCalledWith('job-figma');
+      expect(app.toast().message).toContain('Cancelled queue job for Figma');
+
+      mockApi.batchApply = vi.fn().mockReturnValue(of({ status: 'queued' }));
+      const unqueuedApp = {
+        id: 'app-unqueued',
+        company: 'Canva',
+        title: 'Web Engineer',
+        job_url: 'https://canva.com/jobs/2',
+        cv_filename: '',
+        has_cover_letter: false,
+        cover_letter_preview: '',
+        pdf_url: '',
+        created_at: '2026-09-12',
+      };
+      app.toggleQueueApp(unqueuedApp);
+      expect(mockApi.batchApply).toHaveBeenCalledWith(1, 'assisted', ['app-unqueued']);
+      expect(app.toast().message).toContain('Enqueued Canva');
+    });
+
+    it('opens takeover modal when action is required and stores activeTakeoverJobId', () => {
+      mockApi.claimTakeover = vi
+        .fn()
+        .mockReturnValue(of({ status: 'claimed', lease_seconds: 300 }));
+      mockApi.reopenAuthSession = vi
+        .fn()
+        .mockReturnValue(of({ status: 'ok', message: 'Reopened' }));
+      mockApi.resumeTakeover = vi.fn().mockReturnValue(of({ status: 'ok', message: 'Resumed' }));
+
+      app.openTakeoverForJob('job-action-needed');
+      expect(mockApi.claimTakeover).toHaveBeenCalled();
+      expect(app.vncModalOpen()).toBe(true);
+      expect(app.activeTakeoverJobId()).toBe('job-action-needed');
+
+      app.reopenAuthSession();
+      expect(mockApi.reopenAuthSession).toHaveBeenCalledWith('job-action-needed');
+
+      app.openTakeoverForJob('job-action-needed');
+      app.resumeFromTakeover();
+      expect(mockApi.resumeTakeover).toHaveBeenCalledWith('job-action-needed');
+
+      app.closeTakeoverModal();
+      expect(app.activeTakeoverJobId()).toBeNull();
+    });
+
+    it('evaluates isAppCancellable accurately across queue states', () => {
+      const activeApp = {
+        id: 'app-active',
+        company: 'Stripe',
+        title: 'API Engineer',
+        job_url: 'https://stripe.com/jobs/1',
+        cv_filename: '',
+        has_cover_letter: false,
+        cover_letter_preview: '',
+        pdf_url: '',
+        created_at: '2026-09-12',
+        job_id: 'job-stripe',
+        job_state: 'filling',
+      };
+      expect(app.isAppCancellable(activeApp)).toBe(true);
+
+      const readyApp = { ...activeApp, job_state: 'ready' };
+      expect(app.isAppCancellable(readyApp)).toBe(true);
+
+      const completedApp = { ...activeApp, job_state: 'completed' };
+      expect(app.isAppCancellable(completedApp)).toBe(false);
+
+      const unqueuedApp = { ...activeApp, job_id: undefined, job_state: undefined };
+      expect(app.isAppCancellable(unqueuedApp)).toBe(false);
+    });
+
+    it('clears selectedAppIds when switching app filter', () => {
+      app.selectedAppIds.set(new Set(['app-1', 'app-2']));
+      expect(app.selectedAppCount()).toBe(2);
+
+      app.setAppFilter('applied');
+      expect(app.appFilter()).toBe('applied');
+      expect(app.selectedAppCount()).toBe(0);
+      expect(app.selectedAppIds().size).toBe(0);
+    });
+
+    it('displays count when queueAllPending succeeds with count response', () => {
+      mockApi.batchRequeue = vi.fn().mockReturnValue(of({ success: true, count: 5 }));
+      app.queueAllPending();
+      expect(mockApi.batchRequeue).toHaveBeenCalledWith({
+        requeue_all: true,
+        status_filter: 'pending',
+      });
+      expect(app.toast().visible).toBe(true);
+      expect(app.toast().message).toContain('Enqueued 5 pending applications!');
+    });
+
+    it('triggers export CSV URL download', () => {
+      const clickSpy = vi.fn();
+      const mockAnchor = {
+        href: '',
+        setAttribute: vi.fn(),
+        click: clickSpy,
+      } as unknown as HTMLAnchorElement;
+
+      vi.spyOn(document, 'createElement').mockReturnValue(mockAnchor);
+      vi.spyOn(document.body, 'appendChild').mockImplementation(() => mockAnchor);
+      vi.spyOn(document.body, 'removeChild').mockImplementation(() => mockAnchor);
+
+      app.exportCsv();
+      expect(mockAnchor.setAttribute).toHaveBeenCalledWith('download', 'applications_tracker.csv');
+      expect(clickSpy).toHaveBeenCalled();
     });
   });
 });

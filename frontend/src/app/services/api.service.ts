@@ -2,6 +2,7 @@ import { Injectable, inject } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import type { Observable } from 'rxjs';
 import type {
+  AppFilterCounts,
   ApplicationDetail,
   ApplicationItem,
   ApplicationAutomationEventsResponse,
@@ -11,7 +12,6 @@ import type {
   AutomationFunnel,
   AutomationStatus,
   CandidateProfile,
-  DurableNotification,
   NotificationListResponse,
   PipelineStatus,
   QueueJobActionResponse,
@@ -86,11 +86,31 @@ export class ApiService {
     search = '',
     limit = 60,
     offset = 0,
-    queueOnly = true,
-  ): Observable<{ items: ApplicationItem[]; total: number; scope?: string }> {
-    let url = `/api/applications?limit=${limit}&offset=${offset}&queue_only=${queueOnly}`;
+    queueOnly?: boolean,
+    filter?: string,
+  ): Observable<{
+    items: ApplicationItem[];
+    total: number;
+    scope?: string;
+    counts?: AppFilterCounts;
+  }> {
+    let url = `/api/applications?limit=${limit}&offset=${offset}`;
+    if (filter) {
+      url += `&filter=${encodeURIComponent(filter)}`;
+    } else if (queueOnly !== undefined) {
+      url += `&queue_only=${queueOnly}`;
+    }
     if (search) url += `&search=${encodeURIComponent(search)}`;
-    return this.http.get<{ items: ApplicationItem[]; total: number }>(this.resolveUrl(url));
+    return this.http.get<{
+      items: ApplicationItem[];
+      total: number;
+      scope?: string;
+      counts?: AppFilterCounts;
+    }>(this.resolveUrl(url));
+  }
+
+  getTrackerExportCsvUrl(): string {
+    return this.resolveUrl('/api/tracker/export');
   }
 
   getApplication(appId: string): Observable<ApplicationDetail> {
@@ -138,10 +158,12 @@ export class ApiService {
   batchApply(
     count = 5,
     mode: 'assisted' | 'autonomous' = 'assisted',
+    appIds?: string[],
   ): Observable<Record<string, unknown>> {
     return this.http.post<Record<string, unknown>>(this.resolveUrl('/api/batch-apply'), {
       count,
       mode,
+      app_ids: appIds,
     });
   }
 
