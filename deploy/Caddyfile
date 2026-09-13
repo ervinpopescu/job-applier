@@ -26,7 +26,7 @@
 	header @html_navigation Expires "0"
 
 	# Forward-auth gate for protected browser viewer HTTP & WebSocket upgrades
-	handle /browser* {
+	handle_path /browser* {
 		header Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' wss://jobs.archnet.lol wss://aslan.archnet.lol; frame-src 'self'; worker-src 'self' blob:; form-action 'self'; frame-ancestors 'self'"
 
 		forward_auth web:8000 {

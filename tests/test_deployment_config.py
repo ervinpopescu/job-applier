@@ -89,3 +89,11 @@ def test_justfile_service_management_recipes() -> None:
             check=True,
         )
         assert "web|gateway|runtime|cloudflared|ntfy" in usage_run.stdout
+
+
+def test_caddyfile_browser_viewer_path_stripping() -> None:
+    """Verify that Caddy strips /browser prefix with handle_path before proxying to noVNC."""
+    caddyfile = (PROJECT_ROOT / "deploy" / "Caddyfile").read_text(encoding="utf-8")
+    assert "handle_path /browser* {" in caddyfile
+    assert "reverse_proxy @static_viewer runtime:6080" in caddyfile
+    assert "uri /api/auth/viewer-gate" in caddyfile
