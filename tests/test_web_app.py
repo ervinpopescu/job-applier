@@ -90,6 +90,10 @@ def test_application_details_use_persisted_collision_folder_for_hipo_queue_row(
     output_dir.mkdir()
     monkeypatch.setenv("JOB_APPLIER_DB_PATH", str(db_file))
     monkeypatch.setattr(app_module, "output_apps_dir", output_dir)
+    for route in app_module.app.routes:
+        if getattr(route, "path", None) == "/files/applications":
+            monkeypatch.setattr(route.app, "all_directories", [str(output_dir)])
+            monkeypatch.setattr(route.app, "directory", str(output_dir))
     db_module.init_db(db_file)
 
     app_id = "Hipo_Employer_Software_Requirements_Engineer"
@@ -139,6 +143,37 @@ def test_application_details_use_persisted_collision_folder_for_hipo_queue_row(
         f"{app_id}/CV_Hipo_Employer_Software_Requirements_Engineer.pdf"
     )
     assert stat_result is not None
+
+
+def test_browser_viewer_serves_novnc_asset(client, tmp_path, monkeypatch):
+    """Verify that /browser/vnc_lite.html serves noVNC static assets with correct media type."""
+    import importlib
+
+    app_module = importlib.import_module("job_applier.web.app")
+    mock_novnc = tmp_path / "novnc"
+    mock_novnc.mkdir()
+    (mock_novnc / "vnc_lite.html").write_text(
+        "<!DOCTYPE html><html>noVNC Lite</html>", encoding="utf-8"
+    )
+    (mock_novnc / "core").mkdir()
+    (mock_novnc / "core" / "rfb.js").write_text(
+        "export default class RFB {};", encoding="utf-8"
+    )
+    monkeypatch.setattr(app_module, "novnc_dir", mock_novnc)
+
+    res = client.get("/browser/vnc_lite.html")
+    assert res.status_code == 200
+    assert "noVNC Lite" in res.text
+    assert res.headers["content-type"].startswith("text/html")
+
+    res_js = client.get("/browser/core/rfb.js")
+    assert res_js.status_code == 200
+    assert "export default class RFB" in res_js.text
+    assert "javascript" in res_js.headers["content-type"]
+
+    res_root = client.get("/browser")
+    assert res_root.status_code == 200
+    assert "noVNC Lite" in res_root.text
 
 
 def test_dismiss_application_persists_and_removes_queue_card(

@@ -98,7 +98,27 @@ class SafeStaticFiles(StaticFiles):
 class ApplicationStaticFiles(SafeStaticFiles):
     """Serve artifact files through both application IDs and persisted folder names."""
 
+    def __init__(
+        self,
+        *,
+        directory: os.PathLike | str | None = None,
+        packages: list[str | tuple[str, str]] | None = None,
+        html: bool = False,
+        check_dir: bool = True,
+        follow_symlink: bool = False,
+    ) -> None:
+        self._custom_directory = directory
+        super().__init__(
+            directory=str(directory) if directory is not None else str(output_apps_dir),
+            packages=packages,
+            html=html,
+            check_dir=check_dir,
+            follow_symlink=follow_symlink,
+        )
+
     def lookup_path(self, path: str):
+        if self._custom_directory is None:
+            self.all_directories = [str(output_apps_dir)]
         full_path, stat_result = super().lookup_path(path)
         if stat_result is not None:
             return full_path, stat_result
@@ -185,7 +205,7 @@ resume_generation_state: dict[str, Any] = {
 # Mount files directories
 app.mount(
     "/files/applications",
-    ApplicationStaticFiles(directory=str(output_apps_dir)),
+    ApplicationStaticFiles(),
     name="applications_files",
 )
 app.mount(
@@ -1875,6 +1895,79 @@ def viewer_gate_endpoint(request: Request) -> Response:
 async def viewer_gate_ws_route(websocket: WebSocket) -> None:
     """Gracefully closes any direct WebSocket handshake to the HTTP viewer-gate endpoint."""
     await websocket.close(code=1000)
+
+
+# noVNC browser viewer assets fallback for direct web backend access
+novnc_dir = Path(os.environ.get("NOVNC_DIR", "/usr/share/novnc"))
+
+
+@app.get("/browser/{asset_path:path}")
+async def browser_asset_endpoint(asset_path: str, request: Request) -> Response:
+    """Serves noVNC static assets with fallback to runtime websockify."""
+    target_path = asset_path.strip("/")
+    if not target_path or target_path == "index.html":
+        target_path = "vnc_lite.html"
+
+    # Reject directory traversal attempts
+    if ".." in Path(target_path).parts:
+        raise HTTPException(status_code=400, detail="Invalid asset path")
+
+    # 1. Direct filesystem serving if noVNC is installed locally
+    if novnc_dir.is_dir():
+        candidate_file = (novnc_dir / target_path).resolve()
+        novnc_resolved = novnc_dir.resolve()
+        if candidate_file.is_relative_to(novnc_resolved) and candidate_file.is_file():
+            media_type = None
+            if candidate_file.suffix == ".html":
+                media_type = "text/html"
+            elif candidate_file.suffix == ".js":
+                media_type = "text/javascript"
+            elif candidate_file.suffix == ".css":
+                media_type = "text/css"
+            return FileResponse(candidate_file, media_type=media_type)
+
+    # 2. Proxy to runtime daemon / websockify HTTP server
+    import httpx
+
+    runtime_http = os.getenv(
+        "RUNTIME_HTTP_URL",
+        "http://runtime:6080"
+        if os.path.exists("/.dockerenv")
+        else "http://127.0.0.1:6080",
+    )
+    target_url = f"{runtime_http.rstrip('/')}/{target_path}"
+    async with httpx.AsyncClient() as http_client:
+        try:
+            resp = await http_client.get(
+                target_url,
+                params=dict(request.query_params),
+                timeout=5.0,
+            )
+            return Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                headers={
+                    k: v
+                    for k, v in resp.headers.items()
+                    if k.lower()
+                    not in (
+                        "content-length",
+                        "content-encoding",
+                        "transfer-encoding",
+                    )
+                },
+                media_type=resp.headers.get("content-type"),
+            )
+        except Exception:
+            raise HTTPException(
+                status_code=404, detail="Browser viewer asset not found"
+            )
+
+
+@app.get("/browser")
+async def browser_root_endpoint(request: Request) -> Response:
+    """Redirects or serves vnc_lite.html for /browser."""
+    return await browser_asset_endpoint("vnc_lite.html", request)
 
 
 @app.websocket("/browser/websockify")
