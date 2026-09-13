@@ -255,6 +255,46 @@ import { CommonModule } from '@angular/common';
         <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
         <polyline points="22 4 12 14.01 9 11.01" />
       </g>
+
+      <!-- maximize -->
+      <g *ngSwitchCase="'maximize'">
+        <path
+          d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"
+        />
+      </g>
+
+      <!-- minimize -->
+      <g *ngSwitchCase="'minimize'">
+        <path
+          d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"
+        />
+      </g>
+
+      <!-- chevron-up -->
+      <polyline *ngSwitchCase="'chevron-up'" points="18 15 12 9 6 15" />
+
+      <!-- chevron-down -->
+      <polyline *ngSwitchCase="'chevron-down'" points="6 9 12 15 18 9" />
+
+      <!-- sliders -->
+      <g *ngSwitchCase="'sliders'">
+        <line x1="4" x2="4" y1="21" y2="14" />
+        <line x1="4" x2="4" y1="10" y2="3" />
+        <line x1="12" x2="12" y1="21" y2="12" />
+        <line x1="12" x2="12" y1="8" y2="3" />
+        <line x1="20" x2="20" y1="21" y2="16" />
+        <line x1="20" x2="20" y1="12" y2="3" />
+        <line x1="1" x2="7" y1="14" y2="14" />
+        <line x1="9" x2="15" y1="8" y2="8" />
+        <line x1="17" x2="23" y1="16" y2="16" />
+      </g>
+
+      <!-- type -->
+      <g *ngSwitchCase="'type'">
+        <polyline points="4 7 4 4 20 4 20 7" />
+        <line x1="9" y1="20" x2="15" y2="20" />
+        <line x1="12" y1="4" x2="12" y2="20" />
+      </g>
     </svg>
   `,
   styles: [

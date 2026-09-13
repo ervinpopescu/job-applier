@@ -692,9 +692,128 @@ describe('App Component - State & Degraded Mode Recovery', () => {
       expect(app.toast().message).toContain('dashboard refresh failed');
     });
 
-    it('computes vncUrl pointing to vnc_lite.html with scale and path=browser/websockify', () => {
-      const urlStr = String(app.vncUrl());
-      expect(urlStr).toContain('/browser/vnc_lite.html?scale=true&path=browser/websockify');
+    it('computes vncUrl pointing to vnc.html in full mode and vnc_lite.html in lite mode', () => {
+      expect(app.vncViewerMode()).toBe('full');
+      expect(String(app.vncUrl())).toContain(
+        '/browser/vnc.html?autoconnect=true&resize=scale&reconnect=true&path=browser/websockify',
+      );
+
+      app.setVncViewerMode('lite');
+      expect(app.vncViewerMode()).toBe('lite');
+      expect(String(app.vncUrl())).toContain(
+        '/browser/vnc_lite.html?scale=true&path=browser/websockify',
+      );
+
+      app.toggleVncViewerMode();
+      expect(app.vncViewerMode()).toBe('full');
+      expect(String(app.vncUrl())).toContain(
+        '/browser/vnc.html?autoconnect=true&resize=scale&reconnect=true&path=browser/websockify',
+      );
+    });
+
+    it('provides mobile touch controls, quick text input, and scroll buttons', async () => {
+      // Quick text input modal
+      app.openQuickTextInput();
+      expect(app.quickTextInputOpen()).toBe(true);
+      expect(app.quickTextInputValue()).toBe('');
+
+      app.quickTextInputValue.set('Expected Salary: 75k EUR');
+      const copySpy = vi.spyOn(app, 'copyText').mockImplementation(async (text, msg) => {
+        app.showToast(msg || 'Copied!');
+      });
+
+      app.sendQuickText();
+      expect(copySpy).toHaveBeenCalledWith(
+        'Expected Salary: 75k EUR',
+        'Text copied to clipboard! Paste directly into the browser field.',
+      );
+      expect(app.quickTextInputOpen()).toBe(false);
+      expect(app.toast().message).toContain('Text copied to clipboard');
+
+      // Scroll buttons
+      app.scrollRemote('up');
+      expect(app.toast().message).toContain('Scrolled up');
+
+      app.scrollRemote('down');
+      expect(app.toast().message).toContain('Scrolled down');
+
+      // Fullscreen toggle
+      expect(app.isFullscreen()).toBe(false);
+      const requestFullscreenSpy = vi.fn().mockResolvedValue(undefined);
+      const exitFullscreenSpy = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(document, 'fullscreenElement', {
+        value: null,
+        writable: true,
+        configurable: true,
+      });
+      Object.defineProperty(document.documentElement, 'requestFullscreen', {
+        value: requestFullscreenSpy,
+        writable: true,
+        configurable: true,
+      });
+      Object.defineProperty(document, 'exitFullscreen', {
+        value: exitFullscreenSpy,
+        writable: true,
+        configurable: true,
+      });
+
+      app.toggleFullscreen();
+      expect(requestFullscreenSpy).toHaveBeenCalled();
+    });
+
+    it('renders mobile-optimized takeover dialog with touch assist bar and 100dvh styling', () => {
+      app.openTakeoverModal();
+      fixture.detectChanges();
+
+      const backdrop = fixture.nativeElement.querySelector('.modal-backdrop');
+      expect(backdrop.className).toContain('p-0');
+      expect(backdrop.className).toContain('sm:p-4');
+
+      const dialog = fixture.nativeElement.querySelector('.vnc-dialog');
+      expect(dialog.className).toContain('h-[100dvh]');
+      expect(dialog.className).toContain('max-h-[100dvh]');
+      expect(dialog.className).toContain('rounded-none');
+      expect(dialog.className).toContain('sm:rounded-3xl');
+
+      const assistBar = fixture.nativeElement.querySelector('.touch-assist-bar');
+      expect(assistBar).not.toBeNull();
+      expect(assistBar.getAttribute('role')).toBe('toolbar');
+
+      const fullModeBtn = assistBar.querySelector('button[aria-label="Full noVNC UI mode"]');
+      const liteModeBtn = assistBar.querySelector('button[aria-label="Lite noVNC UI mode"]');
+      const textInputBtn = assistBar.querySelector('button[aria-label="Quick text input"]');
+      const scrollUpBtn = assistBar.querySelector('button[aria-label="Scroll remote page up"]');
+      const scrollDownBtn = assistBar.querySelector('button[aria-label="Scroll remote page down"]');
+      const fullscreenBtn = assistBar.querySelector(
+        'button[aria-label="Toggle native fullscreen"]',
+      );
+
+      expect(fullModeBtn).not.toBeNull();
+      expect(liteModeBtn).not.toBeNull();
+      expect(textInputBtn).not.toBeNull();
+      expect(scrollUpBtn).not.toBeNull();
+      expect(scrollDownBtn).not.toBeNull();
+      expect(fullscreenBtn).not.toBeNull();
+
+      const iframeContainer = fixture.nativeElement.querySelector('.vnc-dialog .touch-none');
+      expect(iframeContainer).not.toBeNull();
+      expect(iframeContainer.getAttribute('style')).toContain('touch-action: none');
+      expect(iframeContainer.className).toContain('touch-none');
+
+      // Test switching mode via UI button
+      liteModeBtn.click();
+      fixture.detectChanges();
+      expect(app.vncViewerMode()).toBe('lite');
+
+      // Test opening text input via UI button
+      textInputBtn.click();
+      fixture.detectChanges();
+      expect(app.quickTextInputOpen()).toBe(true);
+
+      app.closeTakeoverModal();
+      fixture.detectChanges();
+      expect(app.vncModalOpen()).toBe(false);
+      expect(app.quickTextInputOpen()).toBe(false);
     });
   });
 

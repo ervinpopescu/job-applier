@@ -158,11 +158,18 @@ export class App implements OnInit, OnDestroy {
   resolveApprovedScope = signal<string>('global');
   isResolvingJob = signal(false);
 
-  vncUrl = computed(() =>
-    this.sanitizer.bypassSecurityTrustResourceUrl(
-      this.api.resolveUrl('/browser/vnc_lite.html?scale=true&path=browser/websockify'),
-    ),
-  );
+  vncViewerMode = signal<'full' | 'lite'>('full');
+  isFullscreen = signal(false);
+  quickTextInputOpen = signal(false);
+  quickTextInputValue = signal('');
+
+  vncUrl = computed(() => {
+    const isFull = this.vncViewerMode() === 'full';
+    const path = isFull
+      ? '/browser/vnc.html?autoconnect=true&resize=scale&reconnect=true&path=browser/websockify'
+      : '/browser/vnc_lite.html?scale=true&path=browser/websockify';
+    return this.sanitizer.bypassSecurityTrustResourceUrl(this.api.resolveUrl(path));
+  });
 
   // Per-Resource State Tracking
   resourceStates = signal<Record<ResourceKey, ResourceState>>({
@@ -346,10 +353,23 @@ export class App implements OnInit, OnDestroy {
     this.pollIntervalId = setInterval(() => {
       this.refreshPoll();
     }, 2000);
+
+    if (typeof document !== 'undefined') {
+      document.addEventListener('fullscreenchange', this.onFullscreenChange);
+    }
   }
+
+  private onFullscreenChange = () => {
+    if (typeof document !== 'undefined') {
+      this.isFullscreen.set(Boolean(document.fullscreenElement));
+    }
+  };
 
   ngOnDestroy() {
     this.notifService.disconnectEventStream();
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('fullscreenchange', this.onFullscreenChange);
+    }
     if (this.pollIntervalId) {
       clearInterval(this.pollIntervalId);
       this.pollIntervalId = null;
@@ -1870,6 +1890,83 @@ export class App implements OnInit, OnDestroy {
   closeTakeoverModal() {
     this.vncModalOpen.set(false);
     this.activeTakeoverJobId.set(null);
+    this.closeQuickTextInput();
+    if (this.isFullscreen() && typeof document !== 'undefined' && document.fullscreenElement) {
+      document.exitFullscreen?.().catch(() => {});
+      this.isFullscreen.set(false);
+    }
+  }
+
+  setVncViewerMode(mode: 'full' | 'lite') {
+    this.vncViewerMode.set(mode);
+  }
+
+  toggleVncViewerMode() {
+    this.vncViewerMode.update((m) => (m === 'full' ? 'lite' : 'full'));
+  }
+
+  openQuickTextInput() {
+    this.quickTextInputValue.set('');
+    this.quickTextInputOpen.set(true);
+  }
+
+  closeQuickTextInput() {
+    this.quickTextInputOpen.set(false);
+    this.quickTextInputValue.set('');
+  }
+
+  sendQuickText() {
+    const text = this.quickTextInputValue().trim();
+    if (!text) {
+      this.closeQuickTextInput();
+      return;
+    }
+    this.copyText(text, 'Text copied to clipboard! Paste directly into the browser field.');
+    this.closeQuickTextInput();
+  }
+
+  scrollRemote(direction: 'up' | 'down') {
+    try {
+      const iframe = document.querySelector<HTMLIFrameElement>('.vnc-dialog iframe');
+      if (iframe?.contentWindow) {
+        const win = iframe.contentWindow as any;
+        if (win.UI?.rfb) {
+          const delta = direction === 'up' ? -120 : 120;
+          if (typeof win.UI.rfb.sendWheelEvent === 'function') {
+            win.UI.rfb.sendWheelEvent(delta, 0);
+          } else if (typeof win.UI.rfb.sendKey === 'function') {
+            const key = direction === 'up' ? 0xff55 : 0xff56; // Page_Up / Page_Down
+            win.UI.rfb.sendKey(key, null, 1);
+            win.UI.rfb.sendKey(key, null, 0);
+          }
+        }
+      }
+    } catch {
+      // Silently ignore cross-window/security boundary restrictions
+    }
+    this.showToast(`Scrolled ${direction}`, 'info');
+  }
+
+  toggleFullscreen() {
+    if (typeof document === 'undefined') return;
+    if (!document.fullscreenElement) {
+      const dialog = document.querySelector('.vnc-dialog') || document.documentElement;
+      dialog
+        .requestFullscreen?.()
+        .then(() => {
+          this.isFullscreen.set(true);
+        })
+        .catch(() => {
+          this.isFullscreen.set(false);
+        });
+    } else {
+      document
+        .exitFullscreen?.()
+        .then(() => {
+          this.isFullscreen.set(false);
+        })
+        .catch(() => {});
+    }
   }
 
   claimTakeover() {

@@ -3008,14 +3008,14 @@
   <!-- AUTHENTICATED noVNC VIEWER & OPERATOR TAKEOVER MODAL -->
   <div
     *ngIf="vncModalOpen()"
-    class="modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-1 sm:p-4 bg-slate-950/90 backdrop-blur-md"
+    class="modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-0 sm:p-4 bg-slate-950/90 backdrop-blur-md"
   >
     <div
-      class="vnc-dialog bg-slate-900 border border-slate-800 w-full max-w-6xl h-[94vh] rounded-3xl overflow-hidden shadow-2xl flex flex-col"
+      class="vnc-dialog bg-slate-900 border-0 sm:border border-slate-800 w-full max-w-6xl h-[100dvh] max-h-[100dvh] sm:h-[94vh] rounded-none sm:rounded-3xl overflow-hidden shadow-2xl flex flex-col"
     >
       <!-- Viewer Top Bar -->
       <div
-        class="p-3 sm:px-6 border-b border-slate-800 flex items-center justify-between gap-3 bg-slate-950 flex-wrap sm:flex-nowrap"
+        class="p-2.5 sm:px-6 border-b border-slate-800 flex items-center justify-between gap-2.5 bg-slate-950 flex-wrap sm:flex-nowrap"
       >
         <div class="flex items-center space-x-3">
           <div
@@ -3116,14 +3116,170 @@
         </div>
       </div>
 
-      <!-- noVNC iframe Container -->
-      <div class="flex-1 bg-black relative overflow-hidden">
+      <!-- Mobile Touch Assist Bar -->
+      <div
+        class="touch-assist-bar bg-slate-950/95 border-b border-slate-800/90 px-2.5 sm:px-6 py-1.5 flex items-center justify-between gap-2 text-xs select-none overflow-x-auto scrollbar-thin"
+        role="toolbar"
+        aria-label="Touch and mobile navigation assist"
+      >
+        <div class="flex items-center gap-1.5 sm:gap-2">
+          <!-- Viewer Mode Switcher (Full vs Lite) -->
+          <div
+            class="inline-flex rounded-lg bg-slate-900 p-0.5 border border-slate-800 shrink-0"
+            role="group"
+            aria-label="Viewer UI mode"
+          >
+            <button
+              type="button"
+              (click)="setVncViewerMode('full')"
+              [class]="
+                vncViewerMode() === 'full'
+                  ? 'bg-teal-600 text-white font-bold shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200'
+              "
+              class="px-2 py-1 rounded-md text-[11px] transition flex items-center gap-1"
+              title="Full noVNC with mobile drawer, virtual keyboard, and touch mode emulation"
+              aria-label="Full noVNC UI mode"
+            >
+              <app-icon name="sliders" className="w-3 h-3"></app-icon>
+              <span>Full UI</span>
+            </button>
+            <button
+              type="button"
+              (click)="setVncViewerMode('lite')"
+              [class]="
+                vncViewerMode() === 'lite'
+                  ? 'bg-teal-600 text-white font-bold shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200'
+              "
+              class="px-2 py-1 rounded-md text-[11px] transition flex items-center gap-1"
+              title="Minimalist noVNC canvas"
+              aria-label="Lite noVNC UI mode"
+            >
+              <app-icon name="monitor" className="w-3 h-3"></app-icon>
+              <span>Lite UI</span>
+            </button>
+          </div>
+
+          <!-- Quick Text Input -->
+          <button
+            type="button"
+            (click)="openQuickTextInput()"
+            class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700/80 rounded-lg text-[11px] font-medium transition flex items-center gap-1 shrink-0"
+            title="Type text using mobile native keyboard and copy to paste"
+            aria-label="Quick text input"
+          >
+            <app-icon name="type" className="w-3 h-3 text-amber-400"></app-icon>
+            <span>Type Text</span>
+          </button>
+        </div>
+
+        <div class="flex items-center gap-1 sm:gap-1.5 shrink-0">
+          <!-- Page Scroll Helpers -->
+          <button
+            type="button"
+            (click)="scrollRemote('up')"
+            class="p-1 sm:px-2.5 sm:py-1 bg-slate-800/90 hover:bg-slate-700 text-slate-300 border border-slate-700/80 rounded-lg text-[11px] transition flex items-center gap-1 active:bg-slate-600"
+            title="Scroll remote page up"
+            aria-label="Scroll remote page up"
+          >
+            <app-icon name="chevron-up" className="w-3.5 h-3.5 text-slate-300"></app-icon>
+            <span class="hidden sm:inline">Scroll Up</span>
+          </button>
+
+          <button
+            type="button"
+            (click)="scrollRemote('down')"
+            class="p-1 sm:px-2.5 sm:py-1 bg-slate-800/90 hover:bg-slate-700 text-slate-300 border border-slate-700/80 rounded-lg text-[11px] transition flex items-center gap-1 active:bg-slate-600"
+            title="Scroll remote page down"
+            aria-label="Scroll remote page down"
+          >
+            <app-icon name="chevron-down" className="w-3.5 h-3.5 text-slate-300"></app-icon>
+            <span class="hidden sm:inline">Scroll Down</span>
+          </button>
+
+          <!-- Native Fullscreen Toggle -->
+          <button
+            type="button"
+            (click)="toggleFullscreen()"
+            class="p-1 sm:px-2.5 sm:py-1 bg-slate-800/90 hover:bg-slate-700 text-slate-300 border border-slate-700/80 rounded-lg text-[11px] transition flex items-center gap-1"
+            [title]="isFullscreen() ? 'Exit native fullscreen' : 'Enter native fullscreen'"
+            aria-label="Toggle native fullscreen"
+          >
+            <app-icon
+              [name]="isFullscreen() ? 'minimize' : 'maximize'"
+              className="w-3.5 h-3.5 text-teal-400"
+            ></app-icon>
+            <span class="hidden sm:inline">{{ isFullscreen() ? 'Exit Full' : 'Fullscreen' }}</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- noVNC iframe Container with touch hardening -->
+      <div
+        class="flex-1 bg-black relative overflow-hidden touch-none select-none"
+        style="touch-action: none; overscroll-behavior: contain"
+      >
         <iframe
           [src]="vncUrl()"
           class="w-full h-full border-0"
-          allow="clipboard-read; clipboard-write"
+          allow="clipboard-read; clipboard-write; fullscreen"
           title="noVNC Browser Display"
         ></iframe>
+      </div>
+    </div>
+
+    <!-- Quick Text Input Modal for Mobile Touchscreens -->
+    <div
+      *ngIf="quickTextInputOpen()"
+      class="modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-3 bg-slate-950/80 backdrop-blur-sm"
+    >
+      <div
+        class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-sm p-4 shadow-xl flex flex-col gap-3"
+      >
+        <div class="flex items-center justify-between">
+          <h4 class="text-sm font-bold text-white flex items-center gap-1.5">
+            <app-icon name="type" className="w-4 h-4 text-amber-400"></app-icon>
+            <span>Quick Text Input</span>
+          </h4>
+          <button
+            type="button"
+            (click)="closeQuickTextInput()"
+            class="p-1 text-slate-400 hover:text-white rounded-lg transition"
+            aria-label="Close text input"
+          >
+            <app-icon name="x" className="w-4 h-4"></app-icon>
+          </button>
+        </div>
+        <p class="text-xs text-slate-400">
+          Type using your phone's native keyboard, then tap Copy &amp; Use to paste into the browser
+          form.
+        </p>
+        <textarea
+          [(ngModel)]="quickTextInputValue"
+          rows="3"
+          placeholder="Type your response or screening answer..."
+          class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-slate-100 text-xs focus:outline-none focus:border-teal-500 font-mono"
+          autofocus
+        ></textarea>
+        <div class="flex items-center justify-end gap-2 pt-1">
+          <button
+            type="button"
+            (click)="closeQuickTextInput()"
+            class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-semibold transition"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            (click)="sendQuickText()"
+            class="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow transition"
+            aria-label="Copy and send text"
+          >
+            <app-icon name="copy" className="w-3.5 h-3.5"></app-icon>
+            <span>Copy &amp; Use</span>
+          </button>
+        </div>
       </div>
     </div>
   </div>
