@@ -692,76 +692,46 @@ describe('App Component - State & Degraded Mode Recovery', () => {
       expect(app.toast().message).toContain('dashboard refresh failed');
     });
 
-    it('computes vncUrl pointing to vnc.html in full mode and vnc_lite.html in lite mode', () => {
-      expect(app.vncViewerMode()).toBe('full');
-      expect(String(app.vncUrl())).toContain(
-        '/browser/vnc.html?autoconnect=true&resize=scale&reconnect=true&path=browser/websockify',
-      );
-
-      app.setVncViewerMode('lite');
-      expect(app.vncViewerMode()).toBe('lite');
-      expect(String(app.vncUrl())).toContain(
-        '/browser/vnc_lite.html?scale=true&path=browser/websockify',
-      );
-
-      app.toggleVncViewerMode();
-      expect(app.vncViewerMode()).toBe('full');
+    it('computes vncUrl directly pointing to vnc.html with autoconnect and scale', () => {
       expect(String(app.vncUrl())).toContain(
         '/browser/vnc.html?autoconnect=true&resize=scale&reconnect=true&path=browser/websockify',
       );
     });
 
-    it('provides mobile touch controls, quick text input, and scroll buttons', async () => {
-      // Quick text input modal
-      app.openQuickTextInput();
-      expect(app.quickTextInputOpen()).toBe(true);
-      expect(app.quickTextInputValue()).toBe('');
+    it('automatically claims takeover on modal open and resumes automation', () => {
+      mockApi.claimTakeover = vi
+        .fn()
+        .mockReturnValue(of({ success: true, lease_seconds: 300, owner: 'operator' }));
+      mockApi.resumeTakeover = vi
+        .fn()
+        .mockReturnValue(of({ success: true, message: 'Revalidation succeeded' }));
 
-      app.quickTextInputValue.set('Expected Salary: 75k EUR');
-      const copySpy = vi.spyOn(app, 'copyText').mockImplementation(async (text, msg) => {
-        app.showToast(msg || 'Copied!');
-      });
+      // Case 1: When takeover is not active, opening modal auto-claims takeover
+      app.takeoverStatus.set({ is_takeover_active: false } as any);
+      app.openTakeoverModal();
+      expect(app.vncModalOpen()).toBe(true);
+      expect(mockApi.claimTakeover).toHaveBeenCalled();
+      expect(app.takeoverCountdown()).toBe(300);
 
-      app.sendQuickText();
-      expect(copySpy).toHaveBeenCalledWith(
-        'Expected Salary: 75k EUR',
-        'Text copied to clipboard! Paste directly into the browser field.',
-      );
-      expect(app.quickTextInputOpen()).toBe(false);
-      expect(app.toast().message).toContain('Text copied to clipboard');
+      // Case 2: When takeover is already active, opening modal does not re-claim
+      mockApi.claimTakeover = vi.fn();
+      mockApi.getTakeoverStatus = vi.fn().mockReturnValue(of({ is_takeover_active: true }));
+      app.takeoverStatus.set({ is_takeover_active: true } as any);
+      app.openTakeoverModal();
+      expect(mockApi.claimTakeover).not.toHaveBeenCalled();
+      expect(mockApi.getTakeoverStatus).toHaveBeenCalled();
 
-      // Scroll buttons
-      app.scrollRemote('up');
-      expect(app.toast().message).toContain('Scrolled up');
-
-      app.scrollRemote('down');
-      expect(app.toast().message).toContain('Scrolled down');
-
-      // Fullscreen toggle
-      expect(app.isFullscreen()).toBe(false);
-      const requestFullscreenSpy = vi.fn().mockResolvedValue(undefined);
-      const exitFullscreenSpy = vi.fn().mockResolvedValue(undefined);
-      Object.defineProperty(document, 'fullscreenElement', {
-        value: null,
-        writable: true,
-        configurable: true,
-      });
-      Object.defineProperty(document.documentElement, 'requestFullscreen', {
-        value: requestFullscreenSpy,
-        writable: true,
-        configurable: true,
-      });
-      Object.defineProperty(document, 'exitFullscreen', {
-        value: exitFullscreenSpy,
-        writable: true,
-        configurable: true,
-      });
-
-      app.toggleFullscreen();
-      expect(requestFullscreenSpy).toHaveBeenCalled();
+      // Case 3: Resume automation calls resumeTakeover and closes modal
+      app.resumeFromTakeover();
+      expect(mockApi.resumeTakeover).toHaveBeenCalled();
+      expect(app.vncModalOpen()).toBe(false);
+      expect(app.toast().message).toContain('Revalidation succeeded');
     });
 
-    it('renders mobile-optimized takeover dialog with touch assist bar and 100dvh styling', () => {
+    it('renders streamlined mobile-optimized takeover dialog without clutter', () => {
+      mockApi.claimTakeover = vi
+        .fn()
+        .mockReturnValue(of({ success: true, lease_seconds: 300, owner: 'operator' }));
       app.openTakeoverModal();
       fixture.detectChanges();
 
@@ -775,45 +745,44 @@ describe('App Component - State & Degraded Mode Recovery', () => {
       expect(dialog.className).toContain('rounded-none');
       expect(dialog.className).toContain('sm:rounded-3xl');
 
-      const assistBar = fixture.nativeElement.querySelector('.touch-assist-bar');
-      expect(assistBar).not.toBeNull();
-      expect(assistBar.getAttribute('role')).toBe('toolbar');
+      // Clutter removed: no touch assist bar, scroll buttons, or fullscreen buttons
+      expect(fixture.nativeElement.querySelector('.touch-assist-bar')).toBeNull();
+      expect(
+        fixture.nativeElement.querySelector('button[aria-label="Scroll remote page up"]'),
+      ).toBeNull();
+      expect(
+        fixture.nativeElement.querySelector('button[aria-label="Scroll remote page down"]'),
+      ).toBeNull();
+      expect(
+        fixture.nativeElement.querySelector('button[aria-label="Toggle native fullscreen"]'),
+      ).toBeNull();
+      expect(
+        fixture.nativeElement.querySelector('button[title*="Claim exclusive control"]'),
+      ).toBeNull();
 
-      const fullModeBtn = assistBar.querySelector('button[aria-label="Full noVNC UI mode"]');
-      const liteModeBtn = assistBar.querySelector('button[aria-label="Lite noVNC UI mode"]');
-      const textInputBtn = assistBar.querySelector('button[aria-label="Quick text input"]');
-      const scrollUpBtn = assistBar.querySelector('button[aria-label="Scroll remote page up"]');
-      const scrollDownBtn = assistBar.querySelector('button[aria-label="Scroll remote page down"]');
-      const fullscreenBtn = assistBar.querySelector(
-        'button[aria-label="Toggle native fullscreen"]',
-      );
+      // Clean header elements
+      const headerTitle = dialog.querySelector('h3');
+      expect(headerTitle?.textContent).toContain('Browser Automation');
 
-      expect(fullModeBtn).not.toBeNull();
-      expect(liteModeBtn).not.toBeNull();
-      expect(textInputBtn).not.toBeNull();
-      expect(scrollUpBtn).not.toBeNull();
-      expect(scrollDownBtn).not.toBeNull();
-      expect(fullscreenBtn).not.toBeNull();
+      const resumeBtn = dialog.querySelector('button[title*="Revalidate page domain"]');
+      expect(resumeBtn).not.toBeNull();
+      expect(resumeBtn?.textContent).toContain('Resume Automation');
 
-      const iframeContainer = fixture.nativeElement.querySelector('.vnc-dialog .touch-none');
+      // 100% canvas container
+      const iframeContainer = dialog.querySelector('.flex-1.bg-black');
       expect(iframeContainer).not.toBeNull();
-      expect(iframeContainer.getAttribute('style')).toContain('touch-action: none');
-      expect(iframeContainer.className).toContain('touch-none');
+      expect(iframeContainer?.getAttribute('style')).toContain('touch-action: none');
 
-      // Test switching mode via UI button
-      liteModeBtn.click();
-      fixture.detectChanges();
-      expect(app.vncViewerMode()).toBe('lite');
+      const iframe = iframeContainer?.querySelector('iframe');
+      expect(iframe).not.toBeNull();
+      expect(iframe?.getAttribute('title')).toBe('noVNC Browser Display');
 
-      // Test opening text input via UI button
-      textInputBtn.click();
-      fixture.detectChanges();
-      expect(app.quickTextInputOpen()).toBe(true);
-
-      app.closeTakeoverModal();
+      // Close modal
+      const closeBtn = dialog.querySelector('button[aria-label="Close viewer"]');
+      expect(closeBtn).not.toBeNull();
+      closeBtn.click();
       fixture.detectChanges();
       expect(app.vncModalOpen()).toBe(false);
-      expect(app.quickTextInputOpen()).toBe(false);
     });
   });
 
