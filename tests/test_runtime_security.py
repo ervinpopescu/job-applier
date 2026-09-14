@@ -8,17 +8,25 @@ from job_applier.automation.network_security import resolve_and_validate_host
 from job_applier.automation.queue import transition_job
 from job_applier.automation.browser_automator import BrowserAutomator
 from job_applier.automation.runtime_lock import RuntimeSingletonLock
-from job_applier.cli.worker import run_worker_loop
+from job_applier.cli.worker import (
+    HeartbeatThread,
+    _coordinate_challenge_takeover,
+    process_claimed_job,
+    run_worker_loop,
+)
 from job_applier.db import upsert_application
 
 import ipaddress
+import multiprocessing
 import os
+import sqlite3
 import signal
 import socket
 import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -38,16 +46,24 @@ from job_applier.automation.profile_lock import (
     ProfileOwnershipLock,
 )
 from job_applier.automation.queue import (
+    _QUEUE_LOCK,
+    begin_submit_click_fence,
     claim_manual_takeover,
+    clear_automation_state,
+    create_attempt,
     enqueue_job,
+    finish_submit_click_fence,
     get_runtime_control,
     get_browser_owner_job,
     is_takeover_active,
     release_manual_takeover,
+    record_submit_intent,
     requeue_auth_required_job,
     set_runtime_browser_state,
     set_runtime_pause,
     set_runtime_stop,
+    set_pending_verification_code,
+    takeover_owner_matches,
 )
 from job_applier.automation.safe_resume import safe_resume_revalidate
 from job_applier.db import init_db
@@ -56,6 +72,507 @@ from job_applier.db import init_db
 # =====================================================================
 # 1. Security Tests: Secret Environment Stripping
 # =====================================================================
+
+
+def _hold_sqlite_writer(db_file: str, ready: Any, release: Any) -> None:
+    """Hold a write transaction in a separate process for fence contention tests."""
+    conn = get_connection(Path(db_file))
+    try:
+        conn.execute("BEGIN IMMEDIATE;")
+        ready.set()
+        release.wait(timeout=10)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_sqlite_busy_timeout_covers_cross_process_submit_fence(tmp_path: Path):
+    """Expected submit-vs-takeover ordering waits instead of failing at 5 seconds."""
+    db_file = tmp_path / "cross-process-fence.db"
+    init_db(db_file)
+    conn = get_connection(db_file)
+    try:
+        busy_timeout_ms = conn.execute("PRAGMA busy_timeout;").fetchone()[0]
+    finally:
+        conn.close()
+    assert busy_timeout_ms >= 300_000
+
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    process = context.Process(
+        target=_hold_sqlite_writer,
+        args=(str(db_file), ready, release),
+    )
+    process.start()
+    try:
+        assert ready.wait(timeout=5)
+        result: dict[str, Any] = {}
+
+        def claim() -> None:
+            result["value"] = claim_manual_takeover(
+                "cross-process-test", lease_seconds=30, custom_path=db_file
+            )
+
+        claimant = threading.Thread(target=claim)
+        claimant.start()
+        time.sleep(0.2)
+        assert claimant.is_alive()
+        release.set()
+        claimant.join(timeout=10)
+        assert not claimant.is_alive()
+        assert result["value"]["status"] == "success"
+        process.join(timeout=10)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            release.set()
+            process.terminate()
+            process.join(timeout=5)
+
+
+def test_submit_click_fence_orders_takeover_both_ways(tmp_path: Path):
+    """SQLite BEGIN IMMEDIATE orders the final click and takeover across threads."""
+
+    def prepare(db_file: Path):
+        init_db(db_file)
+        upsert_application(
+            app_id="app-submit-fence",
+            company="Fence Corp",
+            title="Engineer",
+            job_url="https://fence.example/job",
+            custom_path=db_file,
+        )
+        enqueue_job("app-submit-fence", adapter="greenhouse", custom_path=db_file)
+        job = claim_next_job("submit-worker", lease_seconds=60, custom_path=db_file)
+        assert job is not None
+        attempt = create_attempt(
+            job_id=job.id,
+            app_id=job.app_id,
+            worker_id="submit-worker",
+            lease_generation=job.fencing_generation,
+            custom_path=db_file,
+        )
+        assert record_submit_intent(
+            attempt.id,
+            job.id,
+            "submit-worker",
+            job.fencing_generation,
+            custom_path=db_file,
+        )
+        return job, attempt
+
+    claim_first = tmp_path / "claim-first.db"
+    job, attempt = prepare(claim_first)
+    assert (
+        claim_manual_takeover("operator", custom_path=claim_first)["status"]
+        == "success"
+    )
+    with pytest.raises(RuntimeError, match="Physical submit fence rejected"):
+        begin_submit_click_fence(
+            job_id=job.id,
+            attempt_id=attempt.id,
+            worker_id="submit-worker",
+            generation=job.fencing_generation,
+            custom_path=claim_first,
+        )
+
+    click_first = tmp_path / "click-first.db"
+    job, attempt = prepare(click_first)
+    fence = begin_submit_click_fence(
+        job_id=job.id,
+        attempt_id=attempt.id,
+        worker_id="submit-worker",
+        generation=job.fencing_generation,
+        custom_path=click_first,
+    )
+    claim_result: list[dict[str, Any]] = []
+
+    def claim_after_click_starts() -> None:
+        claim_result.append(claim_manual_takeover("operator", custom_path=click_first))
+
+    claimant = threading.Thread(target=claim_after_click_starts)
+    claimant.start()
+    time.sleep(0.05)
+    assert claimant.is_alive(), "takeover must wait behind the click transaction"
+    finish_submit_click_fence(fence, clicked=True)
+    claimant.join(timeout=2)
+    assert not claimant.is_alive()
+    assert claim_result and claim_result[0]["status"] == "success"
+
+
+def test_clear_state_preserves_outcome_unknown_jobs(tmp_path: Path):
+    db_file = tmp_path / "clear-ambiguous.db"
+    init_db(db_file)
+    upsert_application(
+        app_id="app-clear-ambiguous",
+        company="Clear Corp",
+        title="Engineer",
+        job_url="https://clear.example/job",
+        custom_path=db_file,
+    )
+    enqueue_job("app-clear-ambiguous", adapter="lever", custom_path=db_file)
+    conn = get_connection(db_file)
+    with conn:
+        conn.execute(
+            "UPDATE automation_jobs SET state = 'submit_intent' WHERE app_id = ?;",
+            ("app-clear-ambiguous",),
+        )
+    result = clear_automation_state(custom_path=db_file)
+    assert result["status"] == "success"
+    conn = get_connection(db_file)
+    row = conn.execute(
+        "SELECT state FROM automation_jobs WHERE app_id = ?;", ("app-clear-ambiguous",)
+    ).fetchone()
+    conn.close()
+    assert row["state"] == JobState.AMBIGUOUS_SUBMISSION.value
+    assert claim_next_job("must-not-claim", custom_path=db_file) is None
+
+
+def test_takeover_lease_contract_rejects_invalid_core_values(tmp_path: Path):
+    db_file = tmp_path / "takeover_lease_contract.db"
+    init_db(db_file)
+    from job_applier.automation.queue import (
+        TAKEOVER_DEFAULT_LEASE_SECONDS,
+        TAKEOVER_MAX_LEASE_SECONDS,
+    )
+
+    result = claim_manual_takeover("valid-owner", custom_path=db_file)
+    assert result["status"] == "success"
+    assert result["lease_seconds"] == TAKEOVER_DEFAULT_LEASE_SECONDS == 300
+    release_manual_takeover("valid-owner", custom_path=db_file)
+    for invalid in (0, -1, 301, 3600):
+        with pytest.raises(ValueError, match="lease_seconds"):
+            claim_manual_takeover("invalid-owner", invalid, custom_path=db_file)
+    assert TAKEOVER_MAX_LEASE_SECONDS == 300
+    assert get_runtime_control(custom_path=db_file)["manual_takeover_owner"] is None
+
+
+def test_takeover_lease_api_schema_rejects_invalid_values():
+    from pydantic import ValidationError
+    from job_applier.web.app import TakeoverClaimRequest
+
+    assert TakeoverClaimRequest().lease_seconds == 300
+    assert TakeoverClaimRequest(lease_seconds=1).lease_seconds == 1
+    for invalid in (0, -1, 301, True):
+        with pytest.raises(ValidationError):
+            TakeoverClaimRequest(lease_seconds=invalid)
+
+
+def test_expired_takeover_owner_is_rejected_by_fenced_mutations(tmp_path: Path):
+    db_file = tmp_path / "expired_takeover.db"
+    init_db(db_file)
+    assert (
+        claim_manual_takeover("expired-owner", custom_path=db_file)["status"]
+        == "success"
+    )
+
+    conn = get_connection(db_file)
+    try:
+        conn.execute(
+            "UPDATE runtime_control SET manual_takeover_expires_at = ? WHERE id = 1;",
+            ("2000-01-01 00:00:00",),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert not takeover_owner_matches("expired-owner", custom_path=db_file)
+    assert not set_runtime_pause(
+        False, custom_path=db_file, expected_owner="expired-owner"
+    )
+    assert not set_pending_verification_code(
+        "123456", custom_path=db_file, expected_owner="expired-owner"
+    )
+
+    from job_applier.ops.emergency_stop import clear_emergency_stop
+
+    result = clear_emergency_stop(
+        custom_db_path=db_file, expected_owner="expired-owner"
+    )
+    assert result["status"] == "rejected"
+    assert result["reason"] == "takeover_owner_required"
+
+
+def test_reopened_browser_generation_allows_same_job_reclaim_and_rejects_stale_worker(
+    tmp_path: Path,
+):
+    db_file = tmp_path / "reopened_browser.db"
+    init_db(db_file)
+    upsert_application(
+        app_id="app-reopened",
+        company="Reopened Corp",
+        title="Engineer",
+        job_url="https://reopened.example/apply",
+        custom_path=db_file,
+    )
+    enqueue_job("app-reopened", custom_path=db_file)
+    first = claim_next_job("worker-first", custom_path=db_file)
+    assert first is not None
+    set_runtime_browser_state(
+        active=True,
+        url="https://old.example/apply",
+        browser_job_id=first.id,
+        browser_session_generation=first.fencing_generation,
+        is_closed=False,
+        custom_path=db_file,
+    )
+
+    # A replacement worker claims the same job ID with a new durable
+    # generation after the original lease expires.
+    conn = get_connection(db_file)
+    try:
+        conn.execute(
+            "UPDATE automation_jobs SET lease_expires_at = '2000-01-01 00:00:00' WHERE id = ?;",
+            (first.id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    reclaimed = claim_next_job("worker-second", custom_path=db_file)
+    assert reclaimed is not None
+    assert reclaimed.id == first.id
+    assert reclaimed.fencing_generation == first.fencing_generation + 1
+
+    set_runtime_browser_state(
+        active=True,
+        url="https://old.example/stale",
+        browser_job_id=first.id,
+        browser_session_generation=first.fencing_generation,
+        is_closed=False,
+        custom_path=db_file,
+    )
+    state = get_runtime_control(custom_path=db_file)
+    assert state["browser_active"] is True
+    assert state["browser_session_generation"] == first.fencing_generation
+    assert state["browser_url"] == "https://old.example/apply"
+
+    # The fresh worker can publish only its current, live generation.
+    set_runtime_browser_state(
+        active=True,
+        url="https://new.example/apply",
+        browser_job_id=reclaimed.id,
+        browser_session_generation=reclaimed.fencing_generation,
+        is_closed=False,
+        custom_path=db_file,
+    )
+    state = get_runtime_control(custom_path=db_file)
+    assert state["browser_active"] is True
+    assert state["browser_job_id"] == reclaimed.id
+    assert state["browser_session_generation"] == reclaimed.fencing_generation
+    assert state["browser_url"] == "https://new.example/apply"
+
+    set_runtime_browser_state(
+        active=False,
+        url="https://old.example/stale",
+        browser_job_id=first.id,
+        browser_session_generation=first.fencing_generation,
+        is_closed=True,
+        custom_path=db_file,
+    )
+    state = get_runtime_control(custom_path=db_file)
+    assert state["browser_active"] is True
+    assert state["browser_session_generation"] == reclaimed.fencing_generation
+
+
+def test_same_job_reclaim_publication_uses_current_claim_generation(tmp_path: Path):
+    db_file = tmp_path / "same_job_reclaim.db"
+    init_db(db_file)
+    upsert_application(
+        app_id="app-reclaim",
+        company="Reclaim Corp",
+        title="Engineer",
+        job_url="https://reclaim.example/apply",
+        custom_path=db_file,
+    )
+    enqueue_job("app-reclaim", custom_path=db_file)
+    first = claim_next_job("worker-first", custom_path=db_file)
+    assert first is not None
+    set_runtime_browser_state(
+        active=True,
+        url="https://reclaim.example/old",
+        browser_job_id=first.id,
+        browser_session_generation=first.fencing_generation,
+        is_closed=False,
+        custom_path=db_file,
+    )
+
+    conn = get_connection(db_file)
+    try:
+        conn.execute(
+            "UPDATE automation_jobs SET lease_expires_at = '2000-01-01 00:00:00' WHERE id = ?;",
+            (first.id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    reclaimed = claim_next_job("worker-second", custom_path=db_file)
+    assert reclaimed is not None
+    assert reclaimed.id == first.id
+    assert reclaimed.fencing_generation == first.fencing_generation + 1
+
+    set_runtime_browser_state(
+        active=True,
+        url="https://reclaim.example/stale",
+        browser_job_id=reclaimed.id,
+        browser_session_generation=first.fencing_generation,
+        is_closed=False,
+        custom_path=db_file,
+    )
+    state = get_runtime_control(custom_path=db_file)
+    assert state["browser_url"] == "https://reclaim.example/old"
+    assert state["browser_session_generation"] == first.fencing_generation
+
+    # A worker with the current generation but an expired lease must not
+    # republish active browser state before another worker reclaims the job.
+    conn = get_connection(db_file)
+    try:
+        conn.execute(
+            "UPDATE automation_jobs SET lease_expires_at = '2000-01-01 00:00:00' WHERE id = ?;",
+            (reclaimed.id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    set_runtime_browser_state(
+        active=True,
+        url="https://reclaim.example/expired",
+        browser_job_id=reclaimed.id,
+        browser_session_generation=reclaimed.fencing_generation,
+        is_closed=False,
+        custom_path=db_file,
+    )
+    state = get_runtime_control(custom_path=db_file)
+    assert state["browser_url"] == "https://reclaim.example/old"
+    assert state["browser_session_generation"] == first.fencing_generation
+
+    # Restore a live lease before testing the replacement worker's publication.
+    conn = get_connection(db_file)
+    try:
+        conn.execute(
+            "UPDATE automation_jobs SET lease_expires_at = '2099-01-01 00:00:00' WHERE id = ?;",
+            (reclaimed.id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    set_runtime_browser_state(
+        active=True,
+        url="https://reclaim.example/new",
+        browser_job_id=reclaimed.id,
+        browser_session_generation=reclaimed.fencing_generation,
+        is_closed=False,
+        custom_path=db_file,
+    )
+    state = get_runtime_control(custom_path=db_file)
+    assert state["browser_url"] == "https://reclaim.example/new"
+    assert state["browser_session_generation"] == reclaimed.fencing_generation
+
+
+def test_safe_resume_rejects_browser_state_from_prior_job_generation(tmp_path: Path):
+    db_file = tmp_path / "stale_resume_generation.db"
+    init_db(db_file)
+    upsert_application(
+        app_id="app-stale-resume",
+        company="Stale Resume Corp",
+        title="Engineer",
+        job_url="https://stale.example/apply",
+        custom_path=db_file,
+    )
+    enqueue_job("app-stale-resume", custom_path=db_file)
+    first = claim_next_job("worker-first", custom_path=db_file)
+    assert first is not None
+    set_runtime_browser_state(
+        active=True,
+        url="https://stale.example/apply",
+        browser_job_id=first.id,
+        browser_session_generation=first.fencing_generation,
+        is_closed=False,
+        custom_path=db_file,
+    )
+
+    conn = get_connection(db_file)
+    try:
+        conn.execute(
+            "UPDATE automation_jobs SET fencing_generation = ?, lease_expires_at = '2099-01-01 00:00:00' WHERE id = ?;",
+            (first.fencing_generation + 1, first.id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = safe_resume_revalidate(custom_path=db_file)
+    assert result["status"] == "rejected"
+    assert result["reason"] == "browser_owner_invalid"
+
+
+def test_lost_lease_closes_browser_and_skips_final_sync(tmp_path: Path):
+    db_file = tmp_path / "lost_lease_browser.db"
+    init_db(db_file)
+    automator = MagicMock()
+    heartbeat = MagicMock()
+    heartbeat.lost_lease = True
+    heartbeat.generation = 1
+
+    with patch(
+        "job_applier.cli.worker._sync_runtime_browser_state_from_automator"
+    ) as sync:
+        _coordinate_challenge_takeover(
+            automator=automator,
+            job_id="expired-job",
+            worker_id="worker-1",
+            heartbeat=heartbeat,
+            custom_db_path=db_file,
+            max_wait_seconds=None,
+        )
+
+    automator.close.assert_called_once_with()
+    sync.assert_not_called()
+
+
+def test_runtime_worker_closes_stale_automator_after_cross_process_reopen(
+    tmp_path: Path,
+):
+    db_file = tmp_path / "cross_process_reopen.db"
+    init_db(db_file)
+    set_runtime_browser_state(
+        active=True,
+        is_closed=False,
+        browser_job_id="same-job",
+        browser_session_generation=2,
+        custom_path=db_file,
+    )
+    conn = get_connection(db_file)
+    try:
+        conn.execute(
+            "UPDATE runtime_control SET browser_active = 0, browser_is_closed = 1 WHERE id = 1;"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    automator = MagicMock()
+    page = MagicMock()
+    page.is_closed.return_value = False
+    page.url = "https://old.example/apply"
+    automator.page = page
+    heartbeat = MagicMock()
+    heartbeat.lost_lease = False
+    heartbeat.generation = 1
+
+    _coordinate_challenge_takeover(
+        automator=automator,
+        job_id="same-job",
+        worker_id="old-worker",
+        heartbeat=heartbeat,
+        custom_db_path=db_file,
+        max_wait_seconds=None,
+    )
+
+    # This models web reopening the job in another process: the runtime worker
+    # observes the durable generation transition and closes its old browser.
+    automator.close.assert_called_once_with()
 
 
 def test_secret_environment_stripping():
@@ -314,7 +831,29 @@ def test_runtime_healthcheck_validates_vnc_bridge():
         "job_applier.cli.runtime_healthcheck",
     ]
 
-    from job_applier.cli.runtime_healthcheck import _read_websocket_frame
+    from job_applier.cli.runtime_healthcheck import (
+        _check_vnc_handshake,
+        _read_websocket_frame,
+    )
+
+    fragmented_socket = MagicMock()
+    fragmented_socket.__enter__.return_value = fragmented_socket
+    fragmented_socket.recv.side_effect = [b"RFB 00", b"3.008\n"]
+    with patch(
+        "job_applier.cli.runtime_healthcheck.socket.create_connection",
+        return_value=fragmented_socket,
+    ):
+        _check_vnc_handshake()
+
+    eof_socket = MagicMock()
+    eof_socket.__enter__.return_value = eof_socket
+    eof_socket.recv.side_effect = [b"RFB ", b""]
+    with patch(
+        "job_applier.cli.runtime_healthcheck.socket.create_connection",
+        return_value=eof_socket,
+    ):
+        with pytest.raises(RuntimeError, match="incomplete"):
+            _check_vnc_handshake()
 
     frame = MagicMock()
     frame.recv.side_effect = [b"\x82\x0c", b"RFB 003.008\n"]
@@ -453,7 +992,10 @@ def test_safe_resume_detects_completed_takeover_submission(tmp_path):
     mock_automator.page = mock_page
 
     res = safe_resume_revalidate(
-        job_id=claimed.id, automator=mock_automator, custom_path=db_file
+        job_id=claimed.id,
+        current_url=mock_page.url,
+        automator=mock_automator,
+        custom_path=db_file,
     )
     assert res["status"] == "success"
     assert res["action"] == "marked_applied"
@@ -493,7 +1035,10 @@ def test_safe_resume_rejects_mismatched_domain(tmp_path):
     mock_automator.page = mock_page
 
     res = safe_resume_revalidate(
-        job_id=claimed.id, automator=mock_automator, custom_path=db_file
+        job_id=claimed.id,
+        current_url=mock_page.url,
+        automator=mock_automator,
+        custom_path=db_file,
     )
     assert res["status"] == "rejected"
     assert res["reason"] == "domain_mismatch"
@@ -502,6 +1047,604 @@ def test_safe_resume_rejects_mismatched_domain(tmp_path):
 @pytest.fixture
 def client():
     return TestClient(app)
+
+
+def test_access_takeover_status_exposes_current_owner():
+    from types import SimpleNamespace
+    from job_applier.web.app import takeover_status_endpoint
+
+    request = cast(
+        Any,
+        SimpleNamespace(state=SimpleNamespace(user={"email": "viewer@example.test"})),
+    )
+    with (
+        patch("job_applier.web.app.edge_config.cf_access_enabled", True),
+        patch(
+            "job_applier.automation.queue.is_takeover_active",
+            return_value=(True, "owner@example.test", "future"),
+        ),
+        patch("job_applier.automation.queue.get_runtime_control", return_value={}),
+    ):
+        status = takeover_status_endpoint(request)
+
+    assert status["is_takeover_active"] is True
+    assert status["owner"] == "owner@example.test"
+    assert status["is_current_owner"] is False
+    assert status["read_only"] is True
+
+
+def test_access_viewer_cannot_force_release_takeover():
+    from types import SimpleNamespace
+    from job_applier.web.app import (
+        TakeoverReleaseRequest,
+        release_takeover_endpoint,
+    )
+    from fastapi import HTTPException
+
+    request = cast(
+        Any,
+        SimpleNamespace(state=SimpleNamespace(user={"email": "viewer@example.test"})),
+    )
+    with patch("job_applier.web.app.edge_config.cf_access_enabled", True):
+        with pytest.raises(HTTPException) as exc_info:
+            release_takeover_endpoint(TakeoverReleaseRequest(force=True), request)
+
+    assert exc_info.value.status_code == 403
+    assert "Forced takeover release" in str(exc_info.value.detail)
+
+
+def test_safe_resume_and_stop_clear_reject_replaced_claimant(tmp_path: Path):
+    from job_applier.automation.queue import TAKEOVER_TRANSPORT_LOCK
+    from job_applier.ops.emergency_stop import clear_emergency_stop
+
+    db_file = tmp_path / "takeover_replacement_resume.db"
+    init_db(db_file)
+    assert (
+        claim_manual_takeover("old-owner", custom_path=db_file)["status"] == "success"
+    )
+    set_runtime_stop(True, custom_path=db_file)
+
+    # A stale safe-resume request waits behind the transport fence while a new
+    # claimant replaces the old lease. It must reject and preserve the stop.
+    result: dict[str, Any] = {}
+    TAKEOVER_TRANSPORT_LOCK.acquire()
+    try:
+        worker = threading.Thread(
+            target=lambda: result.update(
+                safe_resume_revalidate(
+                    custom_path=db_file,
+                    expected_owner="old-owner",
+                )
+            )
+        )
+        worker.start()
+        time.sleep(0.05)
+        assert worker.is_alive()
+        assert (
+            release_manual_takeover("old-owner", custom_path=db_file)["status"]
+            == "success"
+        )
+        assert (
+            claim_manual_takeover("new-owner", custom_path=db_file)["status"]
+            == "success"
+        )
+        set_runtime_stop(True, custom_path=db_file)
+    finally:
+        TAKEOVER_TRANSPORT_LOCK.release()
+    worker.join(timeout=2)
+
+    assert result["status"] == "rejected"
+    assert result["reason"] == "takeover_owner_required"
+    assert get_runtime_control(custom_path=db_file)["is_stopped"] is True
+    assert (
+        clear_emergency_stop(custom_db_path=db_file, expected_owner="old-owner")[
+            "status"
+        ]
+        == "rejected"
+    )
+    assert get_runtime_control(custom_path=db_file)["is_stopped"] is True
+
+
+def test_verification_code_rejects_replaced_claimant_before_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from types import SimpleNamespace
+    from job_applier.automation.queue import TAKEOVER_TRANSPORT_LOCK
+    from job_applier.web.app import SubmitCodeRequest, submit_verification_code
+
+    db_file = tmp_path / "takeover_replacement_code.db"
+    monkeypatch.setenv("JOB_APPLIER_DB_PATH", str(db_file))
+    init_db(db_file)
+    assert (
+        claim_manual_takeover("old-owner", custom_path=db_file)["status"] == "success"
+    )
+    set_runtime_browser_state(
+        active=True,
+        url="https://example.com/apply",
+        is_closed=False,
+        is_waiting_for_code=True,
+        custom_path=db_file,
+    )
+    automator = MagicMock()
+    automator.waiting_for_code = True
+    request = cast(
+        Any,
+        SimpleNamespace(state=SimpleNamespace(user={"email": "old-owner"})),
+    )
+    result: dict[str, Any] = {}
+    TAKEOVER_TRANSPORT_LOCK.acquire()
+    try:
+        with (
+            patch("job_applier.web.app.edge_config.cf_access_enabled", True),
+            patch(
+                "job_applier.automation.browser_automator.get_active_automator",
+                return_value=automator,
+            ),
+        ):
+            worker = threading.Thread(
+                target=lambda: _capture_http_error(
+                    result,
+                    submit_verification_code,
+                    SubmitCodeRequest(code="123456"),
+                    request,
+                )
+            )
+            worker.start()
+            time.sleep(0.05)
+            assert worker.is_alive()
+            assert (
+                release_manual_takeover("old-owner", custom_path=db_file)["status"]
+                == "success"
+            )
+            assert (
+                claim_manual_takeover("new-owner", custom_path=db_file)["status"]
+                == "success"
+            )
+    finally:
+        TAKEOVER_TRANSPORT_LOCK.release()
+    worker.join(timeout=2)
+
+    assert result["status_code"] == 403
+    automator.supply_verification_code.assert_not_called()
+    assert get_runtime_control(custom_path=db_file)["pending_verification_code"] is None
+
+
+def _capture_http_error(result: dict[str, Any], function: Any, *args: Any) -> None:
+    from fastapi import HTTPException
+
+    try:
+        function(*args)
+    except HTTPException as exc:
+        result["status_code"] = exc.status_code
+
+
+def test_access_takeover_mutations_require_current_owner():
+    from types import SimpleNamespace
+    from fastapi import HTTPException
+    from job_applier.web.app import (
+        reopen_auth_session_endpoint,
+        resume_from_takeover_endpoint,
+    )
+
+    request = cast(
+        Any,
+        SimpleNamespace(state=SimpleNamespace(user={"email": "viewer@example.test"})),
+    )
+    with (
+        patch("job_applier.web.app.edge_config.cf_access_enabled", True),
+        patch(
+            "job_applier.automation.queue.is_takeover_active",
+            return_value=(True, "owner@example.test", "future"),
+        ),
+    ):
+        with pytest.raises(HTTPException) as reopen_error:
+            reopen_auth_session_endpoint(request)
+        with pytest.raises(HTTPException) as resume_error:
+            resume_from_takeover_endpoint(request)
+
+    assert reopen_error.value.status_code == 403
+    assert resume_error.value.status_code == 403
+
+
+def test_access_non_owner_cannot_mutate_takeover_or_global_controls():
+    from types import SimpleNamespace
+    from fastapi import HTTPException
+    from job_applier.web.app import (
+        ResolveJobRequest,
+        SubmitCodeRequest,
+        clear_automation_state_endpoint,
+        pause_automation_endpoint,
+        resolve_job_endpoint,
+        resume_automation_endpoint,
+        stop_automation_endpoint,
+        submit_verification_code,
+    )
+
+    request = cast(
+        Any,
+        SimpleNamespace(state=SimpleNamespace(user={"email": "viewer@example.test"})),
+    )
+    with (
+        patch("job_applier.web.app.edge_config.cf_access_enabled", True),
+        patch(
+            "job_applier.automation.queue.is_takeover_active",
+            return_value=(True, "owner@example.test", "future"),
+        ),
+    ):
+        actions = (
+            lambda: pause_automation_endpoint(request),
+            lambda: resume_automation_endpoint(request),
+            lambda: stop_automation_endpoint(request),
+            lambda: clear_automation_state_endpoint(request),
+            lambda: submit_verification_code(SubmitCodeRequest(code="123456"), request),
+            lambda: resolve_job_endpoint(
+                "job-1", ResolveJobRequest(force=True), request
+            ),
+        )
+        for action in actions:
+            with pytest.raises(HTTPException) as exc_info:
+                action()
+            assert exc_info.value.status_code == 403
+
+
+def test_access_takeover_mutations_pass_verified_owner():
+    from types import SimpleNamespace
+    from job_applier.web.app import (
+        reopen_auth_session_endpoint,
+        resume_from_takeover_endpoint,
+    )
+
+    request = cast(
+        Any,
+        SimpleNamespace(state=SimpleNamespace(user={"email": "owner@example.test"})),
+    )
+    with (
+        patch("job_applier.web.app.edge_config.cf_access_enabled", True),
+        patch(
+            "job_applier.automation.queue.is_takeover_active",
+            return_value=(True, "owner@example.test", "future"),
+        ),
+        patch(
+            "job_applier.automation.queue.requeue_auth_required_job",
+            return_value={"status": "started"},
+        ) as requeue,
+        patch(
+            "job_applier.automation.safe_resume.safe_resume_revalidate",
+            return_value={"status": "success"},
+        ) as resume,
+        patch("job_applier.automation.browser_automator.get_active_automator"),
+    ):
+        assert reopen_auth_session_endpoint(request) == {"status": "started"}
+        assert resume_from_takeover_endpoint(request) == {"status": "success"}
+
+    assert requeue.call_args.kwargs["expected_owner"] == "owner@example.test"
+    assert resume.call_args.kwargs["expected_owner"] == "owner@example.test"
+
+
+@pytest.mark.parametrize("shutdown_action", ["clear", "emergency"])
+def test_runtime_worker_closes_browser_after_durable_shutdown(
+    tmp_path: Path, shutdown_action: str
+):
+    """Clear and emergency stop signal the runtime process to close its browser."""
+    db_file = tmp_path / f"browser_shutdown_{shutdown_action}.db"
+    init_db(db_file)
+    conn = get_connection(db_file)
+    with conn:
+        conn.execute(
+            """
+            UPDATE runtime_control
+            SET browser_active = 1, browser_is_closed = 0,
+                browser_job_id = 'job-1', browser_session_generation = 1
+            WHERE id = 1;
+            """
+        )
+    conn.close()
+
+    if shutdown_action == "clear":
+        from job_applier.automation.queue import clear_automation_state
+
+        result = clear_automation_state(custom_path=db_file)
+    else:
+        from job_applier.ops.emergency_stop import emergency_stop
+
+        result = emergency_stop(custom_db_path=db_file)
+    assert result["status"] == "success"
+    control = get_runtime_control(custom_path=db_file)
+    assert control["browser_job_id"] is None
+    assert control["browser_active"] is False
+    assert control["browser_shutdown_generation"] is not None
+
+    automator = MagicMock()
+    page = MagicMock()
+    page.is_closed.return_value = False
+    page.url = "https://example.test"
+    automator.page = page
+    heartbeat = MagicMock()
+    heartbeat.lost_lease = False
+    heartbeat.generation = 1
+    _coordinate_challenge_takeover(
+        automator=automator,
+        job_id="job-1",
+        worker_id="worker-1",
+        heartbeat=heartbeat,
+        custom_db_path=db_file,
+        max_wait_seconds=1,
+    )
+    automator.close.assert_called_once_with()
+
+
+def _prepare_emergency_ambiguity_db(db_file: Path) -> tuple[str, str]:
+    """Create two leased jobs already inside the outcome-unknown boundary."""
+    init_db(db_file)
+    job_ids: list[str] = []
+    for index, state in enumerate(("submit_intent", "verifying")):
+        app_id = f"app-emergency-{index}"
+        upsert_application(
+            app_id=app_id,
+            company=f"Emergency {index}",
+            title="Engineer",
+            job_url=f"https://emergency.example/{index}",
+            custom_path=db_file,
+        )
+        enqueue_job(app_id, adapter="greenhouse", custom_path=db_file)
+        job = claim_next_job("emergency-worker", lease_seconds=60, custom_path=db_file)
+        assert job is not None
+        attempt = create_attempt(
+            job_id=job.id,
+            app_id=app_id,
+            worker_id="emergency-worker",
+            lease_generation=job.fencing_generation,
+            custom_path=db_file,
+        )
+        assert record_submit_intent(
+            attempt.id,
+            job.id,
+            "emergency-worker",
+            job.fencing_generation,
+            custom_path=db_file,
+        )
+        if state == "verifying":
+            conn = get_connection(db_file)
+            with conn:
+                conn.execute(
+                    "UPDATE automation_jobs SET state = 'verifying' WHERE id = ?;",
+                    (job.id,),
+                )
+            conn.close()
+        job_ids.append(job.id)
+    return job_ids[0], job_ids[1]
+
+
+def test_emergency_stop_rejects_expired_owner_without_any_side_effects(
+    tmp_path: Path,
+):
+    from job_applier.automation.queue import TAKEOVER_TRANSPORT_LOCK
+    from job_applier.ops.emergency_stop import emergency_stop
+
+    db_file = tmp_path / "emergency_expired_owner.db"
+    first_job, second_job = _prepare_emergency_ambiguity_db(db_file)
+    assert (
+        claim_manual_takeover("old-owner", lease_seconds=1, custom_path=db_file)[
+            "status"
+        ]
+        == "success"
+    )
+
+    result: dict[str, Any] = {}
+    TAKEOVER_TRANSPORT_LOCK.acquire()
+    try:
+        worker = threading.Thread(
+            target=lambda: result.update(
+                emergency_stop(custom_db_path=db_file, expected_owner="old-owner")
+            )
+        )
+        worker.start()
+        time.sleep(0.1)
+        assert worker.is_alive()
+        time.sleep(1.1)
+    finally:
+        TAKEOVER_TRANSPORT_LOCK.release()
+    worker.join(timeout=3)
+
+    assert result["status"] == "rejected"
+    conn = get_connection(db_file)
+    rows = conn.execute(
+        "SELECT id, state FROM automation_jobs WHERE id IN (?, ?) ORDER BY id;",
+        (first_job, second_job),
+    ).fetchall()
+    control = conn.execute(
+        "SELECT is_stopped, is_paused FROM runtime_control WHERE id = 1;"
+    ).fetchone()
+    notification_count = conn.execute("SELECT COUNT(*) FROM notifications;").fetchone()[
+        0
+    ]
+    conn.close()
+    assert [row["state"] for row in rows] == ["submit_intent", "verifying"]
+    assert control["is_stopped"] == 0
+    assert control["is_paused"] == 1
+    assert notification_count == 0
+
+
+def test_emergency_stop_rejects_replaced_owner_without_side_effects(tmp_path: Path):
+    from job_applier.automation.queue import TAKEOVER_TRANSPORT_LOCK
+    from job_applier.ops.emergency_stop import emergency_stop
+
+    db_file = tmp_path / "emergency_replaced_owner.db"
+    first_job, second_job = _prepare_emergency_ambiguity_db(db_file)
+    assert (
+        claim_manual_takeover("old-owner", custom_path=db_file)["status"] == "success"
+    )
+    result: dict[str, Any] = {}
+    TAKEOVER_TRANSPORT_LOCK.acquire()
+    try:
+        worker = threading.Thread(
+            target=lambda: result.update(
+                emergency_stop(custom_db_path=db_file, expected_owner="old-owner")
+            )
+        )
+        worker.start()
+        time.sleep(0.1)
+        assert worker.is_alive()
+        assert (
+            release_manual_takeover("old-owner", custom_path=db_file)["status"]
+            == "success"
+        )
+        assert (
+            claim_manual_takeover("new-owner", custom_path=db_file)["status"]
+            == "success"
+        )
+    finally:
+        TAKEOVER_TRANSPORT_LOCK.release()
+    worker.join(timeout=3)
+
+    assert result["status"] == "rejected"
+    conn = get_connection(db_file)
+    rows = conn.execute(
+        "SELECT id, state FROM automation_jobs WHERE id IN (?, ?) ORDER BY id;",
+        (first_job, second_job),
+    ).fetchall()
+    control = conn.execute(
+        "SELECT manual_takeover_owner, is_stopped, is_paused FROM runtime_control WHERE id = 1;"
+    ).fetchone()
+    notification_count = conn.execute("SELECT COUNT(*) FROM notifications;").fetchone()[
+        0
+    ]
+    conn.close()
+    assert [row["state"] for row in rows] == ["submit_intent", "verifying"]
+    assert control["manual_takeover_owner"] == "new-owner"
+    assert control["is_stopped"] == 0
+    assert control["is_paused"] == 1
+    assert notification_count == 0
+
+
+def test_emergency_stop_commits_all_ambiguity_projections_once(tmp_path: Path):
+    from job_applier.ops.emergency_stop import emergency_stop
+
+    db_file = tmp_path / "emergency_success_transaction.db"
+    first_job, second_job = _prepare_emergency_ambiguity_db(db_file)
+    result = emergency_stop(reason="multi-job test", custom_db_path=db_file)
+    assert result["status"] == "success"
+
+    conn = get_connection(db_file)
+    jobs = conn.execute(
+        "SELECT id, state, lease_owner FROM automation_jobs WHERE id IN (?, ?) ORDER BY id;",
+        (first_job, second_job),
+    ).fetchall()
+    apps = conn.execute(
+        "SELECT status FROM applications WHERE id IN ('app-emergency-0', 'app-emergency-1') ORDER BY id;"
+    ).fetchall()
+    attempts = conn.execute(
+        "SELECT is_ambiguous, completed_at FROM application_attempts WHERE job_id IN (?, ?) ORDER BY job_id;",
+        (first_job, second_job),
+    ).fetchall()
+    control = conn.execute(
+        "SELECT is_stopped, is_paused, browser_is_closed, browser_shutdown_generation FROM runtime_control WHERE id = 1;"
+    ).fetchone()
+    audit_count = conn.execute(
+        "SELECT COUNT(*) FROM automation_events WHERE event_type = 'emergency_stop_engaged';"
+    ).fetchone()[0]
+    notification_count = conn.execute(
+        "SELECT COUNT(*) FROM notification_outbox WHERE category = 'system_failure';"
+    ).fetchone()[0]
+    conn.close()
+    assert [row["state"] for row in jobs] == [
+        "ambiguous_submission",
+        "ambiguous_submission",
+    ]
+    assert all(row["lease_owner"] is None for row in jobs)
+    assert [row["status"] for row in apps] == ["ambiguous", "ambiguous"]
+    assert all(row["is_ambiguous"] == 1 and row["completed_at"] for row in attempts)
+    assert control["is_stopped"] == 1
+    assert control["is_paused"] == 1
+    assert control["browser_is_closed"] == 1
+    assert control["browser_shutdown_generation"] >= 1
+    assert audit_count == 1
+    assert notification_count == 1
+
+
+def test_emergency_stop_rolls_back_all_projections_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from job_applier.ops import emergency_stop as emergency_stop_module
+
+    db_file = tmp_path / "emergency_rollback.db"
+    first_job, second_job = _prepare_emergency_ambiguity_db(db_file)
+    original = emergency_stop_module._mark_job_ambiguous_on_conn
+    calls = 0
+
+    def fail_on_second(conn: Any, *args: Any, **kwargs: Any) -> bool:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected ambiguity failure")
+        return original(conn, *args, **kwargs)
+
+    monkeypatch.setattr(
+        emergency_stop_module, "_mark_job_ambiguous_on_conn", fail_on_second
+    )
+    with pytest.raises(RuntimeError, match="injected ambiguity failure"):
+        emergency_stop_module.emergency_stop(custom_db_path=db_file)
+
+    conn = get_connection(db_file)
+    rows = conn.execute(
+        "SELECT id, state FROM automation_jobs WHERE id IN (?, ?) ORDER BY id;",
+        (first_job, second_job),
+    ).fetchall()
+    control = conn.execute(
+        "SELECT is_stopped, is_paused FROM runtime_control WHERE id = 1;"
+    ).fetchone()
+    notification_count = conn.execute("SELECT COUNT(*) FROM notifications;").fetchone()[
+        0
+    ]
+    conn.close()
+    assert [row["state"] for row in rows] == ["submit_intent", "verifying"]
+    assert control["is_stopped"] == 0
+    assert control["is_paused"] == 0
+    assert notification_count == 0
+
+
+def test_emergency_stop_acquires_queue_lock_before_sqlite_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The emergency transaction follows queue lock ordering before event writes."""
+    from job_applier.ops import emergency_stop as emergency_stop_module
+
+    db_file = tmp_path / "emergency-lock-order.db"
+    init_db(db_file)
+    lock_owned_at_event: list[bool] = []
+    original_record_event = emergency_stop_module.record_event
+
+    def record_event_with_lock_probe(*args: Any, **kwargs: Any) -> Any:
+        lock_owned_at_event.append(_QUEUE_LOCK._is_owned())  # type: ignore[attr-defined]
+        return original_record_event(*args, **kwargs)
+
+    monkeypatch.setattr(
+        emergency_stop_module, "record_event", record_event_with_lock_probe
+    )
+
+    result = emergency_stop_module.emergency_stop(custom_db_path=db_file)
+
+    assert result["status"] == "success"
+    assert lock_owned_at_event == [True]
+
+
+def test_emergency_stop_releases_transport_lock_when_connection_fails(tmp_path: Path):
+    from job_applier.automation.queue import TAKEOVER_TRANSPORT_LOCK
+    from job_applier.ops import emergency_stop as emergency_stop_module
+
+    init_db(tmp_path / "emergency-failure.db")
+    with patch.object(
+        emergency_stop_module,
+        "get_connection",
+        side_effect=RuntimeError("database unavailable"),
+    ):
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            emergency_stop_module.emergency_stop(
+                custom_db_path=tmp_path / "emergency-failure.db"
+            )
+
+    assert TAKEOVER_TRANSPORT_LOCK.acquire(blocking=False)
+    TAKEOVER_TRANSPORT_LOCK.release()
 
 
 def test_web_app_takeover_endpoints(client):
@@ -590,7 +1733,10 @@ def test_safe_resume_updates_applications_status_to_applied(tmp_path: Path):
         return_value=(True, ""),
     ):
         res = safe_resume_revalidate(
-            job_id=claimed.id, automator=mock_automator, custom_path=db_file
+            job_id=claimed.id,
+            current_url=mock_page.url,
+            automator=mock_automator,
+            custom_path=db_file,
         )
     assert res["status"] == "success"
     assert res["action"] == "marked_applied"
@@ -601,6 +1747,56 @@ def test_safe_resume_updates_applications_status_to_applied(tmp_path: Path):
     ).fetchone()
     conn.close()
     assert app_row["status"] == "applied"
+
+
+def test_vnc_password_validation_and_generated_file_cleanup(
+    tmp_path: Path, monkeypatch
+):
+    from job_applier.cli import vnc_auth
+
+    with monkeypatch.context() as context:
+        context.setenv("VNC_PASSWORD", "secret8!")
+        assert vnc_auth.load_vnc_password() == "secret8!"
+        for invalid in ("", "123456789", "pässword", "bad\npass"):
+            if invalid:
+                context.setenv("VNC_PASSWORD", invalid)
+            else:
+                context.delenv("VNC_PASSWORD", raising=False)
+            with pytest.raises(RuntimeError):
+                vnc_auth.load_vnc_password()
+
+    def fake_store(cmd, *, env, input, **kwargs):
+        assert cmd == ["x11vnc", "-storepasswd"]
+        assert "secret8!" in input
+        assert "VNC_PASSWORD" not in env
+        stored = Path(env["HOME"]) / ".vnc" / "passwd"
+        stored.write_bytes(b"encrypted")
+        return MagicMock(returncode=0)
+
+    with patch("job_applier.cli.vnc_auth.subprocess.run", side_effect=fake_store):
+        generated = vnc_auth.create_vnc_password_file("secret8!")
+    assert generated.stat().st_mode & 0o777 == 0o600
+    assert generated.read_bytes() == b"encrypted"
+    vnc_auth.cleanup_vnc_password_file(generated)
+    assert not generated.exists()
+
+
+def test_runtime_daemon_rejects_missing_vnc_password_before_starting(tmp_path: Path):
+    from job_applier.cli.runtime_daemon import RuntimeDaemon
+
+    daemon = RuntimeDaemon(profile_dir=tmp_path / "profile")
+    with (
+        patch("job_applier.cli.runtime_daemon.is_linux", return_value=True),
+        patch(
+            "job_applier.cli.runtime_daemon.load_vnc_password",
+            side_effect=RuntimeError("VNC_PASSWORD is required"),
+        ),
+        patch("shutil.which", return_value="/usr/bin/mock"),
+        patch("job_applier.cli.runtime_daemon.subprocess.Popen") as popen,
+    ):
+        with pytest.raises(RuntimeError, match="VNC_PASSWORD is required"):
+            daemon.start_display_subsystem()
+    popen.assert_not_called()
 
 
 def test_runtime_daemon_websockify_and_x11vnc_commands(tmp_path: Path):
@@ -618,6 +1814,11 @@ def test_runtime_daemon_websockify_and_x11vnc_commands(tmp_path: Path):
     )
 
     started_cmds = []
+    password_file = tmp_path / "vnc.passwd"
+    password_file.write_bytes(b"encrypted")
+    previous_password_file = tmp_path / "previous-vnc.passwd"
+    previous_password_file.write_bytes(b"old-encrypted")
+    daemon.vnc_password_file = previous_password_file
 
     def mock_popen(cmd, *args, **kwargs):
         started_cmds.append(cmd)
@@ -627,15 +1828,28 @@ def test_runtime_daemon_websockify_and_x11vnc_commands(tmp_path: Path):
 
     with (
         patch("job_applier.cli.runtime_daemon.is_linux", return_value=True),
+        patch(
+            "job_applier.cli.runtime_daemon.load_vnc_password", return_value="testpass"
+        ),
+        patch(
+            "job_applier.cli.runtime_daemon.create_vnc_password_file",
+            return_value=password_file,
+        ),
         patch("shutil.which", return_value="/usr/bin/mock"),
         patch("subprocess.Popen", side_effect=mock_popen),
     ):
         daemon.start_display_subsystem()
 
+    # A retry removes the previous generated credential before replacing its path.
+    assert not previous_password_file.exists()
+
     # Verify x11vnc does not have -viewonly
     vnc_cmd = next(c for c in started_cmds if c[0] == "x11vnc")
     assert "-viewonly" not in vnc_cmd
+    assert "-nopw" not in vnc_cmd
     assert "-localhost" in vnc_cmd
+    assert "-rfbauth" in vnc_cmd
+    assert vnc_cmd[vnc_cmd.index("-rfbauth") + 1] == str(password_file)
 
     # Verify websockify has --web pointing to novnc_dir
     ws_cmd = next(c for c in started_cmds if c[0] == "websockify")
@@ -668,6 +1882,236 @@ def test_runtime_daemon_websockify_and_x11vnc_commands(tmp_path: Path):
         getattr(daemon.wallpaper_proc, "terminate").called
         or daemon.wallpaper_proc.poll() is not None
     )
+    assert not password_file.exists()
+
+
+def test_heartbeat_exception_only_signals_loss(monkeypatch):
+    monkeypatch.setattr(
+        "job_applier.cli.worker.renew_lease",
+        MagicMock(side_effect=sqlite3.OperationalError("database is locked")),
+    )
+    heartbeat = HeartbeatThread(
+        job_id="job-heartbeat",
+        worker_id="worker-heartbeat",
+        generation=1,
+        interval=0.01,
+    )
+    heartbeat.start()
+    heartbeat.join(timeout=1)
+
+    assert not heartbeat.is_alive()
+    assert heartbeat.lost_lease is True
+    assert heartbeat.lost_lease_event.is_set()
+
+
+def test_worker_closes_without_publication_when_lease_lost_during_startup(
+    tmp_path: Path,
+):
+    db_file = tmp_path / "startup_lease_loss.db"
+    init_db(db_file)
+    upsert_application(
+        "app-startup-lease-loss",
+        "Startup Corp",
+        "Engineer",
+        "https://startup.example/job/1",
+        folder_name="startup_lease_loss",
+        custom_path=db_file,
+    )
+    enqueue_job("app-startup-lease-loss", adapter="generic", custom_path=db_file)
+    claimed = claim_next_job("startup-worker", custom_path=db_file)
+    assert claimed is not None
+    cv_path = tmp_path / "CV.pdf"
+    cv_path.write_bytes(b"%PDF-1.4 test")
+    profile = MagicMock()
+    profile.to_dict.return_value = {}
+    automator = MagicMock()
+    heartbeat_holder: dict[str, Any] = {}
+
+    class FakeHeartbeat:
+        def __init__(self, **kwargs: Any):
+            self.lost_lease = False
+            self.generation = kwargs["generation"]
+            heartbeat_holder["instance"] = self
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    def lose_lease_during_start() -> None:
+        heartbeat_holder["instance"].lost_lease = True
+
+    close_thread_ids: list[int] = []
+    automator.close.side_effect = lambda: close_thread_ids.append(threading.get_ident())
+    automator.start.side_effect = lose_lease_during_start
+    with (
+        patch("job_applier.cli.worker.HeartbeatThread", FakeHeartbeat),
+        patch("job_applier.cli.worker.BrowserAutomator", return_value=automator),
+        patch(
+            "job_applier.cli.worker.validate_application_artifacts",
+            return_value=(True, str(cv_path)),
+        ),
+        patch("job_applier.cli.worker.load_candidate_profile", return_value=profile),
+        patch(
+            "job_applier.cli.worker.SubmissionSafetyGuard.validate_pacing_and_daily_limits"
+        ),
+    ):
+        result = process_claimed_job(
+            claimed, worker_id="startup-worker", custom_db_path=db_file
+        )
+
+    assert result == "lease_lost"
+    automator.run_autonomous_apply.assert_not_called()
+    automator.close.assert_called_once()
+    assert close_thread_ids == [threading.get_ident()]
+    control = get_runtime_control(db_file)
+    assert control["browser_active"] is False
+
+
+def test_worker_skips_reconciliation_when_lease_lost_after_apply(tmp_path: Path):
+    db_file = tmp_path / "post_apply_lease_loss.db"
+    init_db(db_file)
+    upsert_application(
+        "app-post-apply-lease-loss",
+        "Apply Corp",
+        "Engineer",
+        "https://apply.example/job/1",
+        folder_name="post_apply_lease_loss",
+        custom_path=db_file,
+    )
+    enqueue_job("app-post-apply-lease-loss", adapter="generic", custom_path=db_file)
+    claimed = claim_next_job("apply-worker", custom_path=db_file)
+    assert claimed is not None
+    cv_path = tmp_path / "CV.pdf"
+    cv_path.write_bytes(b"%PDF-1.4 test")
+    profile = MagicMock()
+    profile.to_dict.return_value = {}
+    automator = MagicMock()
+    heartbeat_holder: dict[str, Any] = {}
+
+    class FakeHeartbeat:
+        def __init__(self, **kwargs: Any):
+            self.lost_lease = False
+            self.generation = kwargs["generation"]
+            heartbeat_holder["instance"] = self
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    def lose_lease_after_apply(**_: Any) -> tuple[str, str]:
+        heartbeat_holder["instance"].lost_lease = True
+        return "applied", "submitted"
+
+    automator.run_autonomous_apply.side_effect = lose_lease_after_apply
+    with (
+        patch("job_applier.cli.worker.HeartbeatThread", FakeHeartbeat),
+        patch("job_applier.cli.worker.BrowserAutomator", return_value=automator),
+        patch(
+            "job_applier.cli.worker.validate_application_artifacts",
+            return_value=(True, str(cv_path)),
+        ),
+        patch("job_applier.cli.worker.load_candidate_profile", return_value=profile),
+        patch(
+            "job_applier.cli.worker.SubmissionSafetyGuard.validate_pacing_and_daily_limits"
+        ),
+        patch(
+            "job_applier.cli.worker.SubmissionSafetyGuard.reconcile_submission_outcome"
+        ) as reconcile,
+    ):
+        result = process_claimed_job(
+            claimed, worker_id="apply-worker", custom_db_path=db_file
+        )
+
+    assert result == "lease_lost"
+    reconcile.assert_not_called()
+    automator.close.assert_called_once()
+
+
+def test_runtime_daemon_timeout_publishes_browser_shutdown_fence(tmp_path: Path):
+    from job_applier.cli.runtime_daemon import RuntimeDaemon
+
+    db_file = tmp_path / "daemon_timeout.db"
+    init_db(db_file)
+    conn = get_connection(db_file)
+    with conn:
+        conn.execute(
+            """
+            UPDATE runtime_control
+            SET browser_active = 1, browser_is_closed = 0,
+                browser_job_id = 'job-stale', browser_session_generation = 4,
+                browser_shutdown_generation = 4
+            WHERE id = 1;
+            """
+        )
+    conn.close()
+
+    class StubbornWorker:
+        def is_alive(self):
+            return True
+
+        def join(self, timeout):
+            return None
+
+    daemon = RuntimeDaemon(custom_db_path=db_file, worker_shutdown_timeout=0.01)
+    daemon.__dict__["_worker_thread"] = StubbornWorker()
+    with (
+        patch.object(daemon.outbound_proxy, "stop"),
+        patch.object(daemon.profile_lock, "release"),
+        patch.object(daemon.singleton_lock, "release"),
+    ):
+        daemon.shutdown()
+
+    conn = get_connection(db_file)
+    row = conn.execute(
+        "SELECT browser_active, browser_is_closed, browser_job_id, browser_session_generation, browser_shutdown_generation FROM runtime_control WHERE id = 1"
+    ).fetchone()
+    conn.close()
+    assert row["browser_active"] == 0
+    assert row["browser_is_closed"] == 1
+    assert row["browser_job_id"] is None
+    assert row["browser_session_generation"] == 5
+    assert row["browser_shutdown_generation"] == 5
+
+
+def test_runtime_daemon_reconcile_exception_still_publishes_shutdown_fence(
+    tmp_path: Path,
+):
+    from job_applier.cli.runtime_daemon import RuntimeDaemon
+
+    db_file = tmp_path / "daemon_reconcile_exception.db"
+    init_db(db_file)
+    conn = get_connection(db_file)
+    with conn:
+        conn.execute(
+            "UPDATE runtime_control SET browser_active = 1, browser_is_closed = 0, browser_session_generation = 7, browser_shutdown_generation = 7 WHERE id = 1;"
+        )
+    conn.close()
+
+    daemon = RuntimeDaemon(custom_db_path=db_file)
+    daemon._worker_id = "worker-failing-reconcile"
+    daemon.__dict__["_reconcile_inflight_worker"] = MagicMock(
+        side_effect=RuntimeError("reconciliation failed")
+    )
+    with (
+        patch.object(daemon.outbound_proxy, "stop"),
+        patch.object(daemon.profile_lock, "release"),
+        patch.object(daemon.singleton_lock, "release"),
+    ):
+        daemon.shutdown()
+
+    conn = get_connection(db_file)
+    row = conn.execute(
+        "SELECT browser_active, browser_is_closed, browser_session_generation, browser_shutdown_generation FROM runtime_control WHERE id = 1"
+    ).fetchone()
+    conn.close()
+    assert row["browser_active"] == 0
+    assert row["browser_is_closed"] == 1
+    assert row["browser_session_generation"] == 8
+    assert row["browser_shutdown_generation"] == 8
 
 
 def test_runtime_daemon_reconciles_job_before_display_teardown(tmp_path: Path):
@@ -769,6 +2213,48 @@ def test_runtime_daemon_reconciles_job_before_display_teardown(tmp_path: Path):
     assert submit_row["lease_owner"] is None
     assert submit_row["error_code"] == "SHUTDOWN_DURING_SUBMISSION"
     assert app_row["status"] == "ambiguous"
+
+
+def test_runtime_shutdown_preserves_ambiguous_submission(tmp_path: Path):
+    from job_applier.cli.runtime_daemon import RuntimeDaemon
+
+    db_file = tmp_path / "ambiguous-shutdown.db"
+    init_db(db_file)
+    upsert_application(
+        app_id="app-ambiguous-shutdown",
+        company="AmbiguousCo",
+        title="Engineer",
+        job_url="https://ambiguous.example/job",
+        custom_path=db_file,
+    )
+    conn = get_connection(db_file)
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO automation_jobs (
+                id, app_id, adapter, adapter_version, state, priority,
+                lease_owner, fencing_generation, lease_expires_at, created_at, updated_at
+            ) VALUES ('job-ambiguous-shutdown', 'app-ambiguous-shutdown', 'generic', '1.0.0',
+                      'ambiguous_submission', 1, 'runtime-test', 4, datetime('now', '+1 minute'),
+                      datetime('now'), datetime('now'));
+            """
+        )
+    conn.close()
+
+    daemon = RuntimeDaemon(custom_db_path=db_file)
+    assert daemon._reconcile_inflight_worker("runtime-test") == [
+        "job-ambiguous-shutdown"
+    ]
+
+    conn = get_connection(db_file)
+    row = conn.execute(
+        "SELECT state, lease_owner, error_code FROM automation_jobs WHERE id = ?",
+        ("job-ambiguous-shutdown",),
+    ).fetchone()
+    conn.close()
+    assert row["state"] == "ambiguous_submission"
+    assert row["lease_owner"] is None
+    assert row["error_code"] == "RUNTIME_SHUTDOWN"
 
 
 def test_runtime_daemon_runs_sync_worker_outside_main_thread():
@@ -976,6 +2462,7 @@ def test_safe_resume_uses_active_browser_owner_over_newer_auth_job(tmp_path: Pat
         url="https://www.bestjobs.eu/loc-de-munca/product-owner",
         is_closed=False,
         browser_job_id=bestjobs.id,
+        browser_session_generation=bestjobs_claimed.fencing_generation,
         custom_path=db_file,
     )
     browser_owner = get_browser_owner_job(custom_path=db_file)
@@ -1022,13 +2509,21 @@ def test_reopen_auth_session_requeues_closed_browser_job(tmp_path: Path):
     )
     set_runtime_pause(True, custom_path=db_file)
     set_runtime_stop(True, custom_path=db_file)
-    set_runtime_browser_state(active=False, is_closed=True, custom_path=db_file)
+    set_runtime_browser_state(
+        active=True,
+        is_closed=False,
+        browser_job_id=job.id,
+        browser_session_generation=claimed.fencing_generation,
+        custom_path=db_file,
+    )
 
     blocked = requeue_auth_required_job(job_id=job.id, custom_path=db_file)
     assert blocked["reason"] == "emergency_stop_active"
     set_runtime_stop(False, custom_path=db_file)
     result = requeue_auth_required_job(job_id=job.id, custom_path=db_file)
 
+    # Browser closure is performed by the runtime worker after observing the
+    # durable generation transition, not by this web-process test.
     assert result["status"] == "started"
     assert result["action"] == "reopen_auth_session"
     conn = get_connection(db_file)
@@ -1048,6 +2543,65 @@ def test_reopen_auth_session_requeues_closed_browser_job(tmp_path: Path):
     assert control["is_stopped"] is False
     assert control["browser_active"] is False
     assert control["browser_is_closed"] is True
+
+
+def test_reopen_auth_waits_for_transport_fence_before_clearing_lease(tmp_path: Path):
+    """Reopen-auth cannot commit its lease clear while relay transport is fenced."""
+    db_file = tmp_path / "reopen_auth_race.db"
+    init_db(db_file)
+    upsert_application(
+        app_id="app-auth-race",
+        company="Auth Corp",
+        title="Engineer",
+        job_url="https://www.linkedin.com/jobs/view/race",
+        custom_path=db_file,
+    )
+    job = enqueue_job("app-auth-race", adapter="linkedin", custom_path=db_file)
+    claimed = claim_next_job("worker-race", custom_path=db_file)
+    assert claimed is not None
+    assert transition_job(
+        claimed.id,
+        "worker-race",
+        claimed.fencing_generation,
+        to_state=JobState.AUTH_REQUIRED.value,
+        custom_path=db_file,
+    )
+    conn = get_connection(db_file)
+    with conn:
+        conn.execute(
+            "UPDATE runtime_control SET manual_takeover_owner = 'owner@example.test', manual_takeover_expires_at = datetime('now', 'localtime', '+5 minutes'), is_paused = 1 WHERE id = 1;"
+        )
+    conn.close()
+
+    from job_applier.automation.queue import TAKEOVER_TRANSPORT_LOCK
+
+    started = threading.Event()
+    finished = threading.Event()
+    result: dict[str, Any] = {}
+
+    def reopen() -> None:
+        started.set()
+        result.update(
+            requeue_auth_required_job(
+                job_id=job.id,
+                custom_path=db_file,
+                expected_owner="owner@example.test",
+            )
+        )
+        finished.set()
+
+    with TAKEOVER_TRANSPORT_LOCK:
+        thread = threading.Thread(target=reopen)
+        thread.start()
+        assert started.wait(timeout=1)
+        time.sleep(0.02)
+        assert not finished.is_set()
+
+    thread.join(timeout=2)
+    assert finished.is_set()
+    assert result["status"] == "started"
+    control = get_runtime_control(db_file)
+    assert control["manual_takeover_owner"] is None
 
 
 def test_reopen_auth_without_job_id_uses_browser_owner_only(tmp_path: Path):
@@ -1138,6 +2692,95 @@ def test_reopen_auth_without_job_id_rejects_without_browser_owner(tmp_path: Path
     assert result["reason"] == "auth_job_target_required"
 
 
+def test_safe_resume_rejects_reclaimed_generation_before_unpause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from job_applier.automation.queue import (
+        claim_manual_takeover,
+        claim_next_job,
+        enqueue_job,
+        get_runtime_control,
+        set_runtime_pause,
+        set_runtime_browser_state,
+    )
+    from job_applier.automation.safe_resume import safe_resume_revalidate
+
+    db_file = tmp_path / "safe_resume_reclaimed_generation.db"
+    init_db(db_file)
+    upsert_application(
+        app_id="app-resume-reclaim",
+        company="Resume Corp",
+        title="Engineer",
+        job_url="https://example.com/job",
+        custom_path=db_file,
+    )
+    job = enqueue_job("app-resume-reclaim", custom_path=db_file)
+    claimed = claim_next_job("old-worker", custom_path=db_file)
+    assert claimed is not None
+    assert transition_job(
+        job.id,
+        "old-worker",
+        claimed.fencing_generation,
+        to_state=JobState.AUTH_REQUIRED.value,
+        custom_path=db_file,
+    )
+    set_runtime_browser_state(
+        active=True,
+        url="https://example.com/job",
+        is_closed=False,
+        browser_job_id=job.id,
+        browser_session_generation=claimed.fencing_generation,
+        custom_path=db_file,
+    )
+    set_runtime_pause(True, custom_path=db_file)
+    assert (
+        claim_manual_takeover("resume-owner", custom_path=db_file)["status"]
+        == "success"
+    )
+
+    def reclaim_during_validation(_url: str):
+        conn = get_connection(db_file)
+        with conn:
+            conn.execute(
+                """
+                UPDATE automation_jobs
+                SET state = 'claimed', lease_owner = 'replacement-worker',
+                    lease_expires_at = datetime('now', '+1 minute'),
+                    fencing_generation = fencing_generation + 1
+                WHERE id = ?;
+                """,
+                (job.id,),
+            )
+        conn.close()
+        return True, ""
+
+    monkeypatch.setattr(
+        "job_applier.automation.safe_resume.validate_target_url",
+        reclaim_during_validation,
+    )
+    result = safe_resume_revalidate(
+        job_id=job.id,
+        current_url="https://example.com/job",
+        custom_path=db_file,
+        expected_owner="resume-owner",
+    )
+
+    assert result["status"] == "rejected"
+    assert result["reason"] == "lease_fenced_or_expired"
+    control = get_runtime_control(db_file)
+    assert control["is_paused"] == 1
+    assert control["manual_takeover_owner"] == "resume-owner"
+    conn = get_connection(db_file)
+    row = conn.execute(
+        "SELECT state, lease_owner, fencing_generation FROM automation_jobs WHERE id = ?",
+        (job.id,),
+    ).fetchone()
+    conn.close()
+    assert row["state"] == JobState.CLAIMED.value
+    assert row["lease_owner"] == "replacement-worker"
+    assert row["fencing_generation"] == claimed.fencing_generation + 1
+
+
 def test_safe_resume_tenant_validation(tmp_path: Path):
     from job_applier.automation.queue import claim_next_job, enqueue_job
     from job_applier.automation.safe_resume import safe_resume_revalidate
@@ -1168,7 +2811,10 @@ def test_safe_resume_tenant_validation(tmp_path: Path):
         return_value=(True, ""),
     ):
         res = safe_resume_revalidate(
-            job_id=claimed.id, automator=mock_automator, custom_path=db_file
+            job_id=claimed.id,
+            current_url=mock_page.url,
+            automator=mock_automator,
+            custom_path=db_file,
         )
 
     assert res["status"] == "rejected"
@@ -1332,7 +2978,10 @@ def test_safe_resume_ignores_loose_body_text_without_confirmation_url(
         return_value=(True, ""),
     ):
         res = safe_resume_revalidate(
-            job_id=claimed.id, automator=mock_automator, custom_path=db_file
+            job_id=claimed.id,
+            current_url=mock_page.url,
+            automator=mock_automator,
+            custom_path=db_file,
         )
 
     assert res["status"] == "success"

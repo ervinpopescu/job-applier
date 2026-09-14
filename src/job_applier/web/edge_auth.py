@@ -10,7 +10,7 @@ Implements Zero-Trust Edge Security according to autonomous pipeline specificati
 - Host header enforcement and trusted proxy CIDR filtering.
 - CSRF protection and exact Origin verification for mutating requests.
 - No credentialed cross-origin CORS.
-- Minimal private health check (/api/health).
+- Public health authentication with a loopback/token-authenticated internal probe.
 - Gateway authorization endpoint for noVNC HTTP/WebSocket upgrades (/api/auth/viewer-gate).
 - Server-side 5-minute / token-expiry viewer WebSocket lifetime enforcement.
 """
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hmac
 import ipaddress
 import json
 import logging
@@ -27,7 +28,7 @@ import re
 import time
 from dataclasses import dataclass, field
 import struct
-from typing import Any
+from typing import Any, cast
 import urllib.parse
 import urllib.request
 
@@ -124,6 +125,8 @@ class EdgeAuthConfig:
         ]
     )
     viewer_max_duration_seconds: int = 300  # Strict 5-minute maximum viewer lifetime
+    internal_health_check_token: str = ""
+    local_gateway_viewer_token: str = ""
     jwks_cache_ttl_seconds: int = 3600  # 1 hour JWKS TTL
     jwks_rate_limit_seconds: int = 60  # Rate-limit remote refresh to at most once/min
     jwks_timeout_seconds: float = 5.0
@@ -153,6 +156,8 @@ class EdgeAuthConfig:
             "http://localhost:8000",
             "http://127.0.0.1:8001",
             "http://localhost:8001",
+            "http://127.0.0.1:8089",
+            "http://localhost:8089",
             "http://localhost:3000",
             "http://testserver",
         }
@@ -258,6 +263,15 @@ class EdgeAuthConfig:
         except ValueError:
             viewer_duration = 300
 
+        internal_health_check_token = get_secret(
+            "INTERNAL_HEALTH_CHECK_TOKEN",
+            os.getenv("INTERNAL_HEALTH_CHECK_TOKEN", ""),
+        ).strip()
+        local_gateway_viewer_token = get_secret(
+            "LOCAL_GATEWAY_VIEWER_TOKEN",
+            os.getenv("LOCAL_GATEWAY_VIEWER_TOKEN", ""),
+        ).strip()
+
         return cls(
             cf_access_enabled=cf_access_enabled,
             cf_access_aud=cf_access_aud,
@@ -268,6 +282,8 @@ class EdgeAuthConfig:
             allowed_hosts=allowed_hosts,
             trusted_proxies=trusted_proxies,
             viewer_max_duration_seconds=min(300, max(30, viewer_duration)),
+            internal_health_check_token=internal_health_check_token,
+            local_gateway_viewer_token=local_gateway_viewer_token,
         )
 
 
@@ -280,6 +296,7 @@ class JwksCache:
     def __init__(self, max_keys: int = 16) -> None:
         self.max_keys = max_keys
         self._keys: dict[str, rsa.RSAPublicKey] = {}
+        self._key_fetched_at: float = 0.0
         self._last_fetched: float = 0.0
         self._injected_keys: dict[str, rsa.RSAPublicKey] = {}
 
@@ -291,6 +308,7 @@ class JwksCache:
         """Clears all cached and injected keys."""
         self._keys.clear()
         self._injected_keys.clear()
+        self._key_fetched_at = 0.0
         self._last_fetched = 0.0
 
     def get_key(
@@ -299,6 +317,7 @@ class JwksCache:
         certs_url: str,
         rate_limit_seconds: float = 60.0,
         timeout_seconds: float = 5.0,
+        cache_ttl_seconds: float = 3600.0,
     ) -> rsa.RSAPublicKey | None:
         """
         Retrieves public key by kid. Refreshes from certs_url if unknown and rate limit permits.
@@ -306,11 +325,15 @@ class JwksCache:
         if kid in self._injected_keys:
             return self._injected_keys[kid]
 
+        now = time.time()
         if kid in self._keys:
-            return self._keys[kid]
+            if now - self._key_fetched_at <= cache_ttl_seconds:
+                return self._keys[kid]
+            # Never continue trusting an expired key while a refresh is
+            # pending; rotation must fail closed rather than use stale keys.
+            self._keys.clear()
 
         # Rate-limit remote refresh
-        now = time.time()
         if now - self._last_fetched < rate_limit_seconds:
             logger.warning(
                 f"Rate-limiting JWKS refresh for kid {kid}. Last fetch was {now - self._last_fetched:.1f}s ago."
@@ -357,6 +380,7 @@ class JwksCache:
                 new_keys = dict(list(new_keys.items())[: self.max_keys])
 
             self._keys = new_keys
+            self._key_fetched_at = time.time()
             logger.info(f"Loaded {len(self._keys)} RSA public keys from {certs_url}")
         except Exception as e:
             logger.error(f"Failed to fetch JWKS from {certs_url}: {e}")
@@ -418,6 +442,7 @@ def verify_cf_access_jwt(
         certs_url=config.cf_access_certs_url,
         rate_limit_seconds=config.jwks_rate_limit_seconds,
         timeout_seconds=config.jwks_timeout_seconds,
+        cache_ttl_seconds=config.jwks_cache_ttl_seconds,
     )
     if not pub_key:
         raise EdgeAuthError(401, f"Unknown or unverified key ID '{kid}'")
@@ -472,12 +497,15 @@ def verify_cf_access_jwt(
         raise EdgeAuthError(401, f"Token has expired (exp: {exp}, now: {int(now)})")
 
     # 8. Check Clock Skew (nbf, iat)
-    if "nbf" in payload and isinstance(payload["nbf"], (int, float)):
-        if payload["nbf"] > now + 60:
-            raise EdgeAuthError(401, "Token is not yet active (nbf in future)")
-    if "iat" in payload and isinstance(payload["iat"], (int, float)):
-        if payload["iat"] > now + 60:
-            raise EdgeAuthError(401, "Token issued in future (iat in future)")
+    for claim_name, claim_label in (("nbf", "nbf"), ("iat", "iat")):
+        if claim_name not in payload:
+            continue
+        claim_value = payload[claim_name]
+        if isinstance(claim_value, bool) or not isinstance(claim_value, (int, float)):
+            raise EdgeAuthError(401, f"Malformed {claim_label} claim")
+        if claim_value > now + 60:
+            detail = "not yet active" if claim_name == "nbf" else "issued in future"
+            raise EdgeAuthError(401, f"Token {detail} ({claim_label} in future)")
 
     # 9. Verify Identity against Allowlist
     email = payload.get("email", "").strip().lower()
@@ -583,7 +611,8 @@ class EdgeAuthMiddleware(BaseHTTPMiddleware):
             )
 
         # Determine client IP and proxy trust
-        client_ip = request.client.host if request.client else "127.0.0.1"
+        # Missing client metadata is not evidence of a trusted local caller.
+        client_ip = request.client.host if request.client else ""
         trusted_client = is_ip_trusted(client_ip, self.config.trusted_proxies)
         if not trusted_client:
             # Strip untrusted forwarding headers to prevent header spoofing
@@ -596,11 +625,29 @@ class EdgeAuthMiddleware(BaseHTTPMiddleware):
 
         path = request.url.path
 
-        # 2. Minimal Private Health Exemption
-        # /api/health allows unauthenticated access only from trusted loopback/container health checks
-        if path == "/api/health":
-            # Pass directly to endpoint; health response is minimal and leaks no secrets
-            return await call_next(request)
+        # 2. Internal health probe exemption
+        # Public /api/health remains behind Access. The internal endpoint is only
+        # reachable from the loopback-bound Caddy route or the web container's
+        # own loopback healthcheck; Caddy strips this marker on public routes.
+        internal_health_allowed = False
+        if path == "/api/health/internal":
+            loopback_client = False
+            try:
+                loopback_client = ipaddress.ip_address(client_ip).is_loopback
+            except ValueError:
+                pass
+            configured_probe_token = self.config.internal_health_check_token
+            caddy_local_probe = (
+                bool(configured_probe_token)
+                and hmac.compare_digest(
+                    request.headers.get("X-Internal-Health-Check", ""),
+                    configured_probe_token,
+                )
+                and trusted_client
+            )
+            internal_health_allowed = loopback_client or caddy_local_probe
+            if internal_health_allowed:
+                return await call_next(request)
 
         # 3. Viewer gate endpoint handles its own auth checks
         if path == "/api/auth/viewer-gate":
@@ -630,6 +677,12 @@ class EdgeAuthMiddleware(BaseHTTPMiddleware):
             except Exception as e:
                 logger.error(f"Unexpected error during edge auth: {e}")
                 return JSONResponse({"detail": "Authentication error"}, status_code=401)
+
+        if path == "/api/health/internal" and not internal_health_allowed:
+            return JSONResponse(
+                {"detail": "Internal health endpoint is not publicly reachable"},
+                status_code=404,
+            )
 
         # 5. Legacy /job-applier Route Handling
         # After authentication has been verified above, redirect legacy route to canonical root
@@ -678,38 +731,158 @@ class EdgeAuthMiddleware(BaseHTTPMiddleware):
         return response
 
 
-def filter_rfb_client_messages(data: bytes, allow_input: bool) -> bytes:
-    """
-    Parses RFB (VNC) client-to-server messages in the frame.
-    When allow_input is False (read-only viewer), strips all KeyEvent (4),
-    PointerEvent (5), and ClientCutText (6) messages while preserving benign messages
-    (SetPixelFormat, SetEncodings, FramebufferUpdateRequest, Handshake).
-    """
-    if allow_input or not data:
-        return data
+@dataclass
+class RfbReadOnlyState:
+    """Per-viewer protocol phase and authorization-bound fragment buffer.
 
-    if data.startswith(b"RFB "):
-        return data
+    Handshake bytes are buffered independently of takeover authorization.
+    Once initialized, an incomplete frame is tagged with the authorization
+    state present when its first byte arrived; changing that state discards
+    the partial frame rather than forwarding bytes across an epoch boundary.
+    """
 
-    if len(data) <= 4 and data[0] not in (4, 5, 6):
-        return data
+    phase: str = "version"
+    buffer: bytes = b""
+    buffer_allow_input: bool | None = None
+
+
+_MAX_RFB_BUFFER_SIZE = 1024 * 1024
+
+
+def filter_rfb_client_messages(
+    data: bytes, allow_input: bool, state: RfbReadOnlyState | None = None
+) -> bytes:
+    """
+    Filter client-to-server RFB messages without breaking initial negotiation.
+
+    WebSocket message boundaries do not necessarily match RFB message
+    boundaries. A per-connection buffer therefore retains incomplete version,
+    handshake, and post-initialization messages until they can be classified.
+    Read-only viewers receive safe framebuffer requests and configuration
+    messages, while input messages are dropped only after their full frame is
+    available.
+    """
+    if state is None:
+        if not data:
+            return data
+        # Preserve the standalone helper's historical behavior for callers
+        # that do not have a connection-specific protocol phase.
+        if data.startswith(b"RFB "):
+            return data
+        return _filter_initialized_rfb_messages(data, allow_input)
+
+    if not data or state.phase == "rejected":
+        return b""
+
+    # Handshake buffering is independent of authorization. Post-init frame
+    # fragments, however, must never cross a change in input authorization.
+    if (
+        state.phase == "initialized"
+        and state.buffer
+        and state.buffer_allow_input is not None
+        and state.buffer_allow_input != allow_input
+    ):
+        # The current payload is a continuation of a frame begun under the
+        # previous authorization epoch. Drop both the retained prefix and this
+        # continuation; treating the continuation as a new frame would leak
+        # bytes across the authorization boundary.
+        state.buffer = b""
+        state.buffer_allow_input = None
+        return b""
+
+    state.buffer += data
+    if len(state.buffer) > _MAX_RFB_BUFFER_SIZE:
+        state.buffer = b""
+        state.phase = "rejected"
+        return b""
+
+    output = bytearray()
+    while state.phase != "initialized":
+        if state.phase == "version":
+            if len(state.buffer) < 12:
+                if not b"RFB ".startswith(
+                    state.buffer[:4]
+                ) and not state.buffer.startswith(b"RFB "):
+                    state.buffer = b""
+                    state.phase = "rejected"
+                return bytes(output)
+            version = state.buffer[:12]
+            if not version.startswith(b"RFB ") or not version.endswith(b"\n"):
+                state.buffer = b""
+                state.phase = "rejected"
+                return bytes(output)
+            output.extend(version)
+            state.buffer = state.buffer[12:]
+            state.phase = "security_selection"
+        elif state.phase == "security_selection":
+            if len(state.buffer) < 1:
+                return bytes(output)
+            selection = state.buffer[:1]
+            state.buffer = state.buffer[1:]
+            if selection[0] == 0:
+                state.phase = "rejected"
+                state.buffer = b""
+                return bytes(output)
+            output.extend(selection)
+            # Classic VNC authentication (security type 2) adds a 16-byte
+            # challenge response before the one-byte ClientInit message.
+            state.phase = "vnc_auth_response" if selection[0] == 2 else "client_init"
+        elif state.phase == "vnc_auth_response":
+            if len(state.buffer) < 16:
+                return bytes(output)
+            output.extend(state.buffer[:16])
+            state.buffer = state.buffer[16:]
+            state.phase = "client_init"
+        elif state.phase == "client_init":
+            if len(state.buffer) < 1:
+                return bytes(output)
+            client_init = state.buffer[:1]
+            state.buffer = state.buffer[1:]
+            if client_init[0] not in (0, 1):
+                state.phase = "rejected"
+                state.buffer = b""
+                return bytes(output)
+            output.extend(client_init)
+            state.phase = "initialized"
+        else:
+            state.phase = "rejected"
+            state.buffer = b""
+            return bytes(output)
+
+    if state.buffer and state.buffer_allow_input is None:
+        state.buffer_allow_input = allow_input
+
+    output.extend(
+        _filter_initialized_rfb_messages(
+            state.buffer, allow_input=allow_input, state=state
+        )
+    )
+    return bytes(output)
+
+
+def _filter_initialized_rfb_messages(
+    data: bytes, allow_input: bool, state: RfbReadOnlyState | None = None
+) -> bytes:
+    """Filter complete post-handshake frames, retaining fragmented input."""
+    if not data:
+        return b""
+
+    if state is None:
+        buffer = data
+    else:
+        buffer = data
 
     offset = 0
     clean_chunks: list[bytes] = []
-    data_len = len(data)
-
-    while offset < data_len:
-        msg_type = data[offset]
-        msg_len = 0
-
+    while offset < len(buffer):
+        msg_type = buffer[offset]
         if msg_type == 0:  # SetPixelFormat
             msg_len = 20
         elif msg_type == 2:  # SetEncodings
-            if offset + 4 <= data_len:
-                num_enc = struct.unpack(">H", data[offset + 2 : offset + 4])[0]
-                msg_len = 4 + 4 * num_enc
-            else:
-                msg_len = data_len - offset
+            if len(buffer) - offset < 4:
+                break
+            num_enc = struct.unpack(">H", buffer[offset + 2 : offset + 4])[0]
+            msg_len = 4 + 4 * num_enc
         elif msg_type == 3:  # FramebufferUpdateRequest
             msg_len = 10
         elif msg_type == 4:  # KeyEvent
@@ -717,26 +890,30 @@ def filter_rfb_client_messages(data: bytes, allow_input: bool) -> bytes:
         elif msg_type == 5:  # PointerEvent
             msg_len = 6
         elif msg_type == 6:  # ClientCutText
-            if offset + 8 <= data_len:
-                text_len = struct.unpack(">I", data[offset + 4 : offset + 8])[0]
-                msg_len = 8 + text_len
-            else:
-                msg_len = data_len - offset
+            if len(buffer) - offset < 8:
+                break
+            text_len = struct.unpack(">I", buffer[offset + 4 : offset + 8])[0]
+            msg_len = 8 + text_len
         else:
-            # Unknown message type in read-only mode: fail closed by dropping remainder
+            # Unknown message types are never buffered or forwarded. Return
+            # immediately for stateful connections so the rejected bytes are
+            # not restored by the fragmented-buffer assignment below.
+            if state is not None:
+                state.buffer = b""
+                state.buffer_allow_input = None
+                return b"".join(clean_chunks)
             break
 
-        if msg_len <= 0:
+        if len(buffer) - offset < msg_len:
             break
-
-        if offset + msg_len > data_len:
-            msg_len = data_len - offset
-
-        if msg_type not in (4, 5, 6):
-            clean_chunks.append(data[offset : offset + msg_len])
-
+        if allow_input or msg_type not in (4, 5, 6):
+            clean_chunks.append(buffer[offset : offset + msg_len])
         offset += msg_len
 
+    if state is not None:
+        state.buffer = buffer[offset:]
+        if not state.buffer:
+            state.buffer_allow_input = None
     return b"".join(clean_chunks)
 
 
@@ -745,6 +922,13 @@ def parse_viewer_subprotocols(header_value: str) -> tuple[str, ...]:
     return tuple(
         token.strip().lower() for token in header_value.split(",") if token.strip()
     )
+
+
+def viewer_input_authorized(
+    viewer_owner: str, takeover_active: bool, takeover_owner: str | None
+) -> bool:
+    """Authorize input only for the identity holding the current takeover lease."""
+    return takeover_active and bool(takeover_owner) and takeover_owner == viewer_owner
 
 
 async def handle_viewer_websocket(
@@ -780,8 +964,10 @@ async def handle_viewer_websocket(
         )
         return
 
-    # 2. Authenticate WebSocket Upgrade Request
+    # 2. Authenticate WebSocket Upgrade Request. The verified identity is also
+    # the only owner value accepted for input authorization in Access mode.
     token_exp: float | None = None
+    viewer_owner = "operator"
     if config.cf_access_enabled:
         token = websocket.headers.get("Cf-Access-Jwt-Assertion")
         if not token:
@@ -799,6 +985,7 @@ async def handle_viewer_websocket(
         try:
             payload = verify_cf_access_jwt(token, config)
             token_exp = payload["exp"]
+            viewer_owner = str(payload["email"]).strip().lower()
         except EdgeAuthError as e:
             logger.warning(f"Viewer WebSocket auth failed: {e.message}")
             await websocket.close(code=1008, reason=e.message)
@@ -844,20 +1031,22 @@ async def handle_viewer_websocket(
     )
 
     # 5. Connect to Upstream runtime:6080 and Pump Frames
+    rfb_state = RfbReadOnlyState()
     try:
         async with websockets.connect(
             upstream_url,
-            subprotocols=["binary"],  # type: ignore[list-item]
+            subprotocols=cast(Any, ["binary"]),  # type: ignore[arg-type]
             open_timeout=5.0,
             ping_interval=20,
             ping_timeout=20,
         ) as upstream_ws:
 
             async def client_to_upstream() -> None:
-                from job_applier.automation.queue import is_takeover_active
+                from job_applier.automation.queue import (
+                    TAKEOVER_TRANSPORT_LOCK,
+                    is_takeover_active,
+                )
 
-                last_check = 0.0
-                cached_active = False
                 try:
                     while True:
                         msg = await websocket.receive()
@@ -870,16 +1059,24 @@ async def handle_viewer_websocket(
                         else:
                             continue
 
-                        now_mono = time.monotonic()
-                        if now_mono - last_check >= 0.25:
-                            cached_active, _, _ = is_takeover_active()
-                            last_check = now_mono
-
-                        filtered_data = filter_rfb_client_messages(
-                            data, allow_input=cached_active
-                        )
-                        if filtered_data:
-                            await upstream_ws.send(filtered_data)
+                        # Hold the same process-wide fence used by takeover
+                        # claim/release through the upstream send boundary. Poll
+                        # non-blockingly so cancellation cannot strand a worker
+                        # thread that acquired the lock after its awaiter stopped.
+                        while not TAKEOVER_TRANSPORT_LOCK.acquire(blocking=False):
+                            await asyncio.sleep(0.01)
+                        try:
+                            takeover_active, takeover_owner, _ = is_takeover_active()
+                            allow_input = viewer_input_authorized(
+                                viewer_owner, takeover_active, takeover_owner
+                            )
+                            filtered_data = filter_rfb_client_messages(
+                                data, allow_input=allow_input, state=rfb_state
+                            )
+                            if filtered_data:
+                                await upstream_ws.send(filtered_data)
+                        finally:
+                            TAKEOVER_TRANSPORT_LOCK.release()
                 except (WebSocketDisconnect, websockets.ConnectionClosed):
                     pass
 

@@ -913,7 +913,7 @@ def test_clear_automation_state_endpoint(client):
 
 def test_job_cancel_skip_resolve_endpoints(client):
     from job_applier.automation.queue import enqueue_job
-    from job_applier.db import upsert_application
+    from job_applier.db import get_connection, upsert_application
 
     upsert_application(
         app_id="web-cancel-app",
@@ -948,6 +948,13 @@ def test_job_cancel_skip_resolve_endpoints(client):
         job_url="https://res.example",
     )
     job_res = enqueue_job("web-res-app")
+    conn = get_connection()
+    with conn:
+        conn.execute(
+            "UPDATE automation_jobs SET state = 'unknown_question' WHERE id = ?;",
+            (job_res.id,),
+        )
+    conn.close()
     res_resolve = client.post(
         f"/api/automation/jobs/{job_res.id}/resolve",
         json={"resolution_type": "continue"},

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hmac
+import ipaddress
 import json
 import os
 import re
@@ -32,14 +34,16 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 from starlette.types import Receive, Scope, Send
 
+from job_applier.cli.vnc_auth import load_vnc_password
 from job_applier.web.edge_auth import (
     EdgeAuthConfig,
     EdgeAuthError,
     EdgeAuthMiddleware,
     handle_viewer_websocket,
+    is_ip_trusted,
     validate_edge_auth_startup,
     verify_cf_access_jwt,
 )
@@ -394,9 +398,8 @@ def get_safe_app_folder(app_id: str) -> Path:
     return folder
 
 
-@app.get("/api/health", include_in_schema=False)
-def get_health() -> JSONResponse:
-    """Returns a lightweight, non-sensitive liveness and health response for containers."""
+def _health_response() -> JSONResponse:
+    """Build the lightweight, non-sensitive liveness response."""
     from job_applier.db import get_connection
     from job_applier.ops.disk_guard import check_disk_pressure
 
@@ -430,6 +433,54 @@ def get_health() -> JSONResponse:
     return JSONResponse(
         status_code=200,
         content={"status": "ok", "service": "job-applier"},
+    )
+
+
+@app.get("/api/health", include_in_schema=False)
+def get_health() -> JSONResponse:
+    """Public health requests are protected by the edge authentication middleware."""
+    return _health_response()
+
+
+@app.get("/api/health/internal", include_in_schema=False)
+def get_internal_health() -> JSONResponse:
+    """Private container/Caddy health probe, admitted only by edge middleware."""
+    return _health_response()
+
+
+@app.get("/api/automation/takeover/vnc-credentials", include_in_schema=False)
+def get_vnc_credentials(request: Request) -> JSONResponse:
+    """Return the ephemeral VNC credential only to an authenticated same-origin viewer."""
+    if edge_config.cf_access_enabled and not getattr(request.state, "user", None):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if not edge_config.cf_access_enabled:
+        client_ip = request.client.host if request.client else ""
+        try:
+            is_loopback = ipaddress.ip_address(client_ip).is_loopback
+        except ValueError:
+            is_loopback = False
+        local_gateway_token = request.headers.get("X-Local-Gateway-Viewer", "")
+        trusted_gateway = bool(
+            edge_config.local_gateway_viewer_token
+            and hmac.compare_digest(
+                local_gateway_token, edge_config.local_gateway_viewer_token
+            )
+            and is_ip_trusted(client_ip, edge_config.trusted_proxies)
+            and request.url.hostname in {"localhost", "127.0.0.1"}
+        )
+        if not is_loopback and not trusted_gateway:
+            raise HTTPException(status_code=404, detail="VNC credentials unavailable")
+    try:
+        password = load_vnc_password()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return JSONResponse(
+        {"password": password},
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
     )
 
 
@@ -1397,7 +1448,12 @@ class AckAllNotificationsRequest(BaseModel):
 
 class TakeoverClaimRequest(BaseModel):
     owner: str = "operator"
-    lease_seconds: int = 300
+    lease_seconds: StrictInt = Field(
+        default=300,
+        ge=1,
+        le=300,
+        description="Takeover lease duration in seconds (1-300).",
+    )
 
 
 class TakeoverReleaseRequest(BaseModel):
@@ -1512,32 +1568,58 @@ def dispatch_notifications_endpoint() -> dict[str, Any]:
 
 
 @app.get("/api/automation/takeover/status")
-def takeover_status_endpoint() -> dict[str, Any]:
-    """Returns manual takeover status, active lease owner, expiration, and read-only enforcement status."""
+def takeover_status_endpoint(request: Request) -> dict[str, Any]:
+    """Returns takeover status and whether this authenticated viewer owns the lease."""
     from job_applier.automation.queue import get_runtime_control, is_takeover_active
 
     is_active, owner, expires_at = is_takeover_active()
     ctrl = get_runtime_control()
+    if edge_config.cf_access_enabled:
+        current_owner = _takeover_request_owner(request, "")
+        is_current_owner = bool(is_active and owner == current_owner)
+    else:
+        # Non-Access/local mode has one trusted operator identity.
+        is_current_owner = bool(is_active)
     return {
         "status": "success",
         "is_takeover_active": is_active,
         "owner": owner if is_active else None,
         "expires_at": expires_at if is_active else None,
+        "is_current_owner": is_current_owner,
         "is_paused": ctrl.get("is_paused", False),
         "is_stopped": ctrl.get("is_stopped", False),
-        "read_only": not is_active,  # Server-enforced read-only default
+        "read_only": not is_current_owner,  # Server-enforced read-only default
     }
 
 
+def _takeover_request_owner(request: Request, requested_owner: str) -> str:
+    """Resolve takeover ownership from the verified Access identity in service mode."""
+    if edge_config.cf_access_enabled:
+        state = getattr(request, "state", None)
+        user = getattr(state, "user", None)
+        identity = user.get("email") if isinstance(user, dict) else None
+        if not isinstance(identity, str) or not identity.strip():
+            raise HTTPException(
+                status_code=401, detail="Authenticated viewer identity missing"
+            )
+        return identity.strip().lower()
+    return requested_owner.strip() or "operator"
+
+
 @app.post("/api/automation/takeover/claim")
-def claim_takeover_endpoint(body: TakeoverClaimRequest) -> dict[str, Any]:
+def claim_takeover_endpoint(
+    body: TakeoverClaimRequest, request: Request
+) -> dict[str, Any]:
     """
     Claims exclusive operator takeover lease.
     Atomically pauses the worker and enables write/input transport.
     """
     from job_applier.automation.queue import claim_manual_takeover
 
-    result = claim_manual_takeover(owner=body.owner, lease_seconds=body.lease_seconds)
+    result = claim_manual_takeover(
+        owner=_takeover_request_owner(request, body.owner),
+        lease_seconds=body.lease_seconds,
+    )
     if result.get("status") == "conflict":
         raise HTTPException(
             status_code=409,
@@ -1549,68 +1631,134 @@ def claim_takeover_endpoint(body: TakeoverClaimRequest) -> dict[str, Any]:
 
 
 @app.post("/api/automation/takeover/release")
-def release_takeover_endpoint(body: TakeoverReleaseRequest) -> dict[str, Any]:
+def release_takeover_endpoint(
+    body: TakeoverReleaseRequest, request: Request
+) -> dict[str, Any]:
     """
     Releases operator takeover lease.
     Worker remains paused awaiting safe resume revalidation.
     """
     from job_applier.automation.queue import release_manual_takeover
 
-    result = release_manual_takeover(owner=body.owner, force=body.force)
+    if body.force and edge_config.cf_access_enabled:
+        raise HTTPException(
+            status_code=403,
+            detail="Forced takeover release is not available to Access-authenticated viewers.",
+        )
+
+    result = release_manual_takeover(
+        owner=_takeover_request_owner(request, body.owner), force=body.force
+    )
     if result.get("status") == "error":
         raise HTTPException(status_code=400, detail=result.get("message"))
     return result
 
 
+def _require_current_takeover_owner(request: Request) -> str:
+    """Require the verified Access identity to own the active takeover lease."""
+    owner = _takeover_request_owner(request, "")
+    from job_applier.automation.queue import is_takeover_active
+
+    active, current_owner, _ = is_takeover_active()
+    if edge_config.cf_access_enabled and (not active or current_owner != owner):
+        raise HTTPException(
+            status_code=403,
+            detail="Only the current takeover owner may perform this action.",
+        )
+    return owner
+
+
 @app.post("/api/automation/takeover/reopen-auth")
-def reopen_auth_session_endpoint(job_id: str | None = None) -> dict[str, Any]:
-    """Reopens an auth-paused job in a fresh worker-controlled browser session."""
+def reopen_auth_session_endpoint(
+    request: Request, job_id: str | None = None
+) -> dict[str, Any]:
+    """Reopens an auth-paused job only for the current takeover owner."""
     from job_applier.automation.queue import requeue_auth_required_job
 
-    result = requeue_auth_required_job(job_id=job_id)
+    owner = _require_current_takeover_owner(request)
+    expected_owner = owner if edge_config.cf_access_enabled else None
+    result = requeue_auth_required_job(job_id=job_id, expected_owner=expected_owner)
     if result.get("status") == "rejected":
-        raise HTTPException(status_code=400, detail=result.get("message"))
+        status_code = 403 if result.get("reason") == "takeover_owner_required" else 400
+        raise HTTPException(status_code=status_code, detail=result.get("message"))
     return result
 
 
 @app.post("/api/automation/takeover/resume")
-def resume_from_takeover_endpoint(job_id: str | None = None) -> dict[str, Any]:
+def resume_from_takeover_endpoint(
+    request: Request, job_id: str | None = None
+) -> dict[str, Any]:
     """
     Performs safe resume revalidation (domain check, completion check, challenge check)
-    before clearing takeover and unpausing automation.
+    before clearing takeover and unpausing automation for the current owner.
     """
-    from job_applier.automation.browser_automator import get_active_automator
     from job_applier.automation.safe_resume import safe_resume_revalidate
+    from job_applier.automation.queue import get_runtime_browser_state
 
-    automator = get_active_automator()
-    result = safe_resume_revalidate(job_id=job_id, automator=automator)
+    owner = _require_current_takeover_owner(request)
+    expected_owner = owner if edge_config.cf_access_enabled else None
+    browser_state = get_runtime_browser_state()
+    current_url = (
+        browser_state.get("browser_url", "")
+        if browser_state.get("browser_active")
+        and not browser_state.get("browser_is_closed", True)
+        else ""
+    )
+    # The web request thread must not inspect a Playwright page. Runtime state
+    # is the cross-process snapshot; the owning worker remains responsible for
+    # all browser operations.
+    result = safe_resume_revalidate(
+        job_id=job_id,
+        automator=None,
+        current_url=current_url,
+        expected_owner=expected_owner,
+    )
     if result.get("status") == "rejected":
-        raise HTTPException(status_code=400, detail=result.get("message"))
+        status_code = 403 if result.get("reason") == "takeover_owner_required" else 400
+        raise HTTPException(status_code=status_code, detail=result.get("message"))
     return result
 
 
 @app.post("/api/automation/pause")
-def pause_automation_endpoint() -> dict[str, Any]:
-    """Sets global automation pause."""
+def pause_automation_endpoint(request: Request) -> dict[str, Any]:
+    """Sets global automation pause for the current takeover owner."""
     from job_applier.automation.queue import set_runtime_pause
 
-    set_runtime_pause(True)
+    owner = _require_current_takeover_owner(request)
+    expected_owner = owner if edge_config.cf_access_enabled else None
+    if not set_runtime_pause(True, expected_owner=expected_owner):
+        raise HTTPException(
+            status_code=403,
+            detail="Only the current takeover owner may pause automation.",
+        )
     return {"status": "success", "is_paused": True, "message": "Automation paused."}
 
 
 @app.post("/api/automation/resume")
-def resume_automation_endpoint() -> dict[str, Any]:
+def resume_automation_endpoint(request: Request = None) -> dict[str, Any]:  # type: ignore[assignment]
     """Resumes global automation after safe resume revalidation."""
-    from job_applier.automation.browser_automator import get_active_automator
     from job_applier.automation.safe_resume import safe_resume_revalidate
-    from job_applier.ops.emergency_stop import clear_emergency_stop
+    from job_applier.automation.queue import get_runtime_browser_state
 
-    automator = get_active_automator()
-    result = safe_resume_revalidate(automator=automator)
+    owner = (
+        _require_current_takeover_owner(request) if request is not None else "operator"
+    )
+    expected_owner = owner if edge_config.cf_access_enabled else None
+    browser_state = get_runtime_browser_state()
+    current_url = (
+        browser_state.get("browser_url", "")
+        if browser_state.get("browser_active")
+        and not browser_state.get("browser_is_closed", True)
+        else ""
+    )
+    # Do not access Playwright from the web request thread in embedded mode.
+    result = safe_resume_revalidate(
+        automator=None, current_url=current_url, expected_owner=expected_owner
+    )
     if result.get("status") == "rejected":
-        raise HTTPException(status_code=400, detail=result.get("message"))
+        status_code = 403 if result.get("reason") == "takeover_owner_required" else 400
+        raise HTTPException(status_code=status_code, detail=result.get("message"))
 
-    clear_emergency_stop(reason="Operator resumed automation via dashboard")
     return {
         "status": "success",
         "is_paused": False,
@@ -1621,11 +1769,18 @@ def resume_automation_endpoint() -> dict[str, Any]:
 
 
 @app.post("/api/automation/stop")
-def stop_automation_endpoint() -> dict[str, Any]:
+def stop_automation_endpoint(request: Request) -> dict[str, Any]:
     """Engages emergency stop for automation workers, revoking leases and emitting alert."""
     from job_applier.ops.emergency_stop import emergency_stop
 
-    res = emergency_stop(reason="Emergency stop triggered from web dashboard")
+    owner = _require_current_takeover_owner(request)
+    expected_owner = owner if edge_config.cf_access_enabled else None
+    res = emergency_stop(
+        reason="Emergency stop triggered from web dashboard",
+        expected_owner=expected_owner,
+    )
+    if res.get("status") == "rejected":
+        raise HTTPException(status_code=403, detail=res.get("message"))
     return {
         "status": "success",
         "is_stopped": True,
@@ -1635,12 +1790,13 @@ def stop_automation_endpoint() -> dict[str, Any]:
 
 
 @app.post("/api/automation/clear-state")
-def clear_automation_state_endpoint() -> dict[str, Any]:
-    """Fully clears automation state, resets stuck leases/jobs back to ready, and closes orphaned browser sessions."""
+def clear_automation_state_endpoint(request: Request) -> dict[str, Any]:
+    """Fully clears automation state for the current takeover owner."""
     from job_applier.automation.queue import clear_automation_state
 
-    res = clear_automation_state()
-    return res
+    owner = _require_current_takeover_owner(request)
+    expected_owner = owner if edge_config.cf_access_enabled else None
+    return clear_automation_state(expected_owner=expected_owner)
 
 
 @app.post("/api/automation/jobs/{job_id}/cancel")
@@ -1676,10 +1832,14 @@ def skip_job_endpoint(job_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/automation/jobs/{job_id}/resolve")
-def resolve_job_endpoint(job_id: str, body: ResolveJobRequest) -> dict[str, Any]:
+def resolve_job_endpoint(
+    job_id: str, body: ResolveJobRequest, request: Request
+) -> dict[str, Any]:
     """Resolves an exception (e.g. provides approved screening answer or confirms manual login) and resumes job."""
     from job_applier.automation.queue import resolve_job
 
+    owner = _require_current_takeover_owner(request)
+    expected_owner = owner if edge_config.cf_access_enabled else None
     try:
         success = resolve_job(
             job_id=job_id,
@@ -1688,9 +1848,11 @@ def resolve_job_endpoint(job_id: str, body: ResolveJobRequest) -> dict[str, Any]
             question_key=body.question_key,
             approved_scope=body.approved_scope,
             force=body.force,
+            expected_owner=expected_owner,
         )
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        status_code = 403 if str(e) == "takeover_owner_required" else 400
+        raise HTTPException(status_code=status_code, detail=str(e))
 
     if not success:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
@@ -1982,28 +2144,49 @@ async def viewer_websocket_route(websocket: WebSocket) -> None:
 
 
 @app.post("/api/automation/submit-code")
-def submit_verification_code(body: SubmitCodeRequest) -> dict[str, Any]:
-    """Submits a 2FA or email verification code to the active browser automation session."""
+def submit_verification_code(
+    body: SubmitCodeRequest, request: Request
+) -> dict[str, Any]:
+    """Submits a verification code only for the current takeover owner."""
     from job_applier.automation.browser_automator import get_active_automator
     from job_applier.automation.queue import (
+        TAKEOVER_TRANSPORT_LOCK,
         get_runtime_control,
         set_pending_verification_code,
     )
 
+    owner = _require_current_takeover_owner(request)
+    expected_owner = owner if edge_config.cf_access_enabled else None
     automator = get_active_automator()
-    ctrl = get_runtime_control()
-    is_waiting = (
-        automator is not None and getattr(automator, "waiting_for_code", False)
-    ) or bool(ctrl.get("is_waiting_for_code"))
-    if not is_waiting and not automator:
-        raise HTTPException(
-            status_code=400,
-            detail="No active browser session is currently waiting for a verification code.",
-        )
+    with TAKEOVER_TRANSPORT_LOCK:
+        # The endpoint check above is only an early rejection. Revalidate while
+        # holding the same fence as the browser and durable-code mutations so a
+        # replacement claimant cannot receive a stale owner's code.
+        if expected_owner is not None:
+            from job_applier.automation.safe_resume import _takeover_owner_matches
 
-    if automator and hasattr(automator, "supply_verification_code"):
-        automator.supply_verification_code(body.code)
-    set_pending_verification_code(body.code)
+            if not _takeover_owner_matches(expected_owner):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Only the current takeover owner may submit a verification code.",
+                )
+        ctrl = get_runtime_control()
+        is_waiting = (
+            automator is not None and getattr(automator, "waiting_for_code", False)
+        ) or bool(ctrl.get("is_waiting_for_code"))
+        if not is_waiting and not automator:
+            raise HTTPException(
+                status_code=400,
+                detail="No active browser session is currently waiting for a verification code.",
+            )
+
+        if automator and hasattr(automator, "supply_verification_code"):
+            automator.supply_verification_code(body.code)
+        if not set_pending_verification_code(body.code, expected_owner=expected_owner):
+            raise HTTPException(
+                status_code=403,
+                detail="Only the current takeover owner may submit a verification code.",
+            )
     return {
         "status": "success",
         "message": f"Verification code '{body.code}' submitted to browser.",

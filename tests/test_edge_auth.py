@@ -12,7 +12,7 @@ import struct
 import base64
 import json
 import time
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -27,7 +27,9 @@ from job_applier.web.edge_auth import (
     EdgeAuthError,
     EdgeAuthMiddleware,
     JwksCache,
+    handle_viewer_websocket,
     normalize_team_domain,
+    viewer_input_authorized,
     validate_edge_auth_startup,
     verify_cf_access_jwt,
 )
@@ -194,6 +196,24 @@ class TestStrictJwtValidation:
 
         assert exc_info.value.status_code == 401
         assert "signature" in exc_info.value.message.lower()
+
+    def test_rejects_malformed_clock_claims(self, rsa_key_pair):
+        private_key, public_key = rsa_key_pair
+        jwks = JwksCache()
+        jwks.inject_key("test-key-1", public_key)
+        config = EdgeAuthConfig(
+            cf_access_enabled=True,
+            cf_access_aud="test-aud-12345",
+            cf_access_team_domain="aslan",
+            cf_access_allowed_identities={"operator@aslan.net"},
+        )
+        for claim in ("nbf", "iat"):
+            token = create_signed_jwt(
+                private_key,
+                extra_claims={claim: "not-a-number"},
+            )
+            with pytest.raises(EdgeAuthError, match=f"Malformed {claim}"):
+                verify_cf_access_jwt(token, config, jwks)
 
     def test_rejects_expired_token(self, rsa_key_pair):
         private_key, public_key = rsa_key_pair
@@ -524,6 +544,45 @@ class TestBoundedJwksCache:
         # Must be bounded to max_keys (3)
         assert len(cache._keys) <= 3
 
+    def test_expired_cached_keys_are_refreshed(self, rsa_key_pair):
+        _, public_key = rsa_key_pair
+        cache = JwksCache()
+        jwk_data = {
+            "keys": [
+                {
+                    "kty": "RSA",
+                    "alg": "RS256",
+                    "kid": "rotating",
+                    "n": int_to_b64url(public_key.public_numbers().n),
+                    "e": int_to_b64url(public_key.public_numbers().e),
+                }
+            ]
+        }
+        with patch("urllib.request.urlopen") as mock_url:
+            mock_url.return_value.__enter__.return_value.read.return_value = json.dumps(
+                jwk_data
+            ).encode("utf-8")
+            clock = {"calls": 0}
+
+            def fake_time() -> float:
+                clock["calls"] += 1
+                return 100.0 if clock["calls"] <= 3 else 200.0
+
+            with patch("job_applier.web.edge_auth.time.time", side_effect=fake_time):
+                assert cache.get_key(
+                    "rotating",
+                    "https://mock.certs",
+                    rate_limit_seconds=0,
+                    cache_ttl_seconds=10,
+                )
+                assert cache.get_key(
+                    "rotating",
+                    "https://mock.certs",
+                    rate_limit_seconds=0,
+                    cache_ttl_seconds=10,
+                )
+        assert mock_url.call_count == 2
+
     def test_rate_limiting(self, rsa_key_pair):
         cache = JwksCache()
         cache._last_fetched = time.time()  # Just fetched!
@@ -573,6 +632,10 @@ class TestEdgeAuthMiddlewareIntegration:
         def health():
             return {"status": "ok", "service": "job-applier"}
 
+        @test_app.get("/api/health/internal")
+        def internal_health():
+            return {"status": "ok", "service": "job-applier"}
+
         @test_app.get("/api/applications")
         def get_apps():
             return {"items": []}
@@ -581,7 +644,7 @@ class TestEdgeAuthMiddlewareIntegration:
         def create_app():
             return {"status": "created"}
 
-        client = TestClient(test_app)
+        client = TestClient(test_app, client=("127.0.0.1", 50000))
         return client, private_key, jwks
 
     def test_unauthenticated_request_rejected(self, auth_client):
@@ -701,12 +764,156 @@ class TestEdgeAuthMiddlewareIntegration:
             assert res.status_code == 200
             assert res.json() == {"status": "created"}
 
-    def test_minimal_private_health_unauthenticated(self, auth_client):
+    def test_vnc_credentials_are_access_protected_and_uncacheable(self, rsa_key_pair):
+        private_key, public_key = rsa_key_pair
+        jwks = JwksCache()
+        jwks.inject_key("test-key-1", public_key)
+        client = TestClient(app)
+        with (
+            patch("job_applier.web.app.edge_config.cf_access_enabled", True),
+            patch("job_applier.web.app.edge_config.cf_access_aud", "test-aud-12345"),
+            patch("job_applier.web.app.edge_config.cf_access_team_domain", "aslan"),
+            patch(
+                "job_applier.web.app.edge_config.cf_access_allowed_identities",
+                {"operator@aslan.net"},
+            ),
+            patch("job_applier.web.edge_auth.get_jwks_cache", return_value=jwks),
+            patch("job_applier.web.app.load_vnc_password", return_value="testpass"),
+        ):
+            assert (
+                client.get("/api/automation/takeover/vnc-credentials").status_code
+                == 401
+            )
+            token = create_signed_jwt(
+                private_key, kid="test-key-1", email="operator@aslan.net"
+            )
+            response = client.get(
+                "/api/automation/takeover/vnc-credentials",
+                headers={"Cf-Access-Jwt-Assertion": token},
+            )
+        assert response.status_code == 200
+        assert response.json() == {"password": "testpass"}
+        assert "no-store" in response.headers["cache-control"]
+        assert response.headers["pragma"] == "no-cache"
+
+    def test_local_gateway_vnc_credentials_use_proxy_token(self):
+        # Caddy forwards from the trusted Docker bridge, not loopback.
+        client = TestClient(app, client=("172.20.0.2", 50000))
+        with (
+            patch("job_applier.web.app.edge_config.cf_access_enabled", False),
+            patch(
+                "job_applier.web.app.edge_config.local_gateway_viewer_token",
+                "local-gateway-secret",
+            ),
+            patch("job_applier.web.app.load_vnc_password", return_value="testpass"),
+        ):
+            response = client.get(
+                "/api/automation/takeover/vnc-credentials",
+                headers={
+                    "Host": "localhost:8089",
+                    "X-Local-Gateway-Viewer": "local-gateway-secret",
+                },
+            )
+        assert response.status_code == 200
+        assert response.json() == {"password": "testpass"}
+        assert "no-store" in response.headers["cache-control"]
+
+    def test_public_health_requires_access(self, auth_client):
         client, _, _ = auth_client
-        # Health endpoint from loopback requires no JWT
         res = client.get("/api/health")
+        assert res.status_code == 401
+        assert "Missing Cloudflare Access assertion" in res.json()["detail"]
+
+    def test_internal_health_is_loopback_only(self, auth_client):
+        client, _, _ = auth_client
+        res = client.get("/api/health/internal")
         assert res.status_code == 200
         assert res.json() == {"status": "ok", "service": "job-applier"}
+
+    def test_internal_health_marker_requires_secret_and_trusted_source(self):
+        config = EdgeAuthConfig(
+            cf_access_enabled=False,
+            allowed_hosts={"testserver"},
+            internal_health_check_token="gateway-health-secret",
+        )
+        test_app = FastAPI()
+        test_app.add_middleware(EdgeAuthMiddleware, config=config)
+
+        @test_app.get("/api/health/internal")
+        def internal_health():
+            return {"status": "ok"}
+
+        client = TestClient(test_app, client=("10.0.0.8", 50000))
+        assert (
+            client.get(
+                "/api/health/internal",
+                headers={"X-Internal-Health-Check": "caddy-local"},
+            ).status_code
+            == 404
+        )
+        assert (
+            client.get(
+                "/api/health/internal",
+                headers={
+                    "X-Internal-Health-Check": "gateway-health-secret",
+                },
+            ).status_code
+            == 200
+        )
+
+    def test_internal_health_missing_client_metadata_is_untrusted(self):
+        config = EdgeAuthConfig(
+            cf_access_enabled=False,
+            allowed_hosts={"testserver"},
+            internal_health_check_token="gateway-health-secret",
+        )
+        test_app = FastAPI()
+        test_app.add_middleware(EdgeAuthMiddleware, config=config)
+
+        @test_app.get("/api/health/internal")
+        def internal_health():
+            return {"status": "ok"}
+
+        client = TestClient(test_app, client=None)  # type: ignore[arg-type]
+        response = client.get(
+            "/api/health/internal",
+            headers={"X-Internal-Health-Check": "gateway-health-secret"},
+        )
+        assert response.status_code == 404
+
+    def test_public_internal_health_requires_access_before_private_404(
+        self, rsa_key_pair
+    ):
+        private_key, public_key = rsa_key_pair
+        jwks = JwksCache()
+        jwks.inject_key("test-key-1", public_key)
+        config = EdgeAuthConfig(
+            cf_access_enabled=True,
+            cf_access_aud="test-aud-12345",
+            cf_access_team_domain="aslan",
+            cf_access_allowed_identities={"operator@aslan.net"},
+            public_origin="https://jobs.aslan.net",
+            allowed_hosts={"jobs.aslan.net", "testserver"},
+        )
+        test_app = FastAPI()
+        test_app.add_middleware(EdgeAuthMiddleware, config=config)
+
+        @test_app.get("/api/health/internal")
+        def internal_health():
+            return {"status": "ok"}
+
+        client = TestClient(test_app, client=("10.0.0.8", 50000))
+        assert client.get("/api/health/internal").status_code == 401
+
+        with patch("job_applier.web.edge_auth.get_jwks_cache", return_value=jwks):
+            token = create_signed_jwt(
+                private_key, kid="test-key-1", email="operator@aslan.net"
+            )
+            response = client.get(
+                "/api/health/internal",
+                headers={"Cf-Access-Jwt-Assertion": token},
+            )
+        assert response.status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -966,6 +1173,160 @@ def test_viewer_websocket_rejects_query_token_unit():
     mock_ws.accept.assert_not_called()
 
 
+def test_rfb_authenticated_handshake_forwards_auth_response_before_client_init():
+    from job_applier.web.edge_auth import RfbReadOnlyState, filter_rfb_client_messages
+
+    state = RfbReadOnlyState()
+    version = b"RFB 003.008\n"
+    assert (
+        filter_rfb_client_messages(version, allow_input=False, state=state) == version
+    )
+    assert (
+        filter_rfb_client_messages(b"\x02", allow_input=False, state=state) == b"\x02"
+    )
+    assert state.phase == "vnc_auth_response"
+    response = bytes(range(16))
+    assert (
+        filter_rfb_client_messages(response[:7], allow_input=False, state=state) == b""
+    )
+    assert (
+        filter_rfb_client_messages(response[7:], allow_input=False, state=state)
+        == response
+    )
+    assert state.phase == "client_init"
+    assert (
+        filter_rfb_client_messages(b"\x01", allow_input=False, state=state) == b"\x01"
+    )
+    assert state.phase == "initialized"
+
+
+def test_rfb_read_only_handshake_reaches_initialized_state_and_blocks_input():
+    from job_applier.web.edge_auth import RfbReadOnlyState, filter_rfb_client_messages
+
+    state = RfbReadOnlyState()
+    version = b"RFB 003.008\n"
+    assert (
+        filter_rfb_client_messages(version, allow_input=False, state=state) == version
+    )
+    assert state.phase == "security_selection"
+    assert (
+        filter_rfb_client_messages(b"\x01", allow_input=False, state=state) == b"\x01"
+    )
+    assert state.phase == "client_init"
+    assert (
+        filter_rfb_client_messages(b"\x01", allow_input=False, state=state) == b"\x01"
+    )
+    assert state.phase == "initialized"
+
+    framebuffer_request = b"\x03" + b"\x00" * 9
+    key_event = b"\x04" + b"\x00" * 7
+    pointer_event = b"\x05" + b"\x00" * 5
+    clipboard = b"\x06" + b"\x00" * 7
+    assert (
+        filter_rfb_client_messages(
+            framebuffer_request + key_event + pointer_event + clipboard,
+            allow_input=False,
+            state=state,
+        )
+        == framebuffer_request
+    )
+    assert filter_rfb_client_messages(b"\x01", allow_input=False, state=state) == b""
+
+
+def test_rfb_read_only_filter_preserves_fragmented_handshake_and_safe_frames():
+    from job_applier.web.edge_auth import RfbReadOnlyState, filter_rfb_client_messages
+
+    state = RfbReadOnlyState()
+    version = b"RFB 003.008\n"
+    assert (
+        filter_rfb_client_messages(version[:5], allow_input=False, state=state) == b""
+    )
+    assert (
+        filter_rfb_client_messages(version[5:10], allow_input=False, state=state) == b""
+    )
+    assert (
+        filter_rfb_client_messages(version[10:], allow_input=False, state=state)
+        == version
+    )
+    assert state.phase == "security_selection"
+    assert filter_rfb_client_messages(b"", allow_input=False, state=state) == b""
+    assert (
+        filter_rfb_client_messages(b"\x01", allow_input=False, state=state) == b"\x01"
+    )
+    assert state.phase == "client_init"
+    assert (
+        filter_rfb_client_messages(b"\x01", allow_input=False, state=state) == b"\x01"
+    )
+    assert state.phase == "initialized"
+
+    framebuffer_request = b"\x03" + b"\x00" * 9
+    assert (
+        filter_rfb_client_messages(
+            framebuffer_request[:4], allow_input=False, state=state
+        )
+        == b""
+    )
+    assert (
+        filter_rfb_client_messages(
+            framebuffer_request[4:], allow_input=False, state=state
+        )
+        == framebuffer_request
+    )
+
+    key_event = b"\x04" + b"\x00" * 7
+    assert (
+        filter_rfb_client_messages(key_event[:2], allow_input=False, state=state) == b""
+    )
+    assert (
+        filter_rfb_client_messages(key_event[2:], allow_input=False, state=state) == b""
+    )
+    assert state.buffer == b""
+
+
+def _initialized_rfb_state():
+    from job_applier.web.edge_auth import RfbReadOnlyState, filter_rfb_client_messages
+
+    state = RfbReadOnlyState()
+    assert (
+        filter_rfb_client_messages(b"RFB 003.008\n", False, state) == b"RFB 003.008\n"
+    )
+    assert filter_rfb_client_messages(b"\x01\x01", False, state) == b"\x01\x01"
+    assert state.phase == "initialized"
+    return state, filter_rfb_client_messages
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [b"\x04" + b"\x00" * 7, b"\x05" + b"\x00" * 5, b"\x06" + b"\x00" * 7],
+)
+def test_rfb_fragmented_input_cannot_cross_authorization_epoch(frame):
+    """Fragments begun on either side of a lease transition are discarded."""
+    state, filter_messages = _initialized_rfb_state()
+
+    assert filter_messages(frame[:2], allow_input=False, state=state) == b""
+    assert filter_messages(frame[2:], allow_input=True, state=state) == b""
+    assert state.buffer == b""
+
+    state, filter_messages = _initialized_rfb_state()
+    assert filter_messages(frame[:2], allow_input=True, state=state) == b""
+    assert filter_messages(frame[2:], allow_input=False, state=state) == b""
+    assert state.buffer == b""
+
+
+def test_rfb_safe_fragment_cannot_cross_authorization_epoch():
+    state, filter_messages = _initialized_rfb_state()
+    framebuffer_request = b"\x03" + b"\x00" * 9
+
+    assert filter_messages(framebuffer_request[:4], False, state) == b""
+    assert filter_messages(framebuffer_request[4:], True, state) == b""
+    assert filter_messages(framebuffer_request, True, state) == framebuffer_request
+
+    state, filter_messages = _initialized_rfb_state()
+    assert filter_messages(framebuffer_request[:4], True, state) == b""
+    assert filter_messages(framebuffer_request[4:], False, state) == b""
+    assert filter_messages(framebuffer_request, False, state) == framebuffer_request
+
+
 def test_deep_rfb_message_filtering():
     from job_applier.web.edge_auth import filter_rfb_client_messages
 
@@ -1004,15 +1365,17 @@ def test_set_encodings_rfb_length_and_fail_closed():
     filtered = filter_rfb_client_messages(combined, allow_input=False)
     assert filtered == encodings_data
 
-    # Unknown message type (e.g. 99) fails closed (dropped)
+    # Unknown message type (e.g. 99) fails closed (dropped), including a
+    # short frame that must not be mistaken for a fragmented safe message.
     unknown_msg = bytes([99, 1, 2, 3, 4, 5])
     assert filter_rfb_client_messages(unknown_msg, allow_input=False) == b""
+    assert filter_rfb_client_messages(bytes([99, 1]), allow_input=False) == b""
 
 
 class _ViewerProtocolUpstream:
     def __init__(self) -> None:
         self.sent: list[bytes] = []
-        self._messages = [b"RFB 003.008\\n"]
+        self._messages = [b"RFB 003.008\n"]
 
     async def __aenter__(self):
         return self
@@ -1032,7 +1395,7 @@ class _ViewerProtocolUpstream:
         raise StopAsyncIteration
 
 
-def _viewer_protocol_websocket(protocol_header: str = ""):
+def _viewer_protocol_websocket(protocol_header: str = "", messages=None):
     from unittest.mock import AsyncMock
 
     websocket = AsyncMock()
@@ -1041,7 +1404,7 @@ def _viewer_protocol_websocket(protocol_header: str = ""):
         "sec-websocket-protocol": protocol_header,
     }
     websocket.cookies = {}
-    websocket.receive.side_effect = [{"type": "websocket.disconnect"}]
+    websocket.receive.side_effect = messages or [{"type": "websocket.disconnect"}]
     return websocket
 
 
@@ -1073,7 +1436,7 @@ def test_viewer_without_protocol_exchanges_rfb_without_selected_protocol() -> No
 
     websocket, upstream = asyncio.run(run())
     websocket.accept.assert_awaited_once_with()
-    websocket.send_bytes.assert_awaited_once_with(b"RFB 003.008\\n")
+    websocket.send_bytes.assert_awaited_once_with(b"RFB 003.008\n")
     assert upstream.sent == []
 
 
@@ -1094,7 +1457,6 @@ def test_viewer_binary_protocol_is_selected_when_offered() -> None:
 
 def test_viewer_unsupported_only_protocol_is_rejected() -> None:
     import asyncio
-    from job_applier.web.edge_auth import handle_viewer_websocket
 
     async def run():
         websocket = _viewer_protocol_websocket("base64")
@@ -1106,3 +1468,166 @@ def test_viewer_unsupported_only_protocol_is_rejected() -> None:
         code=1002, reason="Unsupported WebSocket subprotocol"
     )
     websocket.accept.assert_not_awaited()
+
+
+def test_takeover_owner_uses_verified_access_identity_not_request_body() -> None:
+    from types import SimpleNamespace
+    from job_applier.web.app import _takeover_request_owner
+
+    request = cast(
+        Any,
+        SimpleNamespace(state=SimpleNamespace(user={"email": "owner@example.test"})),
+    )
+    with patch("job_applier.web.app.edge_config.cf_access_enabled", True):
+        assert (
+            _takeover_request_owner(request, "forged-client-owner")
+            == "owner@example.test"
+        )
+
+
+def test_viewer_input_authorized_requires_matching_active_owner() -> None:
+    assert viewer_input_authorized(
+        "operator@example.test", True, "operator@example.test"
+    )
+    assert not viewer_input_authorized(
+        "viewer@example.test", True, "operator@example.test"
+    )
+    assert not viewer_input_authorized(
+        "operator@example.test", False, "operator@example.test"
+    )
+
+
+def test_viewer_input_rejects_different_lease_owner() -> None:
+    """An authorized viewer cannot inject input into another owner's lease."""
+    import asyncio
+    from unittest.mock import patch
+
+    key_event = struct.pack(">BBHI", 4, 1, 0, 0x41)
+
+    async def run():
+        websocket = _viewer_protocol_websocket(
+            messages=[{"bytes": key_event}, {"type": "websocket.disconnect"}]
+        )
+        upstream = _ViewerProtocolUpstream()
+        with (
+            patch("websockets.connect", return_value=upstream),
+            patch(
+                "job_applier.automation.queue.is_takeover_active",
+                return_value=(True, "another-authorized-viewer", "future"),
+            ),
+        ):
+            await handle_viewer_websocket(websocket, _viewer_protocol_config())
+        return upstream
+
+    upstream = asyncio.run(run())
+    assert upstream.sent == []
+
+
+def test_takeover_transport_lock_fences_release_during_upstream_send():
+    """A release cannot complete while an authorized frame is being sent upstream."""
+    import threading
+    import time
+    from job_applier.automation.queue import TAKEOVER_TRANSPORT_LOCK
+
+    release_started = threading.Event()
+    release_finished = threading.Event()
+
+    def release_probe() -> None:
+        release_started.set()
+        with TAKEOVER_TRANSPORT_LOCK:
+            release_finished.set()
+
+    with TAKEOVER_TRANSPORT_LOCK:
+        thread = threading.Thread(target=release_probe)
+        thread.start()
+        assert release_started.wait(timeout=1)
+        time.sleep(0.01)
+        assert not release_finished.is_set()
+
+    thread.join(timeout=1)
+    assert release_finished.is_set()
+
+
+def test_viewer_relay_serializes_release_with_upstream_send():
+    """A lease release waits until an authorized frame finishes its upstream send."""
+    import asyncio
+    import threading
+    from unittest.mock import patch
+    from job_applier.automation.queue import TAKEOVER_TRANSPORT_LOCK
+    from job_applier.web.edge_auth import handle_viewer_websocket
+
+    key_event = struct.pack(">BBHI", 4, 1, 0, 0x41)
+    release_started = threading.Event()
+    release_finished = threading.Event()
+
+    def release_probe() -> None:
+        release_started.set()
+        with TAKEOVER_TRANSPORT_LOCK:
+            release_finished.set()
+
+    class BlockingSendUpstream(_ViewerProtocolUpstream):
+        release_thread: threading.Thread | None = None
+
+        async def send(self, message: bytes) -> None:
+            self.sent.append(message)
+            if message != key_event:
+                return
+            self.release_thread = threading.Thread(target=release_probe)
+            self.release_thread.start()
+            assert release_started.wait(timeout=1)
+            await asyncio.sleep(0.01)
+            assert not release_finished.is_set()
+
+    async def run():
+        websocket = _viewer_protocol_websocket(
+            messages=[
+                {"bytes": b"RFB 003.008\n"},
+                {"bytes": b"\x01"},
+                {"bytes": b"\x01"},
+                {"bytes": key_event},
+                {"type": "websocket.disconnect"},
+            ]
+        )
+        upstream = BlockingSendUpstream()
+        with (
+            patch("websockets.connect", return_value=upstream),
+            patch(
+                "job_applier.automation.queue.is_takeover_active",
+                return_value=(True, "operator", "future"),
+            ),
+        ):
+            await handle_viewer_websocket(websocket, _viewer_protocol_config())
+        return upstream
+
+    upstream = asyncio.run(run())
+    assert upstream.sent == [b"RFB 003.008\n", b"\x01", b"\x01", key_event]
+    assert upstream.release_thread is not None
+    upstream.release_thread.join(timeout=1)
+    assert not upstream.release_thread.is_alive()
+    assert release_finished.is_set()
+
+
+def test_viewer_input_rejects_first_frame_after_release() -> None:
+    """A release is observed on the next input frame, with no cache grace period."""
+    import asyncio
+    from unittest.mock import patch
+
+    key_event = struct.pack(">BBHI", 4, 1, 0, 0x41)
+
+    async def run():
+        websocket = _viewer_protocol_websocket(
+            messages=[{"bytes": key_event}, {"type": "websocket.disconnect"}]
+        )
+        upstream = _ViewerProtocolUpstream()
+        with (
+            patch("websockets.connect", return_value=upstream),
+            patch(
+                "job_applier.automation.queue.is_takeover_active",
+                return_value=(False, None, None),
+            ),
+        ):
+            await handle_viewer_websocket(websocket, _viewer_protocol_config())
+        return upstream
+
+    upstream = asyncio.run(run())
+    assert upstream.sent == []
