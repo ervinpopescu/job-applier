@@ -18,7 +18,7 @@ def test_migrations_fresh_db(tmp_path: Path):
 
     # First migration run
     applied = run_migrations(custom_path=db_file)
-    assert applied == 5
+    assert applied == 7
     assert get_schema_version(custom_path=db_file) == CURRENT_SCHEMA_VERSION
 
     # Idempotent second run
@@ -84,9 +84,9 @@ def test_migrations_legacy_db_upgrade(tmp_path: Path):
     # Verify legacy version detected as 1
     assert get_schema_version(custom_path=db_file) == 1
 
-    # Run migrations: should apply migrations 2 through 5
+    # Run migrations: should apply migrations 2 through 7
     applied = run_migrations(custom_path=db_file)
-    assert applied == 4
+    assert applied == 6
     assert get_schema_version(custom_path=db_file) == CURRENT_SCHEMA_VERSION
 
 

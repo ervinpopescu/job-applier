@@ -12,8 +12,18 @@ from pathlib import Path
 from typing import Any
 
 from job_applier.automation.browser_runtime import get_default_profile_dir, is_linux
+from job_applier.cli.vnc_auth import (
+    cleanup_vnc_password_file,
+    create_vnc_password_file,
+    load_vnc_password,
+    vnc_process_environment,
+)
 from job_applier.automation.network_security import OutboundSecurityProxy
-from job_applier.automation.queue import record_event
+from job_applier.automation.queue import (
+    _record_ambiguous_notification_on_conn,
+    mark_runtime_browser_shutdown,
+    record_event,
+)
 from job_applier.automation.profile_lock import (
     ProfileOwnershipError,
     ProfileOwnershipLock,
@@ -29,7 +39,7 @@ class RuntimeDaemon:
     - Singleton worker OS lock
     - Exclusive profile ownership lock
     - Xvfb virtual display
-    - x11vnc loopback read-only default viewer transport
+    - x11vnc loopback authenticated viewer transport
     - websockify WebSocket-to-VNC bridge
     - Enforceable outbound security proxy
     - Automation worker loop
@@ -70,6 +80,7 @@ class RuntimeDaemon:
         self.xvfb_proc: subprocess.Popen[Any] | None = None
         self.wallpaper_proc: subprocess.Popen[Any] | None = None
         self.vnc_proc: subprocess.Popen[Any] | None = None
+        self.vnc_password_file: Path | None = None
         self.websockify_proc: subprocess.Popen[Any] | None = None
         self._stop_requested = False
         self._shutdown_requested = threading.Event()
@@ -77,7 +88,7 @@ class RuntimeDaemon:
         self._worker_thread: threading.Thread | None = None
 
     def start_display_subsystem(self) -> None:
-        """Starts Xvfb, x11vnc (view-only default), and websockify if on Linux."""
+        """Starts Xvfb, authenticated x11vnc, and websockify if on Linux."""
         if not is_linux():
             return
 
@@ -88,6 +99,15 @@ class RuntimeDaemon:
             # Startup may be retried after an authentication/browser reopen.
             # Keep the existing supervised display stack singleton.
             return
+
+        if not shutil.which("x11vnc"):
+            raise RuntimeError(
+                "x11vnc binary not found; cannot start authenticated VNC"
+            )
+
+        # Validate and generate authentication material before starting any
+        # display child process. The secret never enters a process argument or log.
+        vnc_password = load_vnc_password()
 
         # 1. Start Xvfb virtual display
         if self.xvfb_proc is not None and self.xvfb_proc.poll() is None:
@@ -146,28 +166,36 @@ class RuntimeDaemon:
         # 2. Start x11vnc: Loopback only
         if self.vnc_proc is None or self.vnc_proc.poll() is not None:
             if shutil.which("x11vnc"):
-                vnc_cmd = [
-                    "x11vnc",
-                    "-display",
-                    self.display,
-                    "-rfbport",
-                    str(self.vnc_port),
-                    "-localhost",  # Loopback only
-                    "-forever",
-                    "-shared",
-                    "-nopw",
-                ]
                 try:
+                    # Startup may be retried after a crashed x11vnc. Remove the
+                    # prior generated credential before replacing its path so
+                    # every restart attempt cleans up all material it created.
+                    cleanup_vnc_password_file(self.vnc_password_file)
+                    self.vnc_password_file = None
+                    self.vnc_password_file = create_vnc_password_file(vnc_password)
+                    vnc_cmd = [
+                        "x11vnc",
+                        "-display",
+                        self.display,
+                        "-rfbport",
+                        str(self.vnc_port),
+                        "-localhost",  # Loopback only
+                        "-forever",
+                        "-shared",
+                        "-rfbauth",
+                        str(self.vnc_password_file),
+                    ]
                     self.vnc_proc = subprocess.Popen(
                         vnc_cmd,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
+                        env=vnc_process_environment(),
                     )
-                    print(f"🔒 x11vnc active on 127.0.0.1:{self.vnc_port}")
+                    print(f"🔒 x11vnc authenticated on 127.0.0.1:{self.vnc_port}")
                 except Exception as e:
+                    cleanup_vnc_password_file(self.vnc_password_file)
+                    self.vnc_password_file = None
                     print(f"Notice: Failed starting x11vnc: {e}")
-            else:
-                print("Notice: x11vnc binary not found.")
 
         # 3. Start websockify: Bridges internal WebSocket transport to local x11vnc
         if self.websockify_proc is None or self.websockify_proc.poll() is not None:
@@ -211,7 +239,8 @@ class RuntimeDaemon:
             with conn:
                 rows = conn.execute(
                     """
-                    SELECT id, app_id, state
+                    SELECT id, app_id, state, lease_owner, fencing_generation,
+                           lease_expires_at
                     FROM automation_jobs
                     WHERE lease_owner = ?
                       AND state NOT IN ('applied', 'cancelled', 'failed_permanent', 'skipped');
@@ -227,32 +256,12 @@ class RuntimeDaemon:
                             "Runtime shutdown interrupted an in-flight submission; "
                             "manual outcome verification is required."
                         )
-                        conn.execute(
-                            """
-                            UPDATE applications
-                            SET status = 'ambiguous', notes = ?, updated_at = datetime('now')
-                            WHERE id = ?;
-                            """,
-                            (message, row["app_id"]),
-                        )
-                        conn.execute(
-                            """
-                            UPDATE application_attempts
-                            SET outcome = 'ambiguous', error_details = ?,
-                                is_ambiguous = 1, completed_at = datetime('now')
-                            WHERE id = (
-                                SELECT id FROM application_attempts
-                                WHERE job_id = ? AND completed_at IS NULL
-                                ORDER BY created_at DESC LIMIT 1
-                            );
-                            """,
-                            (message, row["id"]),
-                        )
                     elif state in {
                         "auth_required",
                         "mfa_required",
                         "captcha_required",
                         "unknown_question",
+                        "ambiguous_submission",
                     }:
                         next_state = state
                         error_code = "RUNTIME_SHUTDOWN"
@@ -265,6 +274,9 @@ class RuntimeDaemon:
                         error_code = "RUNTIME_SHUTDOWN"
                         message = "Runtime shutdown interrupted pre-submit automation; job was safely returned to the queue."
 
+                    # Win the durable owner/generation/state/lease snapshot first.
+                    # All ambiguity projections below are conditional on this
+                    # one-row fence, so a replacement claimant remains untouched.
                     updated = conn.execute(
                         """
                         UPDATE automation_jobs
@@ -272,29 +284,89 @@ class RuntimeDaemon:
                             fencing_generation = fencing_generation + 1,
                             checkpoint = 'runtime_shutdown', error_code = ?,
                             error_message = ?, updated_at = datetime('now')
-                        WHERE id = ? AND lease_owner = ?;
+                        WHERE id = ? AND state = ? AND lease_owner = ?
+                          AND fencing_generation = ?
+                          AND ((lease_expires_at = ?) OR (lease_expires_at IS NULL AND ? IS NULL));
                         """,
                         (
                             next_state,
                             error_code,
                             message,
                             row["id"],
-                            worker_id,
+                            state,
+                            row["lease_owner"],
+                            row["fencing_generation"],
+                            row["lease_expires_at"],
+                            row["lease_expires_at"],
                         ),
                     ).rowcount
-                    if updated:
-                        record_event(
+                    if not updated:
+                        continue
+
+                    if state in {"submit_intent", "verifying"}:
+                        conn.execute(
+                            """
+                            UPDATE applications
+                            SET status = 'ambiguous', notes = ?, updated_at = datetime('now')
+                            WHERE id = ?;
+                            """,
+                            (message, row["app_id"]),
+                        )
+                        attempt = conn.execute(
+                            """
+                            SELECT id, attempt_number FROM application_attempts
+                            WHERE job_id = ? AND completed_at IS NULL
+                            ORDER BY created_at DESC LIMIT 1;
+                            """,
+                            (row["id"],),
+                        ).fetchone()
+                        if attempt:
+                            conn.execute(
+                                """
+                                UPDATE application_attempts
+                                SET outcome = 'ambiguous', error_details = ?,
+                                    is_ambiguous = 1, completed_at = datetime('now')
+                                WHERE id = ? AND job_id = ?;
+                                """,
+                                (message, attempt["id"], row["id"]),
+                            )
+                        event_id = record_event(
                             job_id=row["id"],
                             app_id=row["app_id"],
-                            event_type="runtime_shutdown_reconciled",
-                            level="WARN",
-                            step=next_state,
+                            attempt_id=attempt["id"] if attempt else None,
+                            attempt_number=attempt["attempt_number"]
+                            if attempt
+                            else None,
+                            event_key=f"runtime_shutdown_ambiguous:{row['id']}:{row['fencing_generation']}",
+                            event_type="ambiguous_submission",
+                            level="CRITICAL",
+                            step="ambiguous_submission",
                             message=message,
                             details={"previous_state": state, "worker_id": worker_id},
                             custom_path=self.custom_db_path,
                             conn=conn,
                         )
-                        reconciled.append(row["id"])
+                        _record_ambiguous_notification_on_conn(
+                            conn,
+                            job_id=row["id"],
+                            app_id=row["app_id"],
+                            event_id=event_id,
+                            message=message,
+                            custom_path=self.custom_db_path,
+                        )
+
+                    record_event(
+                        job_id=row["id"],
+                        app_id=row["app_id"],
+                        event_type="runtime_shutdown_reconciled",
+                        level="WARN",
+                        step=next_state,
+                        message=message,
+                        details={"previous_state": state, "worker_id": worker_id},
+                        custom_path=self.custom_db_path,
+                        conn=conn,
+                    )
+                    reconciled.append(row["id"])
         finally:
             conn.close()
         return reconciled
@@ -309,11 +381,25 @@ class RuntimeDaemon:
         if worker_thread and worker_thread.is_alive():
             worker_thread.join(timeout=self.worker_shutdown_timeout)
         worker_id = getattr(self, "_worker_id", "")
-        if worker_id:
-            reconciled = self._reconcile_inflight_worker(worker_id)
-            if reconciled:
+        try:
+            if worker_id:
+                reconciled = self._reconcile_inflight_worker(worker_id)
+                if reconciled:
+                    print(
+                        f"⚠️ Reconciled {len(reconciled)} in-flight job(s) after worker shutdown."
+                    )
+        except Exception as exc:
+            print(f"Notice: Failed reconciling in-flight jobs during shutdown: {exc}")
+        finally:
+            # Publish the cross-process browser shutdown fence before tearing
+            # down display processes. This remains mandatory even when the
+            # worker join timed out or reconciliation raised, so the next
+            # runtime cannot inherit stale browser ownership metadata.
+            try:
+                mark_runtime_browser_shutdown(self.custom_db_path)
+            except Exception as exc:
                 print(
-                    f"⚠️ Reconciled {len(reconciled)} in-flight job(s) after worker shutdown."
+                    f"Notice: Failed publishing runtime browser shutdown fence: {exc}"
                 )
 
         try:
@@ -347,6 +433,8 @@ class RuntimeDaemon:
         except Exception:
             pass
 
+        cleanup_vnc_password_file(self.vnc_password_file)
+        self.vnc_password_file = None
         print("👋 Runtime daemon terminated cleanly.")
 
     def run(self) -> int:

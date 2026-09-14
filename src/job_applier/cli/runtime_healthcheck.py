@@ -62,7 +62,7 @@ def _check_novnc_asset() -> None:
 
 def _check_vnc_handshake() -> None:
     with socket.create_connection(VNC_ADDRESS, timeout=TIMEOUT_SECONDS) as sock:
-        if not sock.recv(12).startswith(b"RFB "):
+        if not _read_exact(sock, 12).startswith(b"RFB "):
             raise RuntimeError("x11vnc did not return an RFB greeting")
 
 
