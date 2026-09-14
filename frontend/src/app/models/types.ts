@@ -309,6 +309,7 @@ export interface TakeoverStatus {
   is_takeover_active: boolean;
   owner: string | null;
   expires_at: string | null;
+  is_current_owner: boolean;
   is_paused: boolean;
   is_stopped: boolean;
   read_only: boolean;

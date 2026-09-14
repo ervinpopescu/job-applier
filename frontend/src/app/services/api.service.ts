@@ -471,6 +471,12 @@ export class ApiService {
 
   // --- Operator Takeover & noVNC View Controls ---
 
+  getVncCredentials(): Observable<{ password: string }> {
+    return this.http.get<{ password: string }>(
+      this.resolveUrl('/api/automation/takeover/vnc-credentials'),
+    );
+  }
+
   getTakeoverStatus(): Observable<TakeoverStatus> {
     return this.http.get<TakeoverStatus>(this.resolveUrl('/api/automation/takeover/status'));
   }

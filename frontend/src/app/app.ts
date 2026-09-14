@@ -12,7 +12,7 @@ import {
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { DomSanitizer, type SafeResourceUrl } from '@angular/platform-browser';
-import { type Observable, forkJoin, of } from 'rxjs';
+import { firstValueFrom, type Observable, forkJoin, of } from 'rxjs';
 import { catchError, tap } from 'rxjs/operators';
 import { IconComponent } from './components/icon.component';
 import { ApiService, resolveFileUrl } from './services/api.service';
@@ -40,8 +40,17 @@ import {
   classifyHttpError,
 } from './models/types';
 import { NotificationService } from './services/notification.service';
+import {
+  VncClientService,
+  type RfbConnectionEvent,
+  type RfbLike,
+} from './services/vnc-client.service';
 
 const RETRY_BACKOFF_STEPS = [5, 15, 30];
+const VNC_RETRY_DELAYS_MS = [1000, 2000, 5000];
+const XK_PAGE_UP = 0xff55;
+const XK_PAGE_DOWN = 0xff56;
+const XK_RETURN = 0xff0d;
 
 @Component({
   selector: 'app-root',
@@ -53,10 +62,28 @@ const RETRY_BACKOFF_STEPS = [5, 15, 30];
 export class App implements OnInit, OnDestroy {
   api = inject(ApiService);
   notifService = inject(NotificationService);
+  private vncClient = inject(VncClientService);
   private sanitizer = inject(DomSanitizer);
 
   @ViewChild('consoleContainer') consoleContainer?: ElementRef<HTMLDivElement>;
   @ViewChild('moreActionsButton') moreActionsButton?: ElementRef<HTMLButtonElement>;
+
+  private vncDialog?: ElementRef<HTMLDivElement>;
+  @ViewChild('vncDialog')
+  set vncDialogRef(ref: ElementRef<HTMLDivElement> | undefined) {
+    this.vncDialog = ref;
+    if (ref && this.vncModalOpen()) {
+      queueMicrotask(() => ref.nativeElement.focus({ preventScroll: true }));
+    }
+  }
+
+  @ViewChild('vncTarget')
+  set vncTargetRef(ref: ElementRef<HTMLDivElement> | undefined) {
+    this.vncTarget = ref;
+    if (ref && this.vncModalOpen()) {
+      queueMicrotask(() => this.connectRfb());
+    }
+  }
 
   // Tabs
   activeTab = signal<
@@ -105,6 +132,25 @@ export class App implements OnInit, OnDestroy {
   isReleasingTakeover = signal(false);
   isResumingTakeover = signal(false);
   isReopeningAuth = signal(false);
+  vncMode = signal<'pan' | 'fit'>('pan');
+  vncModeManuallySelected = signal(false);
+  vncConnection = signal<
+    'idle' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected' | 'error'
+  >('idle');
+  vncError = signal<string | null>(null);
+  vncRetryCount = signal(0);
+  vncInputText = signal('');
+  private vncTarget?: ElementRef<HTMLDivElement>;
+  private rfb?: RfbLike;
+  private vncRetryTimerId: ReturnType<typeof setTimeout> | null = null;
+  private vncIntentionalDisconnect = false;
+  private vncSecurityFailure = false;
+  private vncCredentials: { password: string } | null = null;
+  private vncCredentialsRequest: Promise<{ password: string }> | null = null;
+  private vncConnecting = false;
+  private takeoverInputRevoked = false;
+  private takeoverEpoch = 0;
+  private takeoverStatusRequest = 0;
   private takeoverTimerId: ReturnType<typeof setInterval> | null = null;
 
   // Queue & Automation Runtime Controls
@@ -157,14 +203,6 @@ export class App implements OnInit, OnDestroy {
   resolveAnswerValue = signal('');
   resolveApprovedScope = signal<string>('global');
   isResolvingJob = signal(false);
-
-  vncUrl = computed(() => {
-    return this.sanitizer.bypassSecurityTrustResourceUrl(
-      this.api.resolveUrl(
-        '/browser/vnc.html?autoconnect=true&resize=scale&reconnect=true&path=browser/websockify',
-      ),
-    );
-  });
 
   // Per-Resource State Tracking
   resourceStates = signal<Record<ResourceKey, ResourceState>>({
@@ -347,6 +385,7 @@ export class App implements OnInit, OnDestroy {
     // Periodic background poll
     this.pollIntervalId = setInterval(() => {
       this.refreshPoll();
+      if (this.vncModalOpen()) this.refreshTakeoverStatus();
     }, 2000);
   }
 
@@ -362,6 +401,7 @@ export class App implements OnInit, OnDestroy {
       this.takeoverTimerId = null;
     }
     this.stopResumePolling();
+    this.disconnectRfb();
   }
 
   setResourceStatus(
@@ -1374,7 +1414,7 @@ export class App implements OnInit, OnDestroy {
 
   submitCode() {
     const code = this.verificationCode().trim();
-    if (!code) return;
+    if (!code || !this.takeoverOwnerActionEnabled()) return;
     this.api.submitVerificationCode(code).subscribe({
       next: () => {
         this.showToast('Verification code submitted to browser!');
@@ -1672,7 +1712,16 @@ export class App implements OnInit, OnDestroy {
 
   // --- Automation Runtime Controls (Pause / Resume / Stop) ---
 
+  runtimeActionEnabled(): boolean {
+    const takeover = this.takeoverStatus();
+    return !takeover?.is_takeover_active || takeover.is_current_owner;
+  }
+
   pauseAutomation() {
+    if (!this.runtimeActionEnabled()) {
+      this.showToast('Only the current takeover owner may pause automation.', 'warning');
+      return;
+    }
     this.isPausingAutomation.set(true);
     this.api.pauseAutomation().subscribe({
       next: () => {
@@ -1729,7 +1778,7 @@ export class App implements OnInit, OnDestroy {
   clearAutomationState() {
     if (
       !confirm(
-        'Clear automation state? This resets any stuck or claimed jobs back to ready, closes orphaned browser sessions, and clears emergency stop.',
+        'Clear automation state? Recoverable pre-submit jobs return to ready, while submit_intent/verifying jobs remain ambiguous and require explicit outcome resolution. Orphaned browser sessions are closed and emergency stop is cleared.',
       )
     )
       return;
@@ -1825,19 +1874,273 @@ export class App implements OnInit, OnDestroy {
 
   // --- noVNC Viewer & Operator Takeover Controls ---
 
+  vncConnectionLabel(): string {
+    switch (this.vncConnection()) {
+      case 'connecting':
+        return 'Connecting';
+      case 'connected':
+        if (!this.takeoverStatus()?.is_takeover_active) {
+          return 'Read-only until takeover is active';
+        }
+        return this.takeoverStatus()?.is_current_owner
+          ? 'Connected'
+          : 'Read-only: another operator controls the session';
+      case 'reconnecting':
+        return `Reconnecting (attempt ${this.vncRetryCount()}/3)`;
+      case 'disconnected':
+        return 'Disconnected';
+      case 'error':
+        return this.vncError() || 'Connection error';
+      default:
+        return 'Waiting to connect';
+    }
+  }
+
+  takeoverOwnerActionEnabled(): boolean {
+    return (
+      !this.takeoverInputRevoked &&
+      this.takeoverStatus()?.is_takeover_active === true &&
+      this.takeoverStatus()?.is_current_owner === true
+    );
+  }
+
+  vncInputEnabled(): boolean {
+    return this.vncConnection() === 'connected' && this.takeoverOwnerActionEnabled();
+  }
+
+  private websocketUrl(): string {
+    const path = this.api.resolveUrl('/browser/websockify');
+    const base = typeof window === 'undefined' ? 'http://localhost' : window.location.origin;
+    const url = new URL(path, base);
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    return url.toString();
+  }
+
+  private setVncModeProperties() {
+    if (!this.rfb) return;
+    if (this.vncMode() === 'pan') {
+      this.rfb.scaleViewport = false;
+      this.rfb.clipViewport = true;
+      this.rfb.dragViewport = true;
+    } else {
+      this.rfb.dragViewport = false;
+      this.rfb.clipViewport = false;
+      this.rfb.scaleViewport = true;
+    }
+    this.rfb.resizeSession = false;
+    this.rfb.viewOnly = !this.vncInputEnabled();
+  }
+
+  private chooseDefaultVncMode() {
+    if (this.vncModeManuallySelected()) return;
+    const narrow =
+      typeof window !== 'undefined' && window.matchMedia?.('(max-width: 767px)').matches;
+    this.vncMode.set(narrow === false ? 'fit' : 'pan');
+  }
+
+  setVncMode(mode: 'pan' | 'fit') {
+    this.vncModeManuallySelected.set(true);
+    this.vncMode.set(mode);
+    this.setVncModeProperties();
+  }
+
+  private clearVncRetryTimer() {
+    if (this.vncRetryTimerId) {
+      clearTimeout(this.vncRetryTimerId);
+      this.vncRetryTimerId = null;
+    }
+  }
+
+  private scheduleVncReconnect() {
+    if (this.vncIntentionalDisconnect || this.vncSecurityFailure || !this.vncModalOpen()) return;
+    const attempt = this.vncRetryCount();
+    if (attempt >= VNC_RETRY_DELAYS_MS.length) {
+      this.vncConnection.set('error');
+      this.vncError.set('Connection failed after 3 attempts. Retry connection.');
+      return;
+    }
+    this.vncRetryCount.set(attempt + 1);
+    this.vncConnection.set('reconnecting');
+    this.clearVncRetryTimer();
+    this.vncRetryTimerId = setTimeout(() => {
+      this.vncRetryTimerId = null;
+      this.connectRfb();
+    }, VNC_RETRY_DELAYS_MS[attempt]);
+  }
+
+  private onRfbConnect = () => {
+    this.vncConnection.set('connected');
+    this.vncError.set(null);
+    this.vncRetryCount.set(0);
+    this.setVncModeProperties();
+    if (this.vncInputEnabled()) this.rfb?.focus({ preventScroll: true });
+  };
+
+  private onRfbDisconnect = (event: RfbConnectionEvent) => {
+    const clean = event instanceof CustomEvent ? Boolean(event.detail?.clean) : false;
+    this.rfb = undefined;
+    if (this.vncIntentionalDisconnect) return;
+    if (clean) {
+      this.vncConnection.set('disconnected');
+      this.vncError.set('Disconnected. Retry connection when ready.');
+      return;
+    }
+    this.scheduleVncReconnect();
+  };
+
+  private onRfbSecurityFailure = (event: RfbConnectionEvent) => {
+    this.vncSecurityFailure = true;
+    const detail = event instanceof CustomEvent ? event.detail : undefined;
+    this.vncConnection.set('error');
+    this.vncError.set(
+      detail?.reason || 'Authentication or VNC security failure. Reauthenticate, then retry.',
+    );
+    this.setVncModeProperties();
+  };
+
+  private async connectRfb() {
+    if (
+      !this.vncModalOpen() ||
+      !this.vncTarget ||
+      this.rfb ||
+      this.vncRetryTimerId ||
+      this.vncConnecting
+    )
+      return;
+    this.vncConnecting = true;
+    this.vncIntentionalDisconnect = false;
+    this.vncSecurityFailure = false;
+    this.vncConnection.set(this.vncRetryCount() ? 'reconnecting' : 'connecting');
+    this.vncError.set(null);
+    try {
+      if (!this.vncCredentials) {
+        this.vncCredentialsRequest ??= firstValueFrom(this.api.getVncCredentials());
+        const credentials = await this.vncCredentialsRequest;
+        this.vncCredentialsRequest = null;
+        if (!credentials?.password) throw new Error('VNC credentials were unavailable.');
+        if (this.vncIntentionalDisconnect || !this.vncModalOpen() || !this.vncTarget) return;
+        this.vncCredentials = { password: credentials.password };
+      }
+      if (this.vncIntentionalDisconnect || !this.vncModalOpen() || !this.vncTarget) return;
+      this.rfb = this.vncClient.create(
+        this.vncTarget.nativeElement,
+        this.websocketUrl(),
+        this.vncCredentials,
+      );
+      this.rfb.addEventListener('connect', this.onRfbConnect);
+      this.rfb.addEventListener('disconnect', this.onRfbDisconnect);
+      this.rfb.addEventListener('securityfailure', this.onRfbSecurityFailure);
+      this.setVncModeProperties();
+    } catch (error) {
+      this.vncCredentialsRequest = null;
+      this.rfb = undefined;
+      this.vncConnection.set('error');
+      this.vncError.set(error instanceof Error ? error.message : 'Unable to start VNC connection.');
+    } finally {
+      this.vncConnecting = false;
+    }
+  }
+
+  private disconnectRfb() {
+    this.vncIntentionalDisconnect = true;
+    this.clearVncRetryTimer();
+    const client = this.rfb;
+    this.rfb = undefined;
+    if (client) {
+      client.removeEventListener('connect', this.onRfbConnect);
+      client.removeEventListener('disconnect', this.onRfbDisconnect);
+      client.removeEventListener('securityfailure', this.onRfbSecurityFailure);
+      client.disconnect();
+    }
+    this.vncCredentials = null;
+    this.vncCredentialsRequest = null;
+    this.vncConnection.set('idle');
+  }
+
+  retryVncConnection() {
+    if (!this.vncModalOpen() || this.vncConnection() === 'connecting') return;
+    this.disconnectRfb();
+    this.vncIntentionalDisconnect = false;
+    this.vncSecurityFailure = false;
+    this.vncRetryCount.set(0);
+    this.vncConnection.set('connecting');
+    this.connectRfb();
+  }
+
+  sendRemotePage(direction: 'up' | 'down') {
+    if (!this.vncInputEnabled() || !this.rfb) return;
+    this.rfb.sendKey(
+      direction === 'up' ? XK_PAGE_UP : XK_PAGE_DOWN,
+      direction === 'up' ? 'PageUp' : 'PageDown',
+    );
+  }
+
+  pasteTextToRemote() {
+    const text = this.vncInputText();
+    if (!this.vncInputEnabled() || !this.rfb || !text) return;
+    if ([...text].some((character) => (character.codePointAt(0) ?? 0) > 0xff)) {
+      this.showToast(
+        'This text contains Unicode characters that cannot be sent safely through the remote clipboard. The text was kept for editing.',
+        'warning',
+      );
+      return;
+    }
+    this.rfb.clipboardPasteFrom(text);
+    this.vncInputText.set('');
+    this.rfb.focus({ preventScroll: true });
+  }
+
+  private markTakeoverInactive() {
+    this.takeoverInputRevoked = true;
+    const current = this.takeoverStatus();
+    this.takeoverStatus.set({
+      status: 'inactive',
+      is_takeover_active: false,
+      owner: null,
+      expires_at: null,
+      is_current_owner: false,
+      is_paused: current?.is_paused ?? true,
+      is_stopped: current?.is_stopped ?? false,
+      read_only: true,
+    });
+    this.stopTakeoverTimer();
+    this.setVncModeProperties();
+  }
+
+  sendRemoteEnter() {
+    if (!this.vncInputEnabled() || !this.rfb) return;
+    this.rfb.sendKey(XK_RETURN, 'Enter');
+    this.rfb.focus({ preventScroll: true });
+  }
+
   refreshTakeoverStatus() {
+    const epoch = this.takeoverEpoch;
+    const request = ++this.takeoverStatusRequest;
     this.api
       .getTakeoverStatus()
       .pipe(catchError(() => of(null)))
       .subscribe({
         next: (status) => {
-          if (status) {
-            this.takeoverStatus.set(status);
-            if (status.is_takeover_active) {
-              this.startTakeoverTimer();
-            } else {
-              this.stopTakeoverTimer();
-            }
+          // Ignore responses from before a claim/release, and older requests
+          // superseded by a newer poll. This prevents stale lease state from
+          // changing input permissions after a newer mutation succeeded.
+          if (epoch !== this.takeoverEpoch || request !== this.takeoverStatusRequest) return;
+          if (!status) {
+            this.markTakeoverInactive();
+            return;
+          }
+          // Once a local release/expiry fence is active, an active response
+          // can only be accepted after a new successful claim. Generation
+          // ordering handles old requests; this guard handles a response that
+          // was already in flight when release completed.
+          if (this.takeoverInputRevoked && status.is_takeover_active) return;
+          this.takeoverInputRevoked = !status.is_takeover_active;
+          this.takeoverStatus.set(status);
+          this.setVncModeProperties();
+          if (status.is_takeover_active) {
+            this.startTakeoverTimer();
+          } else {
+            this.stopTakeoverTimer();
           }
         },
       });
@@ -1848,7 +2151,8 @@ export class App implements OnInit, OnDestroy {
     this.takeoverTimerId = setInterval(() => {
       const current = this.takeoverCountdown();
       if (current <= 1) {
-        this.stopTakeoverTimer();
+        this.takeoverEpoch += 1;
+        this.markTakeoverInactive();
         this.refreshTakeoverStatus();
       } else {
         this.takeoverCountdown.set(current - 1);
@@ -1864,8 +2168,12 @@ export class App implements OnInit, OnDestroy {
   }
 
   openTakeoverModal() {
+    this.chooseDefaultVncMode();
+    this.vncConnection.set('idle');
+    this.vncError.set(null);
+    this.vncRetryCount.set(0);
     this.vncModalOpen.set(true);
-    if (this.takeoverStatus()?.is_takeover_active) {
+    if (this.takeoverStatus()?.is_takeover_active && !this.takeoverInputRevoked) {
       this.refreshTakeoverStatus();
     } else {
       this.claimTakeover();
@@ -1873,20 +2181,28 @@ export class App implements OnInit, OnDestroy {
   }
 
   closeTakeoverModal() {
+    this.disconnectRfb();
+    this.vncTarget = undefined;
+    this.vncModeManuallySelected.set(false);
     this.vncModalOpen.set(false);
     this.activeTakeoverJobId.set(null);
   }
 
   claimTakeover() {
+    const epoch = ++this.takeoverEpoch;
     this.isClaimingTakeover.set(true);
     this.api.claimTakeover('operator', 300).subscribe({
       next: (res) => {
+        if (epoch !== this.takeoverEpoch) return;
+        this.takeoverInputRevoked = false;
         this.showToast('Exclusive operator takeover claimed! Automation paused.', 'warning');
         this.isClaimingTakeover.set(false);
         this.takeoverCountdown.set(res.lease_seconds || 300);
         this.refreshTakeoverStatus();
       },
       error: (err) => {
+        if (epoch !== this.takeoverEpoch) return;
+        this.markTakeoverInactive();
         this.showToast(classifyHttpError(err).message || 'Failed to claim takeover lease', 'error');
         this.isClaimingTakeover.set(false);
       },
@@ -1894,9 +2210,13 @@ export class App implements OnInit, OnDestroy {
   }
 
   releaseTakeover() {
+    if (!this.takeoverOwnerActionEnabled()) return;
+    const epoch = ++this.takeoverEpoch;
     this.isReleasingTakeover.set(true);
+    this.markTakeoverInactive();
     this.api.releaseTakeover('operator', false).subscribe({
       next: () => {
+        if (epoch !== this.takeoverEpoch) return;
         this.showToast(
           'Takeover lease released. Automation remains paused awaiting safe resume revalidation.',
           'info',
@@ -1906,6 +2226,7 @@ export class App implements OnInit, OnDestroy {
         this.refreshTakeoverStatus();
       },
       error: (err) => {
+        if (epoch !== this.takeoverEpoch) return;
         this.showToast(classifyHttpError(err).message || 'Failed to release takeover', 'error');
         this.isReleasingTakeover.set(false);
       },
@@ -1913,6 +2234,7 @@ export class App implements OnInit, OnDestroy {
   }
 
   reopenAuthSession() {
+    if (!this.takeoverOwnerActionEnabled()) return;
     this.isReopeningAuth.set(true);
     const jobId =
       this.activeTakeoverJobId() ||
@@ -1939,6 +2261,7 @@ export class App implements OnInit, OnDestroy {
   }
 
   resumeFromTakeover() {
+    if (!this.takeoverOwnerActionEnabled()) return;
     this.isResumingTakeover.set(true);
     const jobId =
       this.activeTakeoverJobId() ||

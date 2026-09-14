@@ -607,7 +607,7 @@
           <button
             *ngIf="notifService.isPaused() && !notifService.isStopped()"
             (click)="resumeAutomation()"
-            [disabled]="isResumingAutomation()"
+            [disabled]="isResumingAutomation() || !takeoverOwnerActionEnabled()"
             class="px-3.5 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs rounded-xl transition shadow flex items-center gap-1.5 disabled:opacity-50"
             title="Perform safe revalidation and resume automation"
           >
@@ -657,7 +657,7 @@
           <button
             *ngIf="!notifService.isStopped()"
             (click)="stopAutomation()"
-            [disabled]="isStoppingAutomation()"
+            [disabled]="isStoppingAutomation() || !takeoverOwnerActionEnabled()"
             class="px-3 py-1.5 bg-rose-950/80 hover:bg-rose-900 text-rose-300 border border-rose-800 rounded-xl text-xs font-medium flex items-center gap-1.5 transition shadow"
             title="Emergency halt all automation"
           >
@@ -818,7 +818,7 @@
           <button
             *ngIf="!notifService.isPaused()"
             (click)="pauseAutomation()"
-            [disabled]="isPausingAutomation()"
+            [disabled]="isPausingAutomation() || !runtimeActionEnabled()"
             class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-amber-400 rounded-lg font-medium transition flex items-center gap-1.5"
             title="Pause automation workers"
           >
@@ -828,7 +828,7 @@
           <button
             *ngIf="notifService.isPaused() && !notifService.isStopped()"
             (click)="resumeAutomation()"
-            [disabled]="isResumingAutomation()"
+            [disabled]="isResumingAutomation() || !takeoverOwnerActionEnabled()"
             class="px-2.5 py-1 bg-emerald-950 hover:bg-emerald-900 border border-emerald-800 text-emerald-300 rounded-lg font-medium transition flex items-center gap-1.5"
             title="Resume automation after safe revalidation"
           >
@@ -838,7 +838,7 @@
           <button
             *ngIf="!notifService.isStopped()"
             (click)="stopAutomation()"
-            [disabled]="isStoppingAutomation()"
+            [disabled]="isStoppingAutomation() || !takeoverOwnerActionEnabled()"
             class="px-2.5 py-1 bg-rose-950/60 hover:bg-rose-900 border border-rose-800 text-rose-300 rounded-lg font-medium transition flex items-center gap-1.5"
             title="Emergency halt all worker processes"
           >
@@ -847,9 +847,9 @@
           </button>
           <button
             (click)="clearAutomationState()"
-            [disabled]="isClearingAutomationState()"
+            [disabled]="isClearingAutomationState() || !takeoverOwnerActionEnabled()"
             class="px-2.5 py-1 bg-amber-950/50 hover:bg-amber-900/60 border border-amber-800 text-amber-300 rounded-lg font-medium transition flex items-center gap-1.5"
-            title="Reset stuck jobs, clear emergency stop, and close orphaned browser sessions"
+            title="Recover pre-submit jobs; ambiguous submissions remain blocked for explicit resolution"
           >
             <app-icon
               name="rotate-ccw"
@@ -906,7 +906,8 @@
           />
           <button
             type="submit"
-            class="px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-xl text-xs font-bold transition shadow whitespace-nowrap"
+            [disabled]="!takeoverOwnerActionEnabled()"
+            class="px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-xl text-xs font-bold transition shadow whitespace-nowrap disabled:opacity-50"
           >
             Submit Code
           </button>
@@ -3009,94 +3010,155 @@
   <div
     *ngIf="vncModalOpen()"
     class="modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-0 sm:p-4 bg-slate-950/90 backdrop-blur-md"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="vnc-viewer-title"
   >
     <div
+      #vncDialog
       class="vnc-dialog bg-slate-900 border-0 sm:border border-slate-800 w-full max-w-6xl h-[100dvh] max-h-[100dvh] sm:h-[94vh] rounded-none sm:rounded-3xl overflow-hidden shadow-2xl flex flex-col"
+      tabindex="-1"
     >
-      <!-- Streamlined Header Bar -->
       <div
-        class="p-2 sm:px-4 border-b border-slate-800 flex items-center justify-between gap-2 bg-slate-950 shrink-0"
+        class="p-2 sm:px-4 border-b border-slate-800 bg-slate-950 shrink-0 space-y-2 safe-area-top"
       >
-        <div class="flex items-center space-x-2.5 min-w-0">
-          <div
-            class="w-7 h-7 rounded-xl bg-teal-500/20 border border-teal-500/30 flex items-center justify-center text-teal-400 shrink-0"
-          >
-            <app-icon name="monitor" className="w-4 h-4"></app-icon>
-          </div>
-          <div class="flex items-center gap-2 min-w-0">
-            <h3 class="text-xs sm:text-sm font-bold text-white truncate">Browser Automation</h3>
-            <span
-              class="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold uppercase tracking-wider border shrink-0"
-              [ngClass]="{
-                'bg-emerald-950 text-emerald-300 border-emerald-800':
-                  takeoverStatus()?.is_takeover_active,
-                'bg-slate-800 text-slate-300 border-slate-700':
-                  !takeoverStatus()?.is_takeover_active,
-              }"
-            >
-              {{
-                takeoverStatus()?.is_takeover_active
-                  ? 'Operator Control Active' +
-                    (takeoverCountdown() ? ' (' + takeoverCountdown() + 's)' : '')
-                  : 'Connecting...'
-              }}
+        <div class="flex flex-wrap items-center gap-2">
+          <div class="flex min-w-0 flex-1 items-center gap-2">
+            <app-icon name="monitor" className="w-5 h-5 text-teal-400 shrink-0"></app-icon>
+            <h3 id="vnc-viewer-title" class="text-xs sm:text-sm font-bold text-white truncate">
+              Browser Automation
+            </h3>
+            <span class="text-[11px] font-semibold text-slate-300" role="status" aria-live="polite">
+              {{ vncConnectionLabel() }}
             </span>
           </div>
+          <div
+            class="flex w-full flex-wrap items-center gap-1.5 sm:w-auto sm:justify-end"
+            aria-label="Takeover actions"
+          >
+            <button
+              *ngIf="isAuthenticationWaiting()"
+              (click)="reopenAuthSession()"
+              [disabled]="isReopeningAuth() || !takeoverOwnerActionEnabled()"
+              class="min-h-11 flex-1 whitespace-nowrap px-3 bg-sky-600 hover:bg-sky-500 text-white font-bold text-xs rounded-xl disabled:opacity-50 sm:flex-none"
+              title="Start a fresh controlled browser session for operator authentication"
+            >
+              Reopen Authentication
+            </button>
+            <button
+              (click)="releaseTakeover()"
+              [disabled]="isReleasingTakeover() || !takeoverOwnerActionEnabled()"
+              class="min-h-11 flex-1 whitespace-nowrap px-3 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs rounded-xl disabled:opacity-50 sm:flex-none"
+              title="Release operator input without resuming automation"
+            >
+              {{ isReleasingTakeover() ? 'Releasing...' : 'Release Control' }}
+            </button>
+            <button
+              (click)="resumeFromTakeover()"
+              [disabled]="isResumingTakeover() || !takeoverOwnerActionEnabled()"
+              class="min-h-11 flex-1 whitespace-nowrap px-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl disabled:opacity-50 sm:flex-none"
+              title="Revalidate page domain, challenge completion, and resume automation"
+            >
+              {{ isResumingTakeover() ? 'Resuming...' : 'Resume Automation' }}
+            </button>
+            <button
+              (click)="closeTakeoverModal()"
+              class="min-h-11 min-w-11 px-2 text-slate-300 hover:text-white rounded-xl hover:bg-slate-800"
+              title="Close viewer without resuming automation"
+              aria-label="Close viewer"
+            >
+              <app-icon name="x" className="w-5 h-5"></app-icon>
+            </button>
+          </div>
         </div>
-
-        <!-- Actionable Controls -->
-        <div class="flex items-center gap-1.5 sm:gap-2 shrink-0">
-          <!-- Reopen a closed authentication session without bypassing revalidation -->
+        <div class="flex flex-wrap items-center gap-2 text-xs" aria-label="Remote browser controls">
           <button
-            *ngIf="isAuthenticationWaiting()"
-            (click)="reopenAuthSession()"
-            [disabled]="isReopeningAuth()"
-            class="px-2.5 sm:px-3 py-1.5 bg-sky-600 hover:bg-sky-500 text-white font-bold text-xs rounded-xl transition shadow flex items-center gap-1.5 disabled:opacity-50"
-            title="Start a fresh controlled browser session for operator authentication"
+            (click)="setVncMode('pan')"
+            [attr.aria-pressed]="vncMode() === 'pan'"
+            class="min-h-11 px-3 rounded-xl border font-semibold"
+            [ngClass]="
+              vncMode() === 'pan'
+                ? 'bg-teal-600 border-teal-400 text-white'
+                : 'bg-slate-900 border-slate-700 text-slate-300'
+            "
           >
-            <app-icon name="refresh-cw" className="w-3.5 h-3.5"></app-icon>
-            <span class="hidden sm:inline">{{
-              isReopeningAuth() ? 'Reopening...' : 'Reopen Authentication'
-            }}</span>
-            <span class="sm:hidden">Reopen</span>
+            Readable Pan (1:1)
           </button>
-
-          <!-- Resume Automation -->
           <button
-            (click)="resumeFromTakeover()"
-            [disabled]="isResumingTakeover()"
-            class="px-3 sm:px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl transition shadow flex items-center gap-1.5 disabled:opacity-50"
-            title="Revalidate page domain, challenge completion, and resume automation"
+            (click)="setVncMode('fit')"
+            [attr.aria-pressed]="vncMode() === 'fit'"
+            class="min-h-11 px-3 rounded-xl border font-semibold"
+            [ngClass]="
+              vncMode() === 'fit'
+                ? 'bg-teal-600 border-teal-400 text-white'
+                : 'bg-slate-900 border-slate-700 text-slate-300'
+            "
           >
-            <app-icon name="play" className="w-3.5 h-3.5 fill-current"></app-icon>
-            <span>{{ isResumingTakeover() ? 'Resuming...' : 'Resume Automation' }}</span>
+            Fit Overview
           </button>
-
-          <div class="h-4 w-px bg-slate-800"></div>
-
-          <!-- Close Modal -->
           <button
-            (click)="closeTakeoverModal()"
-            class="p-1.5 text-slate-400 hover:text-white rounded-xl hover:bg-slate-800 transition"
-            title="Close viewer"
-            aria-label="Close viewer"
+            (click)="sendRemotePage('up')"
+            [disabled]="!vncInputEnabled()"
+            aria-label="Remote Page Up"
+            class="min-h-11 px-3 rounded-xl bg-slate-800 text-white font-semibold disabled:opacity-40"
           >
-            <app-icon name="x" className="w-5 h-5"></app-icon>
+            Page Up
+          </button>
+          <button
+            (click)="sendRemotePage('down')"
+            [disabled]="!vncInputEnabled()"
+            aria-label="Remote Page Down"
+            class="min-h-11 px-3 rounded-xl bg-slate-800 text-white font-semibold disabled:opacity-40"
+          >
+            Page Down
+          </button>
+          <button
+            *ngIf="vncConnection() === 'disconnected' || vncConnection() === 'error'"
+            (click)="retryVncConnection()"
+            class="min-h-11 px-3 rounded-xl bg-amber-600 text-white font-semibold"
+          >
+            Retry connection
           </button>
         </div>
+        <div class="flex flex-wrap gap-2 items-end">
+          <label class="sr-only" for="remote-text-input">Text to send to remote browser</label>
+          <textarea
+            id="remote-text-input"
+            rows="1"
+            [(ngModel)]="vncInputText"
+            [disabled]="!vncInputEnabled()"
+            placeholder="Text to send to remote browser"
+            class="w-full min-w-0 min-h-11 bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white disabled:opacity-40 sm:flex-1"
+          ></textarea>
+          <button
+            (click)="pasteTextToRemote()"
+            [disabled]="!vncInputEnabled() || !vncInputText()"
+            class="min-h-11 flex-1 whitespace-nowrap px-3 rounded-xl bg-indigo-600 text-white font-semibold disabled:opacity-40 sm:flex-none"
+          >
+            Paste text to remote
+          </button>
+          <button
+            (click)="sendRemoteEnter()"
+            [disabled]="!vncInputEnabled()"
+            class="min-h-11 flex-1 whitespace-nowrap px-3 rounded-xl bg-slate-800 text-white font-semibold disabled:opacity-40 sm:flex-none"
+          >
+            Enter
+          </button>
+        </div>
+        <p class="text-[11px] text-slate-400">
+          Readable Pan keeps the remote desktop at 1:1 and lets noVNC drag the clipped viewport. Fit
+          Overview shows the whole desktop smaller. Text is sent to the connected remote browser.
+        </p>
       </div>
-
-      <!-- noVNC iframe Canvas Area (100% of remaining height) -->
       <div
-        class="flex-1 bg-black relative overflow-hidden"
+        class="flex-1 min-h-0 bg-black relative overflow-hidden"
         style="touch-action: none; overscroll-behavior: contain"
       >
-        <iframe
-          [src]="vncUrl()"
-          class="w-full h-full border-0"
-          allow="clipboard-read; clipboard-write; fullscreen"
-          title="noVNC Browser Display"
-        ></iframe>
+        <div
+          #vncTarget
+          class="vnc-target w-full h-full min-h-0"
+          aria-label="Remote browser display"
+        ></div>
       </div>
     </div>
   </div>
