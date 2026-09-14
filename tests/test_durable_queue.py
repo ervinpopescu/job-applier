@@ -4,7 +4,9 @@ from job_applier.ops.emergency_stop import emergency_stop
 from job_applier.automation.queue import get_connection
 from job_applier.automation.queue import reconcile_stranded_jobs
 from job_applier.cli.worker import run_worker_loop
+import job_applier.cli.worker as worker_module
 
+import threading
 import time
 from pathlib import Path
 
@@ -22,6 +24,7 @@ from job_applier.automation.queue import (
     get_runtime_control,
     handle_job_failure,
     record_submit_intent,
+    repair_ambiguous_projections,
     renew_lease,
     resolve_job,
     set_runtime_pause,
@@ -31,6 +34,48 @@ from job_applier.automation.queue import (
 )
 from job_applier.automation.runtime_lock import RuntimeSingletonLock, WorkerLockError
 from job_applier.db import init_db, upsert_application
+
+
+def test_transition_with_live_lease_rejects_expired_claim(tmp_path: Path):
+    db_file = tmp_path / "expired_transition.db"
+    init_db(custom_path=db_file)
+    upsert_application(
+        "app-expired-transition",
+        "Expiry Corp",
+        "Engineer",
+        "https://expiry.example/job/1",
+        custom_path=db_file,
+    )
+    job = enqueue_job("app-expired-transition", adapter="generic", custom_path=db_file)
+    claimed = claim_next_job("worker-expired", custom_path=db_file)
+    assert claimed is not None
+
+    conn = get_connection(db_file)
+    with conn:
+        conn.execute(
+            "UPDATE automation_jobs SET lease_expires_at = datetime('now', '-1 second') WHERE id = ?;",
+            (job.id,),
+        )
+    conn.close()
+
+    assert (
+        transition_job(
+            job.id,
+            "worker-expired",
+            claimed.fencing_generation,
+            JobState.APPLIED.value,
+            require_live_lease=True,
+            custom_path=db_file,
+        )
+        is False
+    )
+
+    conn = get_connection(db_file)
+    row = conn.execute(
+        "SELECT state FROM automation_jobs WHERE id = ?;", (job.id,)
+    ).fetchone()
+    conn.close()
+    assert row["state"] == JobState.CLAIMED.value
 
 
 def test_enqueue_and_atomic_claim(tmp_path: Path):
@@ -161,6 +206,116 @@ def test_lease_heartbeat_renewal(tmp_path: Path):
         custom_path=db_file,
     )
     assert wrong_gen is False
+
+
+def test_renew_lease_samples_time_after_waiting_for_queue_lock(tmp_path: Path):
+    db_file = tmp_path / "delayed-heartbeat.db"
+    init_db(custom_path=db_file)
+    upsert_application(
+        "delayed-hb-app",
+        "Delayed HB",
+        "Engineer",
+        "https://delayed-hb.example",
+        custom_path=db_file,
+    )
+    enqueue_job("delayed-hb-app", custom_path=db_file)
+    claimed = claim_next_job("worker-delayed", lease_seconds=1, custom_path=db_file)
+    assert claimed is not None
+
+    # Force the renewal thread to wait long enough for the lease to expire.
+    # A pre-lock timestamp would incorrectly renew this claim after release.
+    from job_applier.automation import queue as queue_module
+
+    acquired = threading.Event()
+    result: list[bool] = []
+    queue_module._QUEUE_LOCK.acquire()
+    try:
+
+        def renew() -> None:
+            acquired.set()
+            result.append(
+                renew_lease(
+                    claimed.id,
+                    "worker-delayed",
+                    claimed.fencing_generation,
+                    lease_seconds=60,
+                    custom_path=db_file,
+                )
+            )
+
+        thread = threading.Thread(target=renew)
+        thread.start()
+        assert acquired.wait(timeout=1)
+        time.sleep(1.2)
+    finally:
+        queue_module._QUEUE_LOCK.release()
+    thread.join(timeout=2)
+    assert result == [False]
+
+
+def test_renew_lease_rejects_expired_claim(tmp_path: Path):
+    db_file = tmp_path / "expired-heartbeat.db"
+    init_db(custom_path=db_file)
+    upsert_application(
+        "expired-hb-app",
+        "Expired HB",
+        "Engineer",
+        "https://expired-hb.example",
+        custom_path=db_file,
+    )
+    enqueue_job("expired-hb-app", custom_path=db_file)
+    claimed = claim_next_job("worker-expired", lease_seconds=1, custom_path=db_file)
+    assert claimed is not None
+    time.sleep(1.1)
+    assert not renew_lease(
+        claimed.id,
+        "worker-expired",
+        claimed.fencing_generation,
+        lease_seconds=60,
+        custom_path=db_file,
+    )
+
+
+def test_submit_intent_rejects_attempt_owned_by_other_generation(tmp_path: Path):
+    db_file = tmp_path / "wrong-attempt-owner.db"
+    init_db(custom_path=db_file)
+    upsert_application(
+        "attempt-owner-app",
+        "Attempt Owner",
+        "Engineer",
+        "https://attempt-owner.example",
+        custom_path=db_file,
+    )
+    enqueue_job("attempt-owner-app", custom_path=db_file)
+    claimed = claim_next_job("worker-owner", custom_path=db_file)
+    assert claimed is not None
+    attempt = create_attempt(
+        claimed.id,
+        claimed.app_id,
+        worker_id="different-worker",
+        lease_generation=claimed.fencing_generation,
+        custom_path=db_file,
+    )
+    assert not record_submit_intent(
+        attempt.id,
+        claimed.id,
+        "worker-owner",
+        claimed.fencing_generation,
+        custom_path=db_file,
+    )
+    conn = get_connection(db_file)
+    try:
+        job_row = conn.execute(
+            "SELECT state FROM automation_jobs WHERE id = ?;", (claimed.id,)
+        ).fetchone()
+        attempt_row = conn.execute(
+            "SELECT submit_intent_at FROM application_attempts WHERE id = ?;",
+            (attempt.id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert job_row["state"] == JobState.CLAIMED.value
+    assert attempt_row["submit_intent_at"] is None
 
 
 def test_runtime_singleton_lock(tmp_path: Path):
@@ -314,6 +469,8 @@ def test_submit_intent_persisted_and_no_blind_retry(tmp_path: Path):
         app_id="intent-app",
         profile_snapshot={"name": "Test User"},
         resume_snapshot="resume text",
+        worker_id=worker,
+        lease_generation=claimed.fencing_generation,
         custom_path=db_file,
     )
     assert attempt.id.startswith("att_")
@@ -606,6 +763,79 @@ def test_reconcile_stranded_jobs_on_startup(tmp_path: Path):
     # Verify worker was paused
     ctrl = get_runtime_control(db_file)
     assert ctrl["is_paused"] is True
+
+
+def test_active_worker_sweeper_recovers_expired_submission_without_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    db_file = tmp_path / "active-sweeper.db"
+    init_db(db_file)
+    upsert_application(
+        app_id="app-active-sweeper",
+        company="Active Sweeper Corp",
+        title="Engineer",
+        job_url="https://sweeper.example/job/1",
+        custom_path=db_file,
+    )
+    job = enqueue_job("app-active-sweeper", adapter="greenhouse", custom_path=db_file)
+    conn = get_connection(db_file)
+    with conn:
+        conn.execute(
+            "UPDATE automation_jobs SET state = 'submit_intent', lease_owner = 'lost-worker', lease_expires_at = datetime('now', '-1 second') WHERE id = ?;",
+            (job.id,),
+        )
+    conn.close()
+    create_attempt(
+        job.id,
+        "app-active-sweeper",
+        custom_path=db_file,
+        worker_id="lost-worker",
+        lease_generation=job.fencing_generation,
+    )
+
+    stop_event = threading.Event()
+    calls: list[int] = []
+    real_reconcile = worker_module.reconcile_stranded_jobs
+
+    def reconcile_after_startup(path: Path | None = None) -> list[str]:
+        calls.append(1)
+        if len(calls) == 1:
+            return []
+        recovered = real_reconcile(path)
+        stop_event.set()
+        return recovered
+
+    monkeypatch.setattr(
+        worker_module, "reconcile_stranded_jobs", reconcile_after_startup
+    )
+    monkeypatch.setattr(worker_module, "STRANDED_RECONCILIATION_INTERVAL_SECONDS", 0.0)
+
+    assert (
+        run_worker_loop(
+            worker_id="active-sweeper-worker",
+            poll_interval=0,
+            custom_db_path=db_file,
+            skip_lock=True,
+            stop_event=stop_event,
+        )
+        == 0
+    )
+    assert len(calls) >= 2
+
+    conn = get_connection(db_file)
+    row = conn.execute(
+        "SELECT state FROM automation_jobs WHERE id = ?;", (job.id,)
+    ).fetchone()
+    attempt = conn.execute(
+        "SELECT is_ambiguous, error_details FROM application_attempts WHERE job_id = ? ORDER BY created_at DESC LIMIT 1",
+        (job.id,),
+    ).fetchone()
+    conn.close()
+    assert row["state"] == JobState.AMBIGUOUS_SUBMISSION.value
+    assert attempt["is_ambiguous"] == 1
+    assert "active sweeper" in attempt["error_details"]
+    assert get_runtime_control(db_file)["is_paused"] is True
+    assert claim_next_job("replacement-worker", custom_path=db_file) is None
 
 
 def test_verifying_state_transition(tmp_path: Path):
@@ -1217,6 +1447,180 @@ def test_skip_cancel_resolve_job_by_app_id_and_job_id(tmp_path: Path):
     conn.close()
 
 
+def test_skip_vs_submit_fence_both_orderings(tmp_path: Path):
+    """Skip wins before intent; intent wins then skip preserves ambiguity."""
+    from job_applier.automation.queue import create_attempt, record_submit_intent
+
+    db_file = tmp_path / "skip-submit-race.db"
+    init_db(custom_path=db_file)
+    for app_id in ("app-skip-first", "app-submit-first"):
+        upsert_application(
+            app_id=app_id,
+            company="Race Corp",
+            title="Engineer",
+            job_url=f"https://example.com/{app_id}",
+            custom_path=db_file,
+        )
+        enqueue_job(app_id, adapter="greenhouse", custom_path=db_file)
+
+    skip_first = claim_next_job("skip-worker", custom_path=db_file)
+    assert skip_first is not None
+    assert skip_job(skip_first.id, reason="operator won race", custom_path=db_file)
+    attempt = create_attempt(
+        skip_first.id,
+        skip_first.app_id,
+        custom_path=db_file,
+        worker_id="skip-worker",
+        lease_generation=skip_first.fencing_generation,
+    )
+    assert not record_submit_intent(
+        attempt.id,
+        skip_first.id,
+        "skip-worker",
+        skip_first.fencing_generation,
+        custom_path=db_file,
+    )
+
+    submit_first = claim_next_job("submit-worker", custom_path=db_file)
+    assert submit_first is not None
+    attempt = create_attempt(
+        submit_first.id,
+        submit_first.app_id,
+        custom_path=db_file,
+        worker_id="submit-worker",
+        lease_generation=submit_first.fencing_generation,
+    )
+    assert record_submit_intent(
+        attempt.id,
+        submit_first.id,
+        "submit-worker",
+        submit_first.fencing_generation,
+        custom_path=db_file,
+    )
+    assert skip_job(
+        submit_first.id, reason="operator won after intent", custom_path=db_file
+    )
+    conn = get_connection(db_file)
+    row = conn.execute(
+        "SELECT state, is_cancelled FROM automation_jobs WHERE id = ?;",
+        (submit_first.id,),
+    ).fetchone()
+    attempt_row = conn.execute(
+        "SELECT outcome, is_ambiguous, completed_at FROM application_attempts WHERE id = ?;",
+        (attempt.id,),
+    ).fetchone()
+    conn.close()
+    assert row["state"] == "ambiguous_submission"
+    assert row["is_cancelled"] == 0
+    assert attempt_row["outcome"] == "ambiguous"
+    assert attempt_row["is_ambiguous"] == 1
+
+
+def test_ambiguous_projection_recovery_is_idempotent(tmp_path: Path):
+    from job_applier.automation.queue import repair_ambiguous_projections
+
+    db_file = tmp_path / "ambiguous-repair.db"
+    init_db(custom_path=db_file)
+    upsert_application(
+        app_id="app-repair",
+        company="Repair Corp",
+        title="Engineer",
+        job_url="https://example.com/repair",
+        custom_path=db_file,
+    )
+    job = enqueue_job("app-repair", adapter="lever", custom_path=db_file)
+    conn = get_connection(db_file)
+    with conn:
+        conn.execute(
+            "UPDATE automation_jobs SET state = 'ambiguous_submission', error_code = 'CRASH' WHERE id = ?;",
+            (job.id,),
+        )
+        conn.execute(
+            "INSERT INTO application_attempts (id, job_id, app_id, attempt_number, profile_snapshot, resume_snapshot, artifact_revisions, started_at, created_at) VALUES ('att-repair', ?, ?, 1, '{}', '', '{}', datetime('now'), datetime('now'));",
+            (job.id, job.app_id),
+        )
+    assert repair_ambiguous_projections(custom_path=db_file) == [job.id]
+    assert repair_ambiguous_projections(custom_path=db_file) == []
+    conn = get_connection(db_file)
+    row = conn.execute(
+        "SELECT state FROM automation_jobs WHERE id = ?;", (job.id,)
+    ).fetchone()
+    attempt = conn.execute(
+        "SELECT outcome, is_ambiguous FROM application_attempts WHERE id = 'att-repair';"
+    ).fetchone()
+    app = conn.execute(
+        "SELECT status FROM applications WHERE id = ?;", (job.app_id,)
+    ).fetchone()
+    events = conn.execute(
+        "SELECT COUNT(*) AS count FROM automation_events WHERE job_id = ? AND event_type = 'ambiguous_submission';",
+        (job.id,),
+    ).fetchone()
+    outbox = conn.execute(
+        "SELECT COUNT(*) AS count FROM notification_outbox WHERE dedup_key = ?;",
+        (f"ambiguous_submission:{job.id}",),
+    ).fetchone()
+    conn.close()
+    assert row["state"] == "ambiguous_submission"
+    assert attempt["outcome"] == "ambiguous" and attempt["is_ambiguous"] == 1
+    assert app["status"] == "ambiguous"
+    assert events["count"] == 1 and outbox["count"] == 1
+
+
+def test_resolving_skipped_job_clears_cancellation_and_reclaims(tmp_path: Path):
+    db_file = tmp_path / "resolve-skipped.db"
+    init_db(custom_path=db_file)
+    upsert_application(
+        app_id="app-resolve-skipped",
+        company="Skip Corp",
+        title="Engineer",
+        job_url="https://example.com/skip",
+        custom_path=db_file,
+    )
+    job = enqueue_job("app-resolve-skipped", custom_path=db_file)
+    assert skip_job(job.id, reason="operator skip", custom_path=db_file)
+    assert resolve_job(job.id, resolution_type="continue", custom_path=db_file)
+    conn = get_connection(db_file)
+    row = conn.execute(
+        "SELECT state, is_cancelled FROM automation_jobs WHERE id = ?;", (job.id,)
+    ).fetchone()
+    app = conn.execute(
+        "SELECT status FROM applications WHERE id = ?;", (job.app_id,)
+    ).fetchone()
+    conn.close()
+    assert row["state"] == "ready" and row["is_cancelled"] == 0
+    assert app["status"] == "pending"
+    reclaimed = claim_next_job("reclaim-skipped", custom_path=db_file)
+    assert reclaimed is not None and reclaimed.id == job.id
+
+
+def test_ambiguous_repair_without_attempt_is_idempotent(tmp_path: Path):
+    db_file = tmp_path / "ambiguous-no-attempt.db"
+    init_db(custom_path=db_file)
+    upsert_application(
+        app_id="app-no-attempt",
+        company="Repair Corp",
+        title="Engineer",
+        job_url="https://example.com/no-attempt",
+        custom_path=db_file,
+    )
+    job = enqueue_job("app-no-attempt", custom_path=db_file)
+    conn = get_connection(db_file)
+    with conn:
+        conn.execute(
+            "UPDATE automation_jobs SET state = 'ambiguous_submission' WHERE id = ?;",
+            (job.id,),
+        )
+    assert repair_ambiguous_projections(custom_path=db_file) == [job.id]
+    assert repair_ambiguous_projections(custom_path=db_file) == []
+    conn = get_connection(db_file)
+    event_count = conn.execute(
+        "SELECT COUNT(*) AS count FROM automation_events WHERE job_id = ? AND event_key = ?;",
+        (job.id, f"projection_repair:{job.id}"),
+    ).fetchone()["count"]
+    conn.close()
+    assert event_count == 1
+
+
 def test_skip_and_cancel_application_without_automation_job(tmp_path: Path):
     from job_applier.automation.queue import cancel_job, skip_job
 
@@ -1263,7 +1667,7 @@ def test_skip_and_cancel_application_without_automation_job(tmp_path: Path):
 
 
 def test_ensure_runtime_control_columns_on_legacy_table(tmp_path: Path):
-    """Verifies that init_db idempotently ensures all 7 runtime_control columns on legacy databases."""
+    """Verifies that init_db idempotently ensures runtime browser control columns on legacy databases."""
     db_file = tmp_path / "legacy_rc.db"
     conn = get_connection(db_file)
     with conn:
@@ -1299,6 +1703,7 @@ def test_ensure_runtime_control_columns_on_legacy_table(tmp_path: Path):
         "browser_page_text",
         "browser_is_closed",
         "browser_updated_at",
+        "browser_shutdown_generation",
     }
     assert expected_cols.issubset(cols)
 

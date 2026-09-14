@@ -17,10 +17,13 @@ from job_applier.automation.adapters.models import ConfirmationEvidence
 from job_applier.automation.candidate_profile import CandidateProfile
 from job_applier.automation.queue import (
     JobState,
+    SUBMIT_LEASE_MARGIN_SECONDS,
     claim_next_job,
     create_attempt,
     enqueue_job,
     get_runtime_control,
+    handle_job_failure,
+    record_submit_intent,
     set_runtime_pause,
     validate_application_artifacts,
 )
@@ -560,6 +563,70 @@ def test_reconcile_confirmed_submission_records_applied(test_env):
     assert app_row["status"] == "applied"
 
 
+def test_reconcile_confirmed_rejected_transition_does_not_project_stale_success(
+    test_env, monkeypatch: pytest.MonkeyPatch
+):
+    db = test_env["db"]
+    enqueue_job(test_env["app_id"], adapter="greenhouse", custom_path=db)
+    claimed = claim_next_job("worker-1", lease_seconds=60, custom_path=db)
+    assert claimed is not None
+    attempt = create_attempt(
+        job_id=claimed.id,
+        app_id=test_env["app_id"],
+        profile_snapshot={},
+        resume_snapshot="",
+        artifact_revisions={},
+        custom_path=db,
+    )
+    evidence = ConfirmationEvidence(
+        platform="greenhouse",
+        adapter_version="1.0.0",
+        confirmed=True,
+        confirmation_text="stale confirmation",
+    )
+    monkeypatch.setattr(
+        "job_applier.automation.safety_guard.transition_job", lambda **_: False
+    )
+
+    status, message = SubmissionSafetyGuard.reconcile_submission_outcome(
+        job_id=claimed.id,
+        app_id=test_env["app_id"],
+        attempt_id=attempt.id,
+        worker_id="worker-1",
+        generation=claimed.fencing_generation,
+        adapter_name="greenhouse",
+        company="Corp Inc",
+        evidence=evidence,
+        custom_db_path=db,
+    )
+
+    assert status == "lease_lost"
+    assert "fencing" in message.lower()
+    conn = get_connection(db)
+    try:
+        job_row = conn.execute(
+            "SELECT state FROM automation_jobs WHERE id = ?", (claimed.id,)
+        ).fetchone()
+        attempt_row = conn.execute(
+            "SELECT outcome, completed_at FROM application_attempts WHERE id = ?",
+            (attempt.id,),
+        ).fetchone()
+        app_row = conn.execute(
+            "SELECT status FROM applications WHERE id = ?", (test_env["app_id"],)
+        ).fetchone()
+        event_row = conn.execute(
+            "SELECT COUNT(*) AS count FROM automation_events WHERE job_id = ? AND event_type = 'application_applied'",
+            (claimed.id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert job_row["state"] == "claimed"
+    assert attempt_row["outcome"] is None
+    assert attempt_row["completed_at"] is None
+    assert app_row["status"] == "pending"
+    assert event_row["count"] == 0
+
+
 def test_worker_reconciles_submission_outcome_and_updates_pacing(
     tmp_path: Path,
 ):
@@ -574,7 +641,11 @@ def test_worker_reconciles_submission_outcome_and_updates_pacing(
         job_url="https://pacing.example/jobs/1",
         custom_path=db_file,
     )
-    job = enqueue_job("app-rec-1", adapter="greenhouse", custom_path=db_file)
+    enqueue_job("app-rec-1", adapter="greenhouse", custom_path=db_file)
+    job = claim_next_job(
+        worker_id="test_worker_1", lease_seconds=60, custom_path=db_file
+    )
+    assert job is not None
 
     app_dir = tmp_path / "output" / "applications" / "app-rec-1"
     app_dir.mkdir(parents=True, exist_ok=True)
@@ -640,7 +711,9 @@ def test_ambiguous_submission_pauses_worker(tmp_path: Path):
         job_url="https://ambiguous.example/jobs/2",
         custom_path=db_file,
     )
-    job = enqueue_job("app-amb-1", adapter="lever", custom_path=db_file)
+    enqueue_job("app-amb-1", adapter="lever", custom_path=db_file)
+    job = claim_next_job("test_worker_2", lease_seconds=60, custom_path=db_file)
+    assert job is not None
 
     app_dir = tmp_path / "output" / "applications" / "app-amb-1"
     app_dir.mkdir(parents=True, exist_ok=True)
@@ -677,6 +750,51 @@ def test_ambiguous_submission_pauses_worker(tmp_path: Path):
         # Verify runtime control was paused
         ctrl = get_runtime_control(db_file)
         assert ctrl["is_paused"] is True
+
+
+def test_stale_ambiguous_failure_does_not_pause_replacement(tmp_path: Path):
+    db_file = tmp_path / "stale-ambiguous.db"
+    init_db(db_file)
+    upsert_application(
+        "app-stale-ambiguous",
+        "Stale Corp",
+        "Engineer",
+        "https://stale.example/job",
+        custom_path=db_file,
+    )
+    enqueue_job("app-stale-ambiguous", adapter="lever", custom_path=db_file)
+    old_job = claim_next_job("old-worker", lease_seconds=60, custom_path=db_file)
+    assert old_job is not None
+    conn = get_connection(db_file)
+    with conn:
+        conn.execute(
+            "UPDATE automation_jobs SET lease_expires_at = datetime('now', '-1 second') WHERE id = ?",
+            (old_job.id,),
+        )
+    replacement = claim_next_job(
+        "replacement-worker", lease_seconds=60, custom_path=db_file
+    )
+    assert replacement is not None
+    assert replacement.fencing_generation != old_job.fencing_generation
+    result = handle_job_failure(
+        job_id=old_job.id,
+        worker_id="old-worker",
+        generation=old_job.fencing_generation,
+        attempt_id=None,
+        error="late submit outcome",
+        is_pre_submit=False,
+        error_category="ambiguous_submission",
+        custom_path=db_file,
+    )
+    assert result == "lease_lost"
+    assert get_runtime_control(db_file)["is_paused"] == 0
+    conn = get_connection(db_file)
+    row = conn.execute(
+        "SELECT state, lease_owner FROM automation_jobs WHERE id = ?", (old_job.id,)
+    ).fetchone()
+    conn.close()
+    assert row["lease_owner"] == "replacement-worker"
+    assert row["state"] == JobState.CLAIMED.value
 
 
 def test_lost_lease_aborts_before_submit_intent(tmp_path: Path):
@@ -922,7 +1040,10 @@ def test_safe_resume_takeover_records_submission_pacing(tmp_path: Path):
         return_value=(True, ""),
     ):
         res = safe_resume_revalidate(
-            job_id=claimed.id, automator=mock_automator, custom_path=db_file
+            job_id=claimed.id,
+            current_url=mock_page.url,
+            automator=mock_automator,
+            custom_path=db_file,
         )
     assert res["status"] == "success"
     assert res["action"] == "marked_applied"
@@ -1054,6 +1175,192 @@ def test_execute_submit_intent_fails_closed_on_lost_lease(tmp_path: Path):
             attempt_id="att-1",
             worker_id="worker_1",
             generation=99,
+            custom_db_path=db_file,
+        )
+
+
+def test_confirmed_submission_rejects_expired_lease_before_projections(tmp_path: Path):
+    db_file = tmp_path / "expired_submission.db"
+    init_db(db_file)
+    upsert_application(
+        "app-expired-submission",
+        "Expiry Corp",
+        "Engineer",
+        "https://expiry.example/job/1",
+        custom_path=db_file,
+    )
+    job = enqueue_job("app-expired-submission", adapter="generic", custom_path=db_file)
+    claimed = claim_next_job("worker-expired", custom_path=db_file)
+    assert claimed is not None
+
+    conn = get_connection(db_file)
+    with conn:
+        conn.execute(
+            "UPDATE automation_jobs SET lease_expires_at = datetime('now', '-1 second') WHERE id = ?;",
+            (job.id,),
+        )
+    conn.close()
+
+    evidence = ConfirmationEvidence(
+        platform="generic",
+        adapter_version="1.0.0",
+        confirmed=True,
+        confirmation_text="Submitted",
+    )
+    state, _ = SubmissionSafetyGuard.reconcile_submission_outcome(
+        job_id=job.id,
+        app_id="app-expired-submission",
+        attempt_id="missing-attempt",
+        worker_id="worker-expired",
+        generation=claimed.fencing_generation,
+        adapter_name="generic",
+        company="Expiry Corp",
+        evidence=evidence,
+        custom_db_path=db_file,
+    )
+
+    assert state == "lease_lost"
+    conn = get_connection(db_file)
+    job_row = conn.execute(
+        "SELECT state FROM automation_jobs WHERE id = ?;", (job.id,)
+    ).fetchone()
+    app_row = conn.execute(
+        "SELECT status FROM applications WHERE id = ?;",
+        ("app-expired-submission",),
+    ).fetchone()
+    conn.close()
+    assert job_row["state"] == JobState.CLAIMED.value
+    assert app_row["status"] == "pending"
+
+
+def test_submit_intent_rejects_lease_at_exact_expiry_without_projection(tmp_path: Path):
+    db_file = tmp_path / "submit_intent_exact_expiry.db"
+    init_db(db_file)
+    upsert_application(
+        "app-exact-expiry",
+        "Expiry Corp",
+        "Engineer",
+        "https://expiry.example/job/2",
+        custom_path=db_file,
+    )
+    enqueue_job("app-exact-expiry", adapter="greenhouse", custom_path=db_file)
+    claimed = claim_next_job("expiry-worker", custom_path=db_file)
+    assert claimed is not None
+    attempt = create_attempt(
+        job_id=claimed.id,
+        app_id=claimed.app_id,
+        worker_id="expiry-worker",
+        lease_generation=claimed.fencing_generation,
+        custom_path=db_file,
+    )
+
+    conn = get_connection(db_file)
+    with conn:
+        conn.execute(
+            "UPDATE automation_jobs SET lease_expires_at = datetime('now', 'localtime') WHERE id = ?;",
+            (claimed.id,),
+        )
+    conn.close()
+
+    assert not record_submit_intent(
+        attempt_id=attempt.id,
+        job_id=claimed.id,
+        worker_id="expiry-worker",
+        generation=claimed.fencing_generation,
+        custom_path=db_file,
+    )
+
+    conn = get_connection(db_file)
+    job_row = conn.execute(
+        "SELECT state FROM automation_jobs WHERE id = ?;", (claimed.id,)
+    ).fetchone()
+    attempt_row = conn.execute(
+        "SELECT submit_intent_at FROM application_attempts WHERE id = ?;", (attempt.id,)
+    ).fetchone()
+    conn.close()
+    assert job_row["state"] == JobState.CLAIMED.value
+    assert attempt_row["submit_intent_at"] is None
+
+
+def test_submit_intent_requires_configured_live_lease_margin(tmp_path: Path):
+    db_file = tmp_path / "submit_intent_margin.db"
+    init_db(db_file)
+    upsert_application(
+        "app-submit-margin",
+        "Margin Corp",
+        "Engineer",
+        "https://margin.example/job/1",
+        custom_path=db_file,
+    )
+    enqueue_job("app-submit-margin", adapter="greenhouse", custom_path=db_file)
+    claimed = claim_next_job("margin-worker", lease_seconds=60, custom_path=db_file)
+    assert claimed is not None
+    attempt = create_attempt(
+        job_id=claimed.id,
+        app_id=claimed.app_id,
+        worker_id="margin-worker",
+        lease_generation=claimed.fencing_generation,
+        custom_path=db_file,
+    )
+
+    conn = get_connection(db_file)
+    with conn:
+        conn.execute(
+            "UPDATE automation_jobs SET lease_expires_at = datetime('now', 'localtime', ?) WHERE id = ?;",
+            (f"+{SUBMIT_LEASE_MARGIN_SECONDS - 1} seconds", claimed.id),
+        )
+    conn.close()
+
+    assert not record_submit_intent(
+        attempt.id,
+        claimed.id,
+        "margin-worker",
+        claimed.fencing_generation,
+        custom_path=db_file,
+    )
+
+
+def test_final_submit_permit_rejects_reduced_margin(tmp_path: Path):
+    db_file = tmp_path / "final_submit_permit.db"
+    init_db(db_file)
+    upsert_application(
+        "app-final-permit",
+        "Permit Corp",
+        "Engineer",
+        "https://permit.example/job/1",
+        custom_path=db_file,
+    )
+    enqueue_job("app-final-permit", adapter="greenhouse", custom_path=db_file)
+    claimed = claim_next_job("permit-worker", lease_seconds=60, custom_path=db_file)
+    assert claimed is not None
+    attempt = create_attempt(
+        job_id=claimed.id,
+        app_id=claimed.app_id,
+        worker_id="permit-worker",
+        lease_generation=claimed.fencing_generation,
+        custom_path=db_file,
+    )
+    assert record_submit_intent(
+        attempt.id,
+        claimed.id,
+        "permit-worker",
+        claimed.fencing_generation,
+        custom_path=db_file,
+    )
+
+    conn = get_connection(db_file)
+    with conn:
+        conn.execute(
+            "UPDATE automation_jobs SET lease_expires_at = datetime('now', 'localtime', ?) WHERE id = ?;",
+            (f"+{SUBMIT_LEASE_MARGIN_SECONDS - 1} seconds", claimed.id),
+        )
+    conn.close()
+
+    with pytest.raises(FencingOwnershipLostError, match="live-lease margin"):
+        SubmissionSafetyGuard.ensure_submit_permit(
+            claimed.id,
+            "permit-worker",
+            claimed.fencing_generation,
             custom_db_path=db_file,
         )
 

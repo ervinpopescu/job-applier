@@ -83,7 +83,13 @@ def test_submit_intent_event_keeps_application_identity(tmp_path: Path):
     job = enqueue_job("app-obs", custom_path=db)
     claimed = claim_next_job("worker-a", custom_path=db)
     assert claimed is not None
-    attempt = create_attempt(job.id, "app-obs", custom_path=db)
+    attempt = create_attempt(
+        job.id,
+        "app-obs",
+        worker_id="worker-a",
+        lease_generation=claimed.fencing_generation,
+        custom_path=db,
+    )
     assert record_submit_intent(
         attempt.id,
         job.id,
@@ -219,7 +225,7 @@ def test_v5_schema_contains_observability_columns(tmp_path: Path):
         assert {"started_at", "last_event_id", "redacted_error_code"} <= attempt_columns
         assert (
             conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-            == 5
+            == 7
         )
     finally:
         conn.close()

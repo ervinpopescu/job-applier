@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 from collections.abc import Callable
 from datetime import datetime
@@ -110,6 +111,8 @@ class BrowserAutomator:
         owner_type: str | None = None,
         proxy: str | None = None,
         skip_profile_lock: bool = False,
+        browser_job_id: str | None = None,
+        browser_session_generation: int | None = None,
     ):
         self.profile = profile or load_candidate_profile()
         self.status_callback = status_callback
@@ -149,6 +152,10 @@ class BrowserAutomator:
         self.question_solver = QuestionSolver(self.profile, api_key=self.api_key)
         self.waiting_for_code: bool = False
         self.provided_code: str | None = None
+        # Binds runtime browser-state IPC updates to the owning queue job and
+        # the specific durable lease generation that created this browser.
+        self.browser_job_id = browser_job_id
+        self.browser_session_generation = browser_session_generation
 
         self.profile_dir = profile_dir or get_default_profile_dir(self.engine)
 
@@ -158,6 +165,9 @@ class BrowserAutomator:
         self.page: Any = None
         self.last_evidence: ConfirmationEvidence | None = None
         self.cancellation_check: Callable[[], bool] | None = None
+        # Cross-thread callers may request cancellation, but only the owning
+        # worker thread may touch Playwright objects or perform close().
+        self._close_requested = threading.Event()
 
     def _notify(
         self,
@@ -350,8 +360,16 @@ class BrowserAutomator:
             except Exception:
                 pass
 
+    def request_close(self) -> None:
+        """Request owner-thread cleanup without touching Playwright remotely."""
+        self._close_requested.set()
+
+    def close_requested(self) -> bool:
+        """Returns whether a non-owner requested owner-thread cleanup."""
+        return self._close_requested.is_set()
+
     def close(self) -> None:
-        """Closes browser and stops Playwright engine."""
+        """Closes browser and stops Playwright engine on the owning thread."""
         try:
             if self.context:
                 self.context.close()
@@ -362,6 +380,7 @@ class BrowserAutomator:
         except Exception:
             pass
         finally:
+            self._close_requested.clear()
             if self.profile_lock is not None:
                 try:
                     self.profile_lock.release()
@@ -1206,12 +1225,16 @@ class BrowserAutomator:
                 set_runtime_browser_state,
             )
 
+            set_browser_state: Any = set_runtime_browser_state
+
             try:
-                set_runtime_browser_state(
+                set_browser_state(
                     active=True,
                     url=self.page.url if self.page else "",
                     is_closed=False,
                     is_waiting_for_code=True,
+                    browser_job_id=self.browser_job_id,
+                    browser_session_generation=self.browser_session_generation,
                 )
             except Exception:
                 pass
@@ -1232,11 +1255,13 @@ class BrowserAutomator:
                 time.sleep(1)
 
             try:
-                set_runtime_browser_state(
+                set_browser_state(
                     active=True,
                     url=self.page.url if self.page else "",
                     is_closed=False,
                     is_waiting_for_code=False,
+                    browser_job_id=self.browser_job_id,
+                    browser_session_generation=self.browser_session_generation,
                 )
             except Exception:
                 pass
@@ -1581,6 +1606,7 @@ class BrowserAutomator:
         company: str,
         job_title: str,
         on_submit_intent: Any | None = None,
+        on_submit_permit: Any | None = None,
         on_verifying: Any | None = None,
         adapter_override: Any | None = None,
     ) -> tuple[str, str]:
@@ -1590,10 +1616,16 @@ class BrowserAutomator:
         Guarded by versioned ATS adapters and central safety rules.
         """
         print(f"\n⚡ Starting Autonomous Auto-Apply for {company} - {job_title}")
-        if callable(self.cancellation_check) and self.cancellation_check():
-            raise RuntimeError("Worker lost lease on job; aborting autonomous apply.")
 
+        def check_cancelled(checkpoint: str) -> None:
+            if callable(self.cancellation_check) and self.cancellation_check():
+                raise RuntimeError(
+                    f"Worker lost lease before {checkpoint}; aborting autonomous apply."
+                )
+
+        check_cancelled("navigation")
         success = self.navigate_and_open_form(job_url)
+        check_cancelled("adapter detection")
         if not success:
             return "failed", "Could not navigate to job URL"
 
@@ -1601,11 +1633,14 @@ class BrowserAutomator:
         adapter = adapter_override or get_adapter_for_url(job_url, page=self.page)
 
         # Pre-execution challenge checks via adapter
+        check_cancelled("stale-job detection")
         is_stale, stale_msg = adapter.detect_stale_job(self.page)
+        check_cancelled("authentication check")
         if is_stale:
             return "failed", f"Stale job posting: {stale_msg}"
 
         has_login, log_msg = adapter.check_auth_state(self.page)
+        check_cancelled("captcha detection")
         if has_login:
             raise AuthenticationRequiredError(f"Login required: {log_msg}")
 
@@ -1630,6 +1665,7 @@ class BrowserAutomator:
                 pass
 
         # Delegate form filling directly to the versioned ATS adapter
+        check_cancelled("form filling")
         fill_report = adapter.fill_fields(
             self.page,
             self.profile,
@@ -1638,6 +1674,7 @@ class BrowserAutomator:
         )
 
         # Upload resume and optional cover letter via adapter
+        check_cancelled("document upload")
         if cv_pdf and cv_pdf.exists():
             adapter.upload_documents(
                 self.page,
@@ -1655,6 +1692,7 @@ class BrowserAutomator:
         time.sleep(2)
 
         # SAFETY CONTRACT: Generic forms are fill-only!
+        check_cancelled("fill-only decision")
         if not adapter.can_submit:
             fill_shot = app_dir / "submission_fill_only.png"
             self.safe_screenshot(fill_shot)
@@ -1681,7 +1719,10 @@ class BrowserAutomator:
         # Multi-step progression (e.g. Ashby multi-page forms)
         max_steps = 5
         step_idx = 1
-        while step_idx < max_steps and adapter.advance_step(self.page):
+        while step_idx < max_steps:
+            check_cancelled("multi-step navigation")
+            if not adapter.advance_step(self.page):
+                break
             step_idx += 1
             time.sleep(1)
             self._notify(
@@ -1690,6 +1731,7 @@ class BrowserAutomator:
                 level="INFO",
             )
             # Fill fields on the advanced step
+            check_cancelled("multi-step form filling")
             adapter.fill_fields(
                 self.page,
                 self.profile,
@@ -1698,16 +1740,25 @@ class BrowserAutomator:
             )
 
         # Adapter validation check before submission
+        check_cancelled("form validation")
         val_errors = adapter.validate_form(self.page)
         if val_errors:
             err_summary = "; ".join(e.message for e in val_errors)
             return "failed", f"Validation errors: {err_summary}"
 
-        if callable(self.cancellation_check) and self.cancellation_check():
-            raise RuntimeError(
-                "Worker lost lease on job; aborting before submit intent."
+        # Direct CLI callers do not have a durable queue lease and therefore
+        # cannot safely enter the submit boundary. Refuse before setting the
+        # ambiguous-submission marker; queued workers provide both callbacks.
+        if not callable(on_submit_intent) or not callable(on_submit_permit):
+            return (
+                "blocked",
+                "Autonomous submission requires durable queue submit fencing; use the queue worker.",
             )
 
+        check_cancelled("submit intent")
+
+        physical_submit_boundary_reached = False
+        submit_click_fence = None
         try:
             self._notify(
                 "submitting",
@@ -1716,9 +1767,55 @@ class BrowserAutomator:
             )
 
             print(" Auto-submitting application via adapter...")
-            # on_submit_intent is passed directly into adapter.submit() and invoked ONLY
-            # after confirming that a visible, enabled submit button affordance exists.
-            adapter.submit(self.page, on_submit_intent=on_submit_intent)
+            check_cancelled("physical submit")
+
+            def guarded_submit_intent() -> None:
+                nonlocal physical_submit_boundary_reached
+                if on_submit_intent:
+                    on_submit_intent()
+                physical_submit_boundary_reached = True
+                # The durable intent is committed by the callback. This check
+                # remains before the adapter's final enabled-state check.
+                check_cancelled("physical submit")
+
+            def guarded_submit_permit() -> Any:
+                nonlocal physical_submit_boundary_reached, submit_click_fence
+                # This callback is invoked after the final button checks. The
+                # returned SQLite BEGIN IMMEDIATE fence remains open through the
+                # adapter's physical click, ordering this process with takeover
+                # claims in every other web/runtime process.
+                physical_submit_boundary_reached = True
+                check_cancelled("physical submit")
+                if not callable(on_submit_permit):
+                    raise RuntimeError(
+                        "Physical submit permit callback is required; refusing to click."
+                    )
+                submit_click_fence = on_submit_permit()
+                if submit_click_fence is None:
+                    raise RuntimeError(
+                        "Cross-process physical submit fence is required; refusing to click."
+                    )
+                return submit_click_fence
+
+            try:
+                adapter.submit(
+                    self.page,
+                    on_submit_intent=guarded_submit_intent,
+                    on_submit_permit=guarded_submit_permit,
+                )
+            except Exception:
+                if submit_click_fence is not None:
+                    from job_applier.automation.queue import finish_submit_click_fence
+
+                    finish_submit_click_fence(submit_click_fence, clicked=False)
+                    submit_click_fence = None
+                raise
+            else:
+                if submit_click_fence is not None:
+                    from job_applier.automation.queue import finish_submit_click_fence
+
+                    finish_submit_click_fence(submit_click_fence, clicked=True)
+                    submit_click_fence = None
 
             # Move to verifying state while waiting for confirmation
             if on_verifying:
@@ -1730,6 +1827,7 @@ class BrowserAutomator:
             time.sleep(4)
 
             # Confirm submission via adapter-specific evidence
+            check_cancelled("submission reconciliation")
             evidence = adapter.confirm_submission(self.page)
             self.last_evidence = evidence
             proof_path = app_dir / (
@@ -1793,6 +1891,23 @@ class BrowserAutomator:
                     report,
                     evidence.confirmation_text,
                 )
+                if physical_submit_boundary_reached:
+                    self._notify(
+                        "submission_ambiguous",
+                        f"Submission outcome is uncertain for {company} - {job_title}: {evidence.confirmation_text}",
+                        level="WARN",
+                    )
+                    record_application(
+                        company=company,
+                        title=job_title,
+                        job_url=job_url,
+                        status="ambiguous",
+                        platform=str(adapter.adapter_name),
+                        submission_type="autonomous_browser",
+                        proof_path=str(proof_path) if proof_path.exists() else "",
+                        notes=f"Ambiguous after submit intent: {evidence.confirmation_text}",
+                    )
+                    return "ambiguous_submission", evidence.confirmation_text
                 self._notify(
                     "submission_failed",
                     f"Submission unconfirmed for {company} - {job_title}: {evidence.confirmation_text}",
@@ -1813,6 +1928,23 @@ class BrowserAutomator:
         except (SubmissionPacingViolationError, DailySubmissionLimitExceededError):
             raise
         except Exception as e:
+            if physical_submit_boundary_reached:
+                message = f"Submission outcome is uncertain after submit intent: {e}"
+                self._notify(
+                    "submission_ambiguous",
+                    f"Submission outcome is uncertain for {company} - {job_title}: {message}",
+                    level="WARN",
+                )
+                record_application(
+                    company=company,
+                    title=job_title,
+                    job_url=job_url,
+                    status="ambiguous",
+                    platform=str(adapter.adapter_name),
+                    submission_type="autonomous_browser",
+                    notes=message,
+                )
+                return "ambiguous_submission", message
             record_application(
                 company=company,
                 title=job_title,

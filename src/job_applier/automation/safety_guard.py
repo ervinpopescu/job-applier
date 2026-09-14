@@ -13,10 +13,14 @@ from job_applier.automation.candidate_profile import (
 )
 from job_applier.automation.queue import (
     JobState,
+    SUBMIT_LEASE_MARGIN_SECONDS,
+    begin_submit_click_fence,
     complete_attempt,
+    finish_submit_click_fence,
     get_connection,
     get_runtime_control,
     handle_job_failure,
+    has_submit_permit,
     record_event,
     record_submit_intent,
     set_runtime_pause,
@@ -164,10 +168,16 @@ class SubmissionSafetyGuard:
                     f"Fencing generation mismatch for job {job_id}. Expected {generation}, found {job_row['fencing_generation']}."
                 )
 
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            if job_row["lease_expires_at"] and job_row["lease_expires_at"] < now_str:
+            now = datetime.now()
+            lease_cutoff = datetime.fromtimestamp(
+                now.timestamp() + SUBMIT_LEASE_MARGIN_SECONDS
+            ).strftime("%Y-%m-%d %H:%M:%S")
+            if (
+                not job_row["lease_expires_at"]
+                or job_row["lease_expires_at"] <= lease_cutoff
+            ):
                 raise FencingOwnershipLostError(
-                    f"Worker lease expired at {job_row['lease_expires_at']} (current: {now_str})."
+                    f"Worker lease lacks the required {SUBMIT_LEASE_MARGIN_SECONDS}s submit margin."
                 )
         finally:
             conn.close()
@@ -340,6 +350,45 @@ class SubmissionSafetyGuard:
             )
 
     @classmethod
+    def ensure_submit_permit(
+        cls,
+        job_id: str,
+        worker_id: str,
+        generation: int,
+        custom_db_path: Path | None = None,
+        attempt_id: str | None = None,
+    ) -> Any:
+        """Acquire the SQLite/process fence held through the physical click."""
+        if not has_submit_permit(
+            job_id=job_id,
+            worker_id=worker_id,
+            generation=generation,
+            custom_path=custom_db_path,
+        ):
+            raise FencingOwnershipLostError(
+                f"Aborting physical submit: job {job_id} lacks the required "
+                f"{SUBMIT_LEASE_MARGIN_SECONDS}s live-lease margin."
+            )
+        if attempt_id is None:
+            # Compatibility for non-click safety checks; physical adapters use
+            # the attempt-bound fence and cannot proceed without it.
+            return None
+        try:
+            return begin_submit_click_fence(
+                job_id=job_id,
+                attempt_id=attempt_id,
+                worker_id=worker_id,
+                generation=generation,
+                custom_path=custom_db_path,
+            )
+        except Exception as exc:
+            raise FencingOwnershipLostError(str(exc)) from exc
+
+    @staticmethod
+    def finish_submit_permit(fence, *, clicked: bool) -> None:
+        finish_submit_click_fence(fence, clicked=clicked)
+
+    @classmethod
     def execute_submit_intent(
         cls,
         job_id: str,
@@ -385,19 +434,31 @@ class SubmissionSafetyGuard:
         evidence_dict = evidence.to_dict()
 
         if evidence.confirmed and not evidence.is_ambiguous:
-            transition_job(
+            transitioned = transition_job(
                 job_id=job_id,
                 worker_id=worker_id,
                 generation=generation,
                 to_state=JobState.APPLIED.value,
                 checkpoint="completed",
                 custom_path=custom_db_path,
+                require_live_lease=True,
             )
+            if not transitioned:
+                # A rejected fenced transition means this worker no longer owns
+                # the job. Do not project stale submission evidence into the
+                # attempt, application, pacing, or event tables.
+                return (
+                    "lease_lost",
+                    "Submission reconciliation rejected: lease or fencing generation was lost.",
+                )
             complete_attempt(
                 attempt_id=attempt_id,
                 outcome="applied",
                 confirmation_evidence=json.dumps(evidence_dict),
                 custom_path=custom_db_path,
+                expected_job_id=job_id,
+                expected_worker_id=worker_id,
+                expected_generation=generation,
             )
             # Record submission timestamp for pacing
             record_submission_timestamp(adapter_name, custom_path=custom_db_path)
@@ -426,9 +487,8 @@ class SubmissionSafetyGuard:
             return "applied", f"Successfully confirmed: {evidence.confirmation_text}"
 
         elif evidence.is_ambiguous:
-            # Ambiguous submission: pause worker, alert operator, never retry automatically
-            set_runtime_pause(True, custom_path=custom_db_path)
-
+            # The fenced state transition must win before pausing or projecting
+            # any ambiguous outcome; a stale worker must not pause a replacement.
             final_state = handle_job_failure(
                 job_id=job_id,
                 worker_id=worker_id,
@@ -470,6 +530,7 @@ class SubmissionSafetyGuard:
         exc: Exception,
         company: str = "",
         custom_db_path: Path | None = None,
+        is_pre_submit: bool = True,
     ) -> str:
         """
         Pauses the whole worker, emits a durable notification, and records job failure for
@@ -479,7 +540,10 @@ class SubmissionSafetyGuard:
         category = "site_changed"
         severity = "warn"
 
-        if "Captcha" in err_name:
+        if not is_pre_submit:
+            category = "ambiguous_submission"
+            severity = "critical"
+        elif "Captcha" in err_name:
             category = "captcha_required"
             severity = "critical"
         elif "MFA" in err_name or "Verification" in err_name:
@@ -498,19 +562,24 @@ class SubmissionSafetyGuard:
             category = "runtime_paused"
             severity = "info"
 
-        # Pause whole worker on critical exceptions
-        if severity == "critical":
-            set_runtime_pause(True, custom_path=custom_db_path)
-
+        # Never pause before the guarded transition: a stale worker could pause
+        # a replacement claimant. The pause is applied only after this worker
+        # successfully records its state transition below.
         final_state = handle_job_failure(
             job_id=job_id,
             worker_id=worker_id,
             generation=generation,
             attempt_id=attempt_id,
             error=str(exc),
-            is_pre_submit=True,
+            is_pre_submit=is_pre_submit,
             error_category=category,
             custom_path=custom_db_path,
         )
+        if (
+            final_state != "lease_lost"
+            and severity == "critical"
+            and category != "ambiguous_submission"
+        ):
+            set_runtime_pause(True, custom_path=custom_db_path)
 
         return final_state

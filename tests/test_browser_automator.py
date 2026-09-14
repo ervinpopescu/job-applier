@@ -2,6 +2,7 @@ from job_applier.automation.adapters import CaptchaDetectedError
 from pathlib import Path
 from job_applier.automation.question_solver import UnknownQuestionError
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -11,6 +12,117 @@ from job_applier.automation.browser_automator import (  # type: ignore[import-no
 from job_applier.automation.candidate_profile import (  # type: ignore[import-not-found]
     CandidateProfile,
 )
+
+
+@pytest.mark.parametrize(
+    "click_error",
+    ["page destroyed after click dispatch", "Timeout waiting for confirmation"],
+)
+def test_click_then_throw_is_classified_as_ambiguous(tmp_path, click_error):
+    """Any adapter error after the submit boundary must fail closed."""
+    automator = BrowserAutomator.__new__(BrowserAutomator)
+    automator.page = MagicMock()
+    automator.context = MagicMock()
+    automator.context.pages = [automator.page]
+    automator.page.locator.return_value.count.return_value = 1
+    automator.profile = MagicMock()
+    automator.question_solver = MagicMock()
+    automator.cancellation_check = None
+    automator.last_evidence = None
+    automator._notify = MagicMock()
+    automator.safe_screenshot = MagicMock()
+    automator._save_diagnostics = MagicMock()
+
+    adapter = MagicMock()
+    adapter.adapter_name = "greenhouse"
+    adapter.adapter_version = "1.0.0"
+    adapter.can_submit = True
+    adapter.detect_stale_job.return_value = (False, "")
+    adapter.check_auth_state.return_value = (False, "")
+    adapter.detect_captcha.return_value = (False, "")
+    adapter.fill_fields.return_value = SimpleNamespace(
+        fields_filled=[], unknown_questions=[]
+    )
+    adapter.advance_step.return_value = False
+    adapter.validate_form.return_value = []
+
+    def click_then_throw(_page, *, on_submit_intent=None, on_submit_permit=None):
+        assert callable(on_submit_intent)
+        assert callable(on_submit_permit)
+        on_submit_intent()
+        on_submit_permit()
+        raise RuntimeError(click_error)
+
+    adapter.submit.side_effect = click_then_throw
+    app_dir = tmp_path / "application"
+    app_dir.mkdir()
+
+    with (
+        patch(
+            "job_applier.automation.browser_automator.get_adapter_for_url",
+            return_value=adapter,
+        ),
+        patch(
+            "job_applier.automation.browser_automator.is_cloudflare_challenge",
+            return_value=False,
+        ),
+        patch("job_applier.automation.browser_automator.record_application"),
+    ):
+        status, message = automator.run_autonomous_apply(
+            app_dir=app_dir,
+            job_url="https://boards.greenhouse.io/example/jobs/1",
+            company="Example Corp",
+            job_title="Engineer",
+            on_submit_intent=lambda: None,
+            on_submit_permit=lambda: None,
+        )
+
+    assert status == "ambiguous_submission"
+    assert "uncertain" in message.lower()
+
+
+def test_direct_autonomous_submission_requires_durable_callbacks(tmp_path):
+    """CLI callers must be blocked before entering the ambiguous boundary."""
+    automator = BrowserAutomator.__new__(BrowserAutomator)
+    automator.page = MagicMock()
+    automator.context = MagicMock()
+    automator.profile = MagicMock()
+    automator.question_solver = MagicMock()
+    automator.cancellation_check = None
+    automator._notify = MagicMock()
+
+    adapter = MagicMock()
+    adapter.adapter_name = "greenhouse"
+    adapter.adapter_version = "1.0.0"
+    adapter.can_submit = True
+    adapter.detect_stale_job.return_value = (False, "")
+    adapter.check_auth_state.return_value = (False, "")
+    adapter.detect_captcha.return_value = (False, "")
+    adapter.fill_fields.return_value = SimpleNamespace(
+        fields_filled=[], unknown_questions=[]
+    )
+    adapter.advance_step.return_value = False
+    adapter.validate_form.return_value = []
+    app_dir = tmp_path / "application"
+    app_dir.mkdir()
+
+    with (
+        patch(
+            "job_applier.automation.browser_automator.get_adapter_for_url",
+            return_value=adapter,
+        ),
+        patch.object(automator, "navigate_and_open_form", return_value=True),
+    ):
+        status, message = automator.run_autonomous_apply(
+            app_dir=app_dir,
+            job_url="https://boards.greenhouse.io/example/jobs/1",
+            company="Example Corp",
+            job_title="Engineer",
+        )
+
+    assert status == "blocked"
+    assert "durable queue" in message
+    adapter.submit.assert_not_called()
 
 
 def test_detect_platform():

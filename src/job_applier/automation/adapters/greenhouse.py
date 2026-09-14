@@ -552,22 +552,39 @@ class GreenhouseAdapter(BaseATSAdapter):
     def submit(
         self,
         page: Any,
+        *,
         on_submit_intent: Callable[[], None] | None = None,
+        on_submit_permit: Callable[[], None] | None = None,
     ) -> bool:
         # 1. Locate Greenhouse submit button
         submit_btn = page.locator(
             "#submit_app, input[type='submit']#submit_app, button[id='submit_app'], button:has-text('Submit Application')"
         )
-        if submit_btn.count() == 0 or not submit_btn.first.is_visible():
+        if (
+            submit_btn.count() == 0
+            or not submit_btn.first.is_visible()
+            or not submit_btn.first.is_enabled()
+        ):
             raise FormValidationError(
-                ["Greenhouse submit button (#submit_app) not found or not visible"]
+                [
+                    "Greenhouse submit button (#submit_app) not found, not visible, or disabled"
+                ]
             )
 
-        # 2. Invoke submit intent safety hook before physical click
+        # 2. Invoke submit intent safety hook before the final button checks.
         if on_submit_intent:
             on_submit_intent()
+        if not submit_btn.first.is_visible() or not submit_btn.first.is_enabled():
+            raise FormValidationError(
+                ["Greenhouse submit button became unavailable before click"]
+            )
+        if not callable(on_submit_permit):
+            raise FormValidationError(
+                ["Greenhouse submission permit callback is required; refusing to click"]
+            )
 
-        # 3. Physically click submit
+        # 3. The permit is deliberately the last callback before the physical click.
+        on_submit_permit()
         submit_btn.first.click()
         return True
 

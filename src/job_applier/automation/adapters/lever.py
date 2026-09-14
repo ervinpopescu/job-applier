@@ -492,17 +492,36 @@ class LeverAdapter(BaseATSAdapter):
     def submit(
         self,
         page: Any,
+        *,
         on_submit_intent: Callable[[], None] | None = None,
+        on_submit_permit: Callable[[], None] | None = None,
     ) -> bool:
         submit_btn = page.locator(
             "button[data-qa='btn-submit'], #btn-submit, button:has-text('Submit Application')"
         )
-        if submit_btn.count() == 0 or not submit_btn.first.is_visible():
-            raise FormValidationError(["Lever submit button not found or not visible"])
+        if (
+            submit_btn.count() == 0
+            or not submit_btn.first.is_visible()
+            or not submit_btn.first.is_enabled()
+        ):
+            raise FormValidationError(
+                ["Lever submit button not found, not visible, or disabled"]
+            )
 
+        # The intent hook records durable intent before the final button checks.
         if on_submit_intent:
             on_submit_intent()
+        if not submit_btn.first.is_visible() or not submit_btn.first.is_enabled():
+            raise FormValidationError(
+                ["Lever submit button became unavailable before click"]
+            )
+        if not callable(on_submit_permit):
+            raise FormValidationError(
+                ["Lever submission permit callback is required; refusing to click"]
+            )
 
+        # Keep the permit immediately adjacent to the physical click.
+        on_submit_permit()
         submit_btn.first.click()
         return True
 

@@ -28,6 +28,7 @@ from job_applier.automation.queue import (
     get_runtime_control,
     handle_job_failure,
     reconcile_stranded_jobs,
+    repair_ambiguous_projections,
     record_event,
     renew_lease,
     reschedule_for_safety_gate,
@@ -59,6 +60,7 @@ def _browser_session_is_open(automator: BrowserAutomator | None) -> bool:
 def _sync_runtime_browser_state_from_automator(
     automator: BrowserAutomator,
     job_id: str,
+    session_generation: int | None,
     custom_db_path: Path | None = None,
 ) -> bool:
     """Persist the actual browser state without marking a live page closed."""
@@ -81,6 +83,7 @@ def _sync_runtime_browser_state_from_automator(
             active=False,
             is_closed=True,
             browser_job_id=job_id,
+            browser_session_generation=session_generation,
             custom_path=custom_db_path,
         )
         return False
@@ -97,6 +100,7 @@ def _sync_runtime_browser_state_from_automator(
         is_closed=False,
         is_waiting_for_code=getattr(automator, "waiting_for_code", False),
         browser_job_id=job_id,
+        browser_session_generation=session_generation,
         custom_path=custom_db_path,
     )
     return True
@@ -122,20 +126,32 @@ class HeartbeatThread(threading.Thread):
         self.lease_seconds = lease_seconds
         self.custom_path = custom_path
         self._stop_event = threading.Event()
+        self.lost_lease_event = threading.Event()
         self.lost_lease = False
+
+    def _mark_lost_lease(self, reason: str) -> None:
+        self.lost_lease = True
+        self.lost_lease_event.set()
+        print(f"⚠️ Worker {self.worker_id} lost lease on job {self.job_id}: {reason}")
 
     def run(self) -> None:
         while not self._stop_event.wait(self.interval):
-            success = renew_lease(
-                job_id=self.job_id,
-                worker_id=self.worker_id,
-                generation=self.generation,
-                lease_seconds=self.lease_seconds,
-                custom_path=self.custom_path,
-            )
+            try:
+                success = renew_lease(
+                    job_id=self.job_id,
+                    worker_id=self.worker_id,
+                    generation=self.generation,
+                    lease_seconds=self.lease_seconds,
+                    custom_path=self.custom_path,
+                )
+            except Exception as exc:
+                # A database/SQLite failure is indistinguishable from lost
+                # ownership. Fail closed rather than allowing work to continue
+                # after the heartbeat thread exits unexpectedly.
+                self._mark_lost_lease(type(exc).__name__)
+                break
             if not success:
-                self.lost_lease = True
-                print(f"⚠️ Worker {self.worker_id} lost lease on job {self.job_id}!")
+                self._mark_lost_lease("renewal rejected")
                 break
 
     def stop(self) -> None:
@@ -281,6 +297,13 @@ def process_claimed_job(
     heartbeat.start()
 
     automator = None
+    browser_closed = False
+
+    def heartbeat_lost() -> bool:
+        event = getattr(heartbeat, "lost_lease_event", None)
+        event_set = isinstance(event, threading.Event) and event.is_set()
+        return bool(heartbeat.lost_lease or event_set)
+
     is_pre_submit = True
     keep_browser_open = False
     is_service_daemon = os.environ.get("JOB_APPLIER_RUNTIME_MODE") == "service"
@@ -292,7 +315,7 @@ def process_claimed_job(
             print(f"⏸️ Automation paused/stopped; releasing job {job.id}")
             return "paused"
 
-        if heartbeat.lost_lease:
+        if heartbeat_lost():
             print(f"⚠️ Lease lost prior to browser startup; releasing job {job.id}")
             return "lease_lost"
 
@@ -335,11 +358,44 @@ def process_claimed_job(
             headless=headless,
             browser=browser_engine,
             skip_profile_lock=is_service_daemon,
+            browser_job_id=job.id,
+            browser_session_generation=job.fencing_generation,
         )
+        # Challenge callbacks use the durable job identity above so they cannot
+        # publish state from a stale automator.
         automator.cancellation_check = lambda: (
-            heartbeat.lost_lease or (stop_event is not None and stop_event.is_set())
+            heartbeat_lost()
+            or (stop_event is not None and stop_event.is_set())
+            or automator.close_requested() is True
         )
+
+        # The heartbeat thread only signals its loss event. The worker thread
+        # owns Playwright and performs all browser cleanup at safe checkpoints.
+
+        def close_after_lease_loss() -> None:
+            nonlocal browser_closed
+            if browser_closed:
+                return
+            browser_closed = True
+            try:
+                automator.close()
+            finally:
+                set_runtime_browser_state(
+                    active=False,
+                    is_closed=True,
+                    browser_job_id=job.id,
+                    browser_session_generation=job.fencing_generation,
+                    custom_path=custom_db_path,
+                )
+
+        if heartbeat_lost():
+            close_after_lease_loss()
+            return "lease_lost"
         automator.start()
+        if heartbeat_lost():
+            print(f"⚠️ Lease lost during browser startup; closing job {job.id}")
+            close_after_lease_loss()
+            return "lease_lost"
         page = getattr(automator, "page", None)
         page_url = getattr(page, "url", "") if page else ""
         if not isinstance(page_url, str):
@@ -349,6 +405,7 @@ def process_claimed_job(
             url=page_url,
             is_closed=False,
             browser_job_id=job.id,
+            browser_session_generation=job.fencing_generation,
             custom_path=custom_db_path,
         )
 
@@ -364,7 +421,7 @@ def process_claimed_job(
 
         def submit_intent_gate() -> None:
             nonlocal is_pre_submit
-            if heartbeat.lost_lease:
+            if heartbeat_lost():
                 raise RuntimeError("Worker lost lease before submit intent.")
             # Central safety and ownership verification before committing submit intent
             SubmissionSafetyGuard.validate_pre_submit_safety(
@@ -386,6 +443,17 @@ def process_claimed_job(
             )
             is_pre_submit = False
 
+        def submit_permit_gate() -> Any:
+            if heartbeat_lost():
+                raise RuntimeError("Worker lost lease before physical submit.")
+            return SubmissionSafetyGuard.ensure_submit_permit(
+                job_id=job.id,
+                attempt_id=attempt.id,
+                worker_id=worker_id,
+                generation=job.fencing_generation,
+                custom_db_path=custom_db_path,
+            )
+
         def verifying_gate() -> None:
             transition_job(
                 job_id=job.id,
@@ -399,7 +467,13 @@ def process_claimed_job(
         # An explicit auth retry only reopens the controlled browser. It must not
         # fill or submit a form before the operator has authenticated.
         if job.checkpoint == "auth_retry_requested":
+            if heartbeat_lost():
+                close_after_lease_loss()
+                return "lease_lost"
             navigation_succeeded = automator.navigate_and_open_form(app_data["job_url"])
+            if heartbeat_lost():
+                close_after_lease_loss()
+                return "lease_lost"
             if not navigation_succeeded:
                 # Keep the headed browser available even when an unauthenticated
                 # page cannot be evaluated as active. The operator may need to
@@ -423,6 +497,7 @@ def process_claimed_job(
                         url=getattr(page, "url", "") if page else "",
                         is_closed=False,
                         browser_job_id=job.id,
+                        browser_session_generation=job.fencing_generation,
                         custom_path=custom_db_path,
                     )
                     keep_browser_open = (
@@ -451,14 +526,17 @@ def process_claimed_job(
                 message="Fresh controlled browser session opened for operator authentication.",
                 custom_path=custom_db_path,
             )
-            _coordinate_challenge_takeover(
-                automator=automator,
-                job_id=job.id,
-                worker_id=worker_id,
-                heartbeat=heartbeat,
-                custom_db_path=custom_db_path,
-                max_wait_seconds=None if is_service_daemon else 300,
-                stop_event=stop_event,
+            browser_closed = (
+                _coordinate_challenge_takeover(
+                    automator=automator,
+                    job_id=job.id,
+                    worker_id=worker_id,
+                    heartbeat=heartbeat,
+                    custom_db_path=custom_db_path,
+                    max_wait_seconds=None if is_service_daemon else 300,
+                    stop_event=stop_event,
+                )
+                or browser_closed
             )
             keep_browser_open = (
                 is_service_daemon
@@ -473,8 +551,14 @@ def process_claimed_job(
             company=app_data["company"],
             job_title=app_data["title"],
             on_submit_intent=submit_intent_gate,
+            on_submit_permit=submit_permit_gate,
             on_verifying=verifying_gate,
         )
+
+        if heartbeat_lost():
+            print(f"⚠️ Lease lost before outcome reconciliation; closing job {job.id}")
+            close_after_lease_loss()
+            return "lease_lost"
 
         evidence = getattr(automator, "last_evidence", None)
         if status in ("applied", "ambiguous_submission") or evidence is not None:
@@ -524,6 +608,7 @@ def process_claimed_job(
                 attempt_id=attempt.id,
                 error=message,
                 is_pre_submit=is_pre_submit,
+                error_category="" if is_pre_submit else "ambiguous_submission",
                 custom_path=custom_db_path,
             )
             return final_state
@@ -562,6 +647,7 @@ def process_claimed_job(
             exc=e,
             company=app_data.get("company", ""),
             custom_db_path=custom_db_path,
+            is_pre_submit=is_pre_submit,
         )
 
         ctrl = get_runtime_control(custom_db_path)
@@ -581,14 +667,17 @@ def process_claimed_job(
         )
         if automator and (is_challenge or ctrl.get("is_paused")):
             try:
-                _coordinate_challenge_takeover(
-                    automator=automator,
-                    job_id=job.id,
-                    worker_id=worker_id,
-                    heartbeat=heartbeat,
-                    custom_db_path=custom_db_path,
-                    max_wait_seconds=None if is_service_daemon else 300,
-                    stop_event=stop_event,
+                browser_closed = (
+                    _coordinate_challenge_takeover(
+                        automator=automator,
+                        job_id=job.id,
+                        worker_id=worker_id,
+                        heartbeat=heartbeat,
+                        custom_db_path=custom_db_path,
+                        max_wait_seconds=None if is_service_daemon else 300,
+                        stop_event=stop_event,
+                    )
+                    or browser_closed
                 )
             except Exception as coord_err:
                 print(f"Notice in challenge takeover coordination: {coord_err}")
@@ -596,6 +685,7 @@ def process_claimed_job(
         keep_browser_open = (
             is_service_daemon
             and not (stop_event is not None and stop_event.is_set())
+            and not heartbeat_lost()
             and final_state
             in {
                 JobState.AUTH_REQUIRED.value,
@@ -609,7 +699,14 @@ def process_claimed_job(
 
     finally:
         heartbeat.stop()
-        if automator and not keep_browser_open:
+        # Ensure no further renewal/callback runs while the worker performs
+        # Playwright cleanup on its creator thread. A blocked database call is
+        # bounded by the join timeout; it still cannot touch the automator.
+        join = getattr(heartbeat, "join", None)
+        if callable(join):
+            join(timeout=max(1.0, heartbeat.interval * 2))
+        if automator and not keep_browser_open and not browser_closed:
+            browser_closed = True
             try:
                 automator.close()
             except Exception:
@@ -619,6 +716,7 @@ def process_claimed_job(
                     active=False,
                     is_closed=True,
                     browser_job_id=job.id,
+                    browser_session_generation=job.fencing_generation,
                     custom_path=custom_db_path,
                 )
 
@@ -631,19 +729,81 @@ def _coordinate_challenge_takeover(
     custom_db_path: Path | None = None,
     max_wait_seconds: int | None = 300,
     stop_event: threading.Event | None = None,
-) -> None:
+) -> bool:
     from datetime import datetime
 
     start_time = time.time()
     last_state_sync = 0.0
+    session_replaced = False
+    session_generation = getattr(heartbeat, "generation", None)
+
+    def lease_lost() -> bool:
+        event = getattr(heartbeat, "lost_lease_event", None)
+        return bool(
+            getattr(heartbeat, "lost_lease", False)
+            or (isinstance(event, threading.Event) and event.is_set())
+        )
+
+    if not isinstance(session_generation, int):
+        session_generation = None
+
+    def close_replaced_session() -> None:
+        nonlocal session_replaced
+        try:
+            automator.close()
+        except Exception:
+            pass
+        session_replaced = True
 
     while True:
         now = time.time()
-        if heartbeat.lost_lease or (stop_event is not None and stop_event.is_set()):
+        if lease_lost():
+            # A worker that lost its durable claim must not leave a headed
+            # browser alive or publish a final snapshot that outlives the
+            # lease. The runtime process observes the resulting closed state.
+            close_replaced_session()
+            break
+        if stop_event is not None and stop_event.is_set():
             break
 
         ctrl = get_runtime_control(custom_db_path)
         if ctrl.get("is_stopped"):
+            # Emergency stop is a durable cross-process close signal. Do not
+            # retain the browser merely because this worker is in service mode.
+            close_replaced_session()
+            break
+
+        # Clear-state, emergency-stop, and reopen-auth publish a durable
+        # shutdown generation because the browser may live in a separate
+        # Compose process. The worker's own fencing generation is immutable;
+        # never adopt a runtime value from a newer or stale session.
+        runtime_browser_job = ctrl.get("browser_job_id")
+        runtime_generation = ctrl.get("browser_session_generation")
+        shutdown_generation = ctrl.get("browser_shutdown_generation")
+        shutdown_requested = shutdown_generation is not None and (
+            not ctrl.get("browser_active") or runtime_generation != session_generation
+        )
+        inactive_signal = (
+            session_generation is not None
+            and not ctrl.get("browser_active")
+            and ctrl.get("browser_is_closed")
+        )
+        if (
+            inactive_signal
+            or shutdown_requested
+            or (
+                runtime_browser_job is not None
+                and (
+                    not ctrl.get("browser_active")
+                    or runtime_browser_job != job_id
+                    or (
+                        runtime_generation is not None
+                        and runtime_generation != session_generation
+                    )
+                )
+            )
+        ):
+            close_replaced_session()
             break
 
         page = getattr(automator, "page", None)
@@ -667,6 +827,7 @@ def _coordinate_challenge_takeover(
                 active=False,
                 is_closed=True,
                 browser_job_id=job_id,
+                browser_session_generation=session_generation,
                 custom_path=custom_db_path,
             )
             break
@@ -680,6 +841,7 @@ def _coordinate_challenge_takeover(
                 is_closed=False,
                 is_waiting_for_code=is_waiting,
                 browser_job_id=job_id,
+                browser_session_generation=session_generation,
                 custom_path=custom_db_path,
             )
             last_state_sync = now
@@ -740,11 +902,17 @@ def _coordinate_challenge_takeover(
 
         time.sleep(1.0)
 
-    _sync_runtime_browser_state_from_automator(
-        automator=automator,
-        job_id=job_id,
-        custom_db_path=custom_db_path,
-    )
+    if not session_replaced and not lease_lost():
+        _sync_runtime_browser_state_from_automator(
+            automator=automator,
+            job_id=job_id,
+            session_generation=session_generation,
+            custom_db_path=custom_db_path,
+        )
+    return session_replaced
+
+
+STRANDED_RECONCILIATION_INTERVAL_SECONDS = 15.0
 
 
 def run_worker_loop(
@@ -786,7 +954,10 @@ def run_worker_loop(
     )
 
     # Reconcile any stranded submit_intent or verifying jobs from prior worker crashes
+    repaired = repair_ambiguous_projections(custom_db_path)
     recovered = reconcile_stranded_jobs(custom_db_path)
+    if repaired:
+        print(f"⚠️ Repaired {len(repaired)} incomplete ambiguous projections.")
     if recovered:
         print(
             f"⚠️ Recovered {len(recovered)} stranded submit_intent/verifying jobs into ambiguous_submission."
@@ -816,11 +987,37 @@ def run_worker_loop(
     jobs_processed = 0
     idle_polls = 0
     service_stop_announced = False
+    last_stranded_reconciliation = time.monotonic()
 
     try:
         while not is_stop_requested() and (
             max_jobs is None or jobs_processed < max_jobs
         ):
+            now_monotonic = time.monotonic()
+            if (
+                now_monotonic - last_stranded_reconciliation
+                >= STRANDED_RECONCILIATION_INTERVAL_SECONDS
+            ):
+                try:
+                    repaired = repair_ambiguous_projections(custom_db_path)
+                    recovered = reconcile_stranded_jobs(custom_db_path)
+                    if repaired:
+                        print(
+                            f"⚠️ Repaired {len(repaired)} incomplete ambiguous projections."
+                        )
+                    if recovered:
+                        print(
+                            f"⚠️ Recovered {len(recovered)} stranded submit_intent/verifying jobs into ambiguous_submission."
+                        )
+                except Exception as reconcile_err:
+                    # A failed sweep must not stop the worker; the next bounded
+                    # cadence retries it while queue mutations remain fenced.
+                    print(
+                        f"Notice: stranded-job reconciliation failed: {reconcile_err}"
+                    )
+                finally:
+                    last_stranded_reconciliation = now_monotonic
+
             ctrl = get_runtime_control(custom_db_path)
             is_service_mode = (
                 os.environ.get("JOB_APPLIER_RUNTIME_MODE", "").strip().lower()

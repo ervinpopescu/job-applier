@@ -9,6 +9,7 @@ from job_applier.automation.adapters import (
     AshbyAdapter,
     GenericAdapterCannotSubmitError,
     GenericFormAdapter,
+    FormValidationError,
     GreenhouseAdapter,
     LeverAdapter,
     UnknownQuestionBlockedError,
@@ -109,6 +110,108 @@ def test_adapter_url_detection():
 # =========================================================================
 # 2. Greenhouse Adapter Fixture Tests
 # =========================================================================
+
+
+@pytest.mark.parametrize(
+    "adapter,selector",
+    [
+        (GreenhouseAdapter(), "#submit_app"),
+        (LeverAdapter(), "button[data-qa='btn-submit']"),
+        (AshbyAdapter(), "button:has-text('Submit Application')"),
+    ],
+)
+def test_submit_permit_can_cancel_before_click(adapter, selector):
+    """A lost margin/lease permit must stop every physical adapter click."""
+
+    class Button:
+        def __init__(self):
+            self.clicked = False
+
+        def is_visible(self):
+            return True
+
+        def is_enabled(self):
+            return True
+
+        def click(self):
+            self.clicked = True
+
+    class Page:
+        def __init__(self):
+            self.button = Button()
+
+        def locator(self, _selector):
+            class Locator:
+                def __init__(self, button):
+                    self.first = button
+
+                def count(self):
+                    return 1
+
+            return Locator(self.button)
+
+    page = Page()
+    intent_called = False
+
+    def intent():
+        nonlocal intent_called
+        intent_called = True
+
+    def permit():
+        raise RuntimeError("submit lease margin lost")
+
+    with pytest.raises(RuntimeError, match="submit lease margin lost"):
+        adapter.submit(page, on_submit_intent=intent, on_submit_permit=permit)
+    assert intent_called is True
+    assert page.button.clicked is False
+
+
+def test_physical_adapters_require_permit_and_permit_is_immediately_before_click():
+    """Every physical adapter must fence its final click with a submission permit."""
+
+    class Button:
+        def __init__(self, events):
+            self.events = events
+
+        def is_visible(self):
+            self.events.append("visible")
+            return True
+
+        def is_enabled(self):
+            self.events.append("enabled")
+            return True
+
+        def click(self):
+            self.events.append("click")
+
+    class Page:
+        def __init__(self):
+            self.events = []
+            self.button = Button(self.events)
+
+        def locator(self, _selector):
+            class Locator:
+                def __init__(self, button):
+                    self.first = button
+
+                def count(self):
+                    return 1
+
+            return Locator(self.button)
+
+    for adapter in (GreenhouseAdapter(), LeverAdapter(), AshbyAdapter()):
+        page = Page()
+        with pytest.raises(FormValidationError, match="permit callback is required"):
+            adapter.submit(page)
+        assert "click" not in page.events
+
+        page = Page()
+
+        def permit():
+            page.events.append("permit")
+
+        assert adapter.submit(page, on_submit_permit=permit) is True
+        assert page.events[-2:] == ["permit", "click"]
 
 
 def test_greenhouse_full_lifecycle(page, sample_profile, sample_cv, tmp_path):
@@ -221,7 +324,14 @@ def test_greenhouse_full_lifecycle(page, sample_profile, sample_cv, tmp_path):
         }"""
     )
 
-    assert adapter.submit(page, on_submit_intent=on_intent) is True
+    assert (
+        adapter.submit(
+            page,
+            on_submit_intent=on_intent,
+            on_submit_permit=lambda: None,
+        )
+        is True
+    )
     assert intent_called is True
 
     # 8. Confirmation evidence
@@ -366,7 +476,7 @@ def test_lever_full_lifecycle(page, sample_profile, sample_cv, tmp_path):
             });
         }"""
     )
-    assert adapter.submit(page) is True
+    assert adapter.submit(page, on_submit_permit=lambda: None) is True
 
     evidence = adapter.confirm_submission(page)
     assert evidence.confirmed is True
@@ -452,7 +562,7 @@ def test_ashby_multi_step_lifecycle(page, sample_profile, sample_cv, tmp_path):
     assert page.locator("#exp_q").input_value() == "7"
 
     # Submit
-    assert adapter.submit(page) is True
+    assert adapter.submit(page, on_submit_permit=lambda: None) is True
 
     # Confirm
     evidence = adapter.confirm_submission(page)

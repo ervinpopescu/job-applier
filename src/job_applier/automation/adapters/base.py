@@ -160,11 +160,14 @@ class BaseATSAdapter(ABC):
     def submit(
         self,
         page: Any,
+        *,
         on_submit_intent: Callable[[], None] | None = None,
+        on_submit_permit: Callable[[], None] | None = None,
     ) -> bool:
         """
         Executes physical submission of the form.
-        Invokes on_submit_intent hook immediately before clicking submit.
+        Invokes the intent hook before the final enabled check and the permit
+        hook immediately before the physical click.
         """
         raise NotImplementedError
 

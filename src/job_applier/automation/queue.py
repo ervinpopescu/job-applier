@@ -18,6 +18,145 @@ from job_applier.utils import get_project_root
 
 logger = logging.getLogger("job_applier.queue")
 _QUEUE_LOCK = threading.RLock()
+# Shared with the viewer relay to fence takeover release/claim against input sends.
+# The relay acquires it non-blockingly so it can safely hold the fence across its
+# awaited upstream send without blocking the event loop.
+TAKEOVER_TRANSPORT_LOCK = threading.RLock()
+TAKEOVER_DEFAULT_LEASE_SECONDS = 300
+TAKEOVER_MIN_LEASE_SECONDS = 1
+TAKEOVER_MAX_LEASE_SECONDS = 300
+# Submit intent and the physical click must each have enough lease runway for
+# the next heartbeat and a slow browser action. With a 60-second worker lease
+# renewed every 10 seconds, two heartbeat intervals leave a conservative 20s
+# margin while still permitting the normal 60s lease to submit.
+SUBMIT_LEASE_MARGIN_SECONDS = 20
+
+
+@dataclass
+class SubmitClickFence:
+    """Cross-process SQLite fence held for the single physical submit click.
+
+    The owning worker holds ``TAKEOVER_TRANSPORT_LOCK`` and a SQLite
+    ``BEGIN IMMEDIATE`` transaction from final button validation through the
+    Playwright click.  Takeover claim uses the same lock order, so either the
+    claim commits first and rejects this fence, or this fence commits first and
+    the claim waits until the one click has completed.
+    """
+
+    conn: sqlite3.Connection
+    committed: bool = False
+
+
+def begin_submit_click_fence(
+    *,
+    job_id: str,
+    attempt_id: str,
+    worker_id: str,
+    generation: int,
+    custom_path: Path | None = None,
+) -> SubmitClickFence:
+    """Acquire the cross-process final-submit fence and validate all ownership state."""
+    init_db(custom_path)
+    TAKEOVER_TRANSPORT_LOCK.acquire()
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = get_connection(custom_path)
+        conn.execute("BEGIN IMMEDIATE;")
+        now = datetime.now()
+        now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+        cutoff = (now + timedelta(seconds=SUBMIT_LEASE_MARGIN_SECONDS)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        row = conn.execute(
+            """
+            SELECT j.state, j.lease_owner, j.fencing_generation,
+                   j.lease_expires_at, j.is_cancelled,
+                   r.is_paused, r.is_stopped,
+                   r.manual_takeover_owner, r.manual_takeover_expires_at,
+                   a.submit_intent_at
+            FROM automation_jobs j
+            JOIN runtime_control r ON r.id = 1
+            LEFT JOIN application_attempts a
+              ON a.id = ? AND a.job_id = j.id
+             AND a.worker_id = ? AND a.lease_generation = ?
+            WHERE j.id = ?;
+            """,
+            (attempt_id, worker_id, generation, job_id),
+        ).fetchone()
+        if not row:
+            raise RuntimeError("Physical submit fence rejected: job disappeared.")
+        takeover_active = bool(
+            row["manual_takeover_owner"]
+            and row["manual_takeover_expires_at"]
+            and row["manual_takeover_expires_at"] > now_str
+        )
+        if (
+            row["state"] != JobState.SUBMIT_INTENT.value
+            or row["lease_owner"] != worker_id
+            or row["fencing_generation"] != generation
+            or row["is_cancelled"]
+            or not row["lease_expires_at"]
+            or row["lease_expires_at"] <= cutoff
+            or row["is_paused"]
+            or row["is_stopped"]
+            or takeover_active
+            or not row["submit_intent_at"]
+        ):
+            raise RuntimeError(
+                "Physical submit fence rejected: takeover, pause, stop, lease, "
+                "generation, or attempt ownership changed."
+            )
+        return SubmitClickFence(conn=conn)
+    except Exception:
+        if conn is not None:
+            try:
+                conn.rollback()
+            finally:
+                conn.close()
+        TAKEOVER_TRANSPORT_LOCK.release()
+        raise
+
+
+def finish_submit_click_fence(fence: SubmitClickFence, *, clicked: bool) -> None:
+    """Commit after the click or rollback on a click failure, then release the fence."""
+    if fence.committed:
+        return
+    try:
+        if clicked:
+            fence.conn.commit()
+            fence.committed = True
+        else:
+            fence.conn.rollback()
+    finally:
+        fence.conn.close()
+        TAKEOVER_TRANSPORT_LOCK.release()
+
+
+def takeover_owner_matches(owner: str, custom_path: Path | None = None) -> bool:
+    """Return whether ``owner`` holds a non-expired takeover lease.
+
+    Callers that mutate takeover state must invoke this while holding
+    ``TAKEOVER_TRANSPORT_LOCK``. The re-entrant lock here also keeps direct
+    callers safe and makes the expiry check part of the same relay fence.
+    """
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with TAKEOVER_TRANSPORT_LOCK:
+        conn = get_connection(custom_path)
+        try:
+            row = conn.execute(
+                """
+                SELECT manual_takeover_owner, manual_takeover_expires_at
+                FROM runtime_control WHERE id = 1;
+                """
+            ).fetchone()
+            return bool(
+                row
+                and row["manual_takeover_owner"] == owner
+                and row["manual_takeover_expires_at"]
+                and row["manual_takeover_expires_at"] > now_str
+            )
+        finally:
+            conn.close()
 
 
 class JobState(str, Enum):
@@ -364,20 +503,22 @@ def claim_next_job(
             # - ready
             # - retry_wait where next_retry_at is passed
             # - claimed/navigating/filling/validating where lease has expired
-            query = """
-                SELECT j.* FROM automation_jobs j
-                JOIN applications a ON a.id = j.app_id
-                WHERE j.is_cancelled = 0
-                  AND LOWER(a.status) != 'dismissed'
-                  AND (
-                    j.state = 'ready'
-                    OR (j.state = 'retry_wait' AND (j.next_retry_at IS NULL OR j.next_retry_at <= ?))
-                    OR (j.state IN ('claimed', 'navigating', 'filling', 'validating') AND j.lease_expires_at IS NOT NULL AND j.lease_expires_at <= ?)
-                  )
-                ORDER BY j.priority DESC, j.created_at ASC
-                LIMIT 1;
-            """
-            job_row = conn.execute(query, (now_str, now_str)).fetchone()
+            job_row = conn.execute(
+                """
+                    SELECT j.* FROM automation_jobs j
+                    JOIN applications a ON a.id = j.app_id
+                    WHERE j.is_cancelled = 0
+                      AND LOWER(a.status) != 'dismissed'
+                      AND (
+                        j.state = 'ready'
+                        OR (j.state = 'retry_wait' AND (j.next_retry_at IS NULL OR j.next_retry_at <= ?))
+                        OR (j.state IN ('claimed', 'navigating', 'filling', 'validating') AND j.lease_expires_at IS NOT NULL AND j.lease_expires_at <= ?)
+                      )
+                    ORDER BY j.priority DESC, j.created_at ASC
+                    LIMIT 1;
+                """,
+                (now_str, now_str),
+            ).fetchone()
             if not job_row:
                 conn.execute("COMMIT;")
                 return None
@@ -441,13 +582,15 @@ def renew_lease(
     Heartbeat mechanism: Renews the lease for an active worker.
     Fails closed if the worker has lost ownership or if the system is paused/stopped.
     """
-    now_dt = datetime.now()
-    now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
-    lease_exp_str = (now_dt + timedelta(seconds=lease_seconds)).strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-
     with _QUEUE_LOCK:
+        # Capture the clock only after waiting for the writer lock. Otherwise
+        # lock contention can make a stale heartbeat renew an already-expired
+        # claim using a timestamp sampled before the wait.
+        now_dt = datetime.now()
+        now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+        lease_exp_str = (now_dt + timedelta(seconds=lease_seconds)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
         conn = get_connection(custom_path)
         try:
             with conn:
@@ -461,9 +604,10 @@ def renew_lease(
                     """
                     UPDATE automation_jobs
                     SET lease_expires_at = ?, updated_at = ?
-                    WHERE id = ? AND lease_owner = ? AND fencing_generation = ? AND is_cancelled = 0;
+                    WHERE id = ? AND lease_owner = ? AND fencing_generation = ?
+                      AND is_cancelled = 0 AND lease_expires_at > ?;
                     """,
-                    (lease_exp_str, now_str, job_id, worker_id, generation),
+                    (lease_exp_str, now_str, job_id, worker_id, generation, now_str),
                 )
                 return cursor.rowcount > 0
         finally:
@@ -480,40 +624,100 @@ def transition_job(
     error_message: str = "",
     custom_path: Path | None = None,
     conn: sqlite3.Connection | None = None,
+    require_live_lease: bool = False,
+    required_lease_margin_seconds: int = 0,
+    pause_runtime_after_success: bool = False,
+    next_retry_at: str | None = None,
+    decrement_attempt_count: bool = False,
 ) -> bool:
-    """Guarded state transition requiring matching lease owner and fencing generation."""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    """Guarded state transition requiring matching owner/generation and lease runway."""
 
     def _execute(active_conn: sqlite3.Connection) -> bool:
+        # Evaluate the clock only after acquiring the queue lock. A caller that
+        # waited behind another writer must not use a pre-lock lease timestamp.
+        now = datetime.now()
+        now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+        lease_cutoff = (
+            now + timedelta(seconds=required_lease_margin_seconds)
+        ).strftime("%Y-%m-%d %H:%M:%S")
         previous_row = active_conn.execute(
             "SELECT state FROM automation_jobs WHERE id = ? AND lease_owner = ? AND fencing_generation = ?;",
             (job_id, worker_id, generation),
         ).fetchone()
-        cursor = active_conn.execute(
-            """
-            UPDATE automation_jobs
-            SET state = ?,
-                checkpoint = CASE WHEN ? != '' THEN ? ELSE checkpoint END,
-                error_code = CASE WHEN ? != '' THEN ? ELSE error_code END,
-                error_message = CASE WHEN ? != '' THEN ? ELSE error_message END,
-                updated_at = ?
-            WHERE id = ? AND lease_owner = ? AND fencing_generation = ? AND is_cancelled = 0;
-            """,
-            (
-                to_state,
-                checkpoint,
-                checkpoint,
-                error_code,
-                error_code,
-                error_message,
-                error_message,
-                now,
-                job_id,
-                worker_id,
-                generation,
-            ),
+        retry_set = (
+            "\n                    next_retry_at = ?,"
+            if next_retry_at is not None
+            else ""
         )
+        retry_params: list[Any] = [next_retry_at] if next_retry_at is not None else []
+        attempt_set = (
+            "\n                    attempt_count = CASE WHEN attempt_count > 0 THEN attempt_count - 1 ELSE 0 END,"
+            if decrement_attempt_count
+            else ""
+        )
+        if require_live_lease or required_lease_margin_seconds > 0:
+            cursor = active_conn.execute(
+                f"""
+                UPDATE automation_jobs
+                SET state = ?,{retry_set}{attempt_set}
+                    checkpoint = CASE WHEN ? != '' THEN ? ELSE checkpoint END,
+                    error_code = CASE WHEN ? != '' THEN ? ELSE error_code END,
+                    error_message = CASE WHEN ? != '' THEN ? ELSE error_message END,
+                    updated_at = ?
+                WHERE id = ? AND lease_owner = ? AND fencing_generation = ?
+                  AND is_cancelled = 0 AND lease_expires_at > ?;
+                """,
+                (
+                    to_state,
+                    *retry_params,
+                    checkpoint,
+                    checkpoint,
+                    error_code,
+                    error_code,
+                    error_message,
+                    error_message,
+                    now_str,
+                    job_id,
+                    worker_id,
+                    generation,
+                    lease_cutoff,
+                ),
+            )
+        else:
+            cursor = active_conn.execute(
+                f"""
+                UPDATE automation_jobs
+                SET state = ?,{retry_set}{attempt_set}
+                    checkpoint = CASE WHEN ? != '' THEN ? ELSE checkpoint END,
+                    error_code = CASE WHEN ? != '' THEN ? ELSE error_code END,
+                    error_message = CASE WHEN ? != '' THEN ? ELSE error_message END,
+                    updated_at = ?
+                WHERE id = ? AND lease_owner = ? AND fencing_generation = ?
+                  AND is_cancelled = 0;
+                """,
+                (
+                    to_state,
+                    *retry_params,
+                    checkpoint,
+                    checkpoint,
+                    error_code,
+                    error_code,
+                    error_message,
+                    error_message,
+                    now_str,
+                    job_id,
+                    worker_id,
+                    generation,
+                ),
+            )
         success = cursor.rowcount > 0
+        if success and pause_runtime_after_success:
+            # This follows the winning job transition in the same SQLite write
+            # transaction, preventing a stale worker from pausing a replacement.
+            active_conn.execute(
+                "UPDATE runtime_control SET is_paused = 1, updated_at = ? WHERE id = 1;",
+                (now_str,),
+            )
         if success:
             row = active_conn.execute(
                 "SELECT app_id FROM automation_jobs WHERE id = ?;", (job_id,)
@@ -523,17 +727,17 @@ def transition_job(
                 if to_state == JobState.FAILED_PERMANENT.value:
                     active_conn.execute(
                         "UPDATE applications SET status = 'failed', notes = CASE WHEN ? != '' THEN ? ELSE notes END, updated_at = ? WHERE id = ?;",
-                        (error_message, error_message, now, app_id),
+                        (error_message, error_message, now_str, app_id),
                     )
                 elif to_state == JobState.CANCELLED.value:
                     active_conn.execute(
                         "UPDATE applications SET status = 'cancelled', notes = CASE WHEN ? != '' THEN ? ELSE notes END, updated_at = ? WHERE id = ?;",
-                        (error_message, error_message, now, app_id),
+                        (error_message, error_message, now_str, app_id),
                     )
                 elif to_state == JobState.AMBIGUOUS_SUBMISSION.value:
                     active_conn.execute(
                         "UPDATE applications SET status = 'ambiguous', notes = CASE WHEN ? != '' THEN ? ELSE notes END, updated_at = ? WHERE id = ?;",
-                        (error_message, error_message, now, app_id),
+                        (error_message, error_message, now_str, app_id),
                     )
             record_event(
                 job_id=job_id,
@@ -655,9 +859,10 @@ def record_submit_intent(
     DURABLE SAFETY GATE: Persists submit intent to disk BEFORE the browser clicks submit.
     If the worker crashes or loses network connectivity after this point, it CANNOT be blindly retried.
     """
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
     with _QUEUE_LOCK:
+        # Sample the clock after acquiring the writer lock; intent persistence
+        # must not use a timestamp captured while waiting behind another writer.
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn = get_connection(custom_path)
         try:
             with conn:
@@ -669,14 +874,27 @@ def record_submit_intent(
                     checkpoint="submit_intent_persisted",
                     custom_path=custom_path,
                     conn=conn,
+                    require_live_lease=True,
+                    required_lease_margin_seconds=SUBMIT_LEASE_MARGIN_SECONDS,
                 )
                 if not job_ok:
                     return False
 
-                conn.execute(
-                    "UPDATE application_attempts SET submit_intent_at = ? WHERE id = ?;",
-                    (now, attempt_id),
+                attempt_cursor = conn.execute(
+                    """
+                    UPDATE application_attempts
+                    SET submit_intent_at = ?
+                    WHERE id = ? AND job_id = ? AND worker_id = ?
+                      AND lease_generation = ? AND submit_intent_at IS NULL;
+                    """,
+                    (now, attempt_id, job_id, worker_id, generation),
                 )
+                if attempt_cursor.rowcount != 1:
+                    # The job transition and attempt marker are one atomic
+                    # safety decision. Never commit submit_intent without a
+                    # matching attempt owned by this worker generation.
+                    conn.rollback()
+                    return False
                 app_row = conn.execute(
                     "SELECT app_id FROM automation_jobs WHERE id = ?;", (job_id,)
                 ).fetchone()
@@ -699,6 +917,351 @@ def record_submit_intent(
             conn.close()
 
 
+def has_submit_permit(
+    job_id: str,
+    worker_id: str,
+    generation: int,
+    custom_path: Path | None = None,
+    margin_seconds: int = SUBMIT_LEASE_MARGIN_SECONDS,
+) -> bool:
+    """Check final lease runway immediately before a physical submit click.
+
+    This is a brief fenced database check. The queue lock and database
+    connection are released before Playwright I/O; the margin prevents a
+    nearly-expired worker from beginning a slow browser action.
+    """
+    with _QUEUE_LOCK:
+        now = datetime.now()
+        cutoff = (now + timedelta(seconds=margin_seconds)).strftime("%Y-%m-%d %H:%M:%S")
+        conn = get_connection(custom_path)
+        try:
+            row = conn.execute(
+                """
+                SELECT 1 FROM automation_jobs
+                WHERE id = ? AND lease_owner = ? AND fencing_generation = ?
+                  AND state = ? AND is_cancelled = 0
+                  AND lease_expires_at > ?;
+                """,
+                (
+                    job_id,
+                    worker_id,
+                    generation,
+                    JobState.SUBMIT_INTENT.value,
+                    cutoff,
+                ),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
+
+def _record_ambiguous_notification_on_conn(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str,
+    app_id: str | None,
+    event_id: int,
+    message: str,
+    custom_path: Path | None,
+) -> None:
+    """Persist an idempotent in-app alert and outbox intent in ``conn``."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    dedup_key = f"ambiguous_submission:{job_id}"
+    existing = conn.execute(
+        "SELECT 1 FROM notification_outbox WHERE dedup_key = ?;", (dedup_key,)
+    ).fetchone()
+    if not existing:
+        notif_id = f"notif_{uuid.uuid4().hex[:8]}"
+        conn.execute(
+            """
+            INSERT INTO notifications (
+                notification_id, job_id, app_id, event_id, category, severity,
+                title, message, url, details_json, acknowledged, created_at
+            )
+            SELECT ?, ?, ?, ?, 'ambiguous_submission', 'critical', ?, ?, '', ?, 0, ?
+            WHERE NOT EXISTS (
+                SELECT 1 FROM notifications
+                WHERE job_id = ? AND category = 'ambiguous_submission'
+            );
+            """,
+            (
+                notif_id,
+                job_id,
+                app_id,
+                event_id,
+                "Ambiguous Application Submission",
+                message,
+                json.dumps({"job_id": job_id}, separators=(",", ":")),
+                now,
+                job_id,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO notification_outbox (
+                id, dedup_key, status, category, urgency, title, message, url,
+                payload_json, attempt_count, created_at
+            ) VALUES (?, ?, 'pending', 'ambiguous_submission', 'high', ?, ?, '', ?, 0, ?)
+            ON CONFLICT(dedup_key) DO UPDATE SET message = excluded.message;
+            """,
+            (
+                notif_id,
+                dedup_key,
+                "Ambiguous Application Submission",
+                message,
+                json.dumps({"job_id": job_id}, separators=(",", ":")),
+                now,
+            ),
+        )
+
+
+def _mark_job_ambiguous_on_conn(
+    conn: sqlite3.Connection,
+    job_id: str,
+    reason: str,
+    *,
+    custom_path: Path | None = None,
+    expected_worker_id: str | None = None,
+    expected_generation: int | None = None,
+    source_states: tuple[str, ...] = (
+        JobState.CLAIMED.value,
+        JobState.NAVIGATING.value,
+        JobState.FILLING.value,
+        JobState.VALIDATING.value,
+        JobState.SUBMIT_INTENT.value,
+        JobState.VERIFYING.value,
+    ),
+    checkpoint: str = "ambiguous_submission",
+    error_code: str = "POST_SUBMIT_UNCERTAIN",
+    pause_runtime: bool = True,
+    attempt_id: str | None = None,
+    operation_key: str | None = None,
+    repair_existing: bool = False,
+    event_type: str = "ambiguous_submission",
+    require_live_lease: bool = False,
+) -> bool:
+    """Apply the canonical ambiguity projection inside the caller transaction."""
+    message = reason[:1000]
+    event_key = operation_key or f"ambiguous:{job_id}:{checkpoint}:{error_code}"
+    row = conn.execute(
+        "SELECT id, app_id, state, lease_owner, fencing_generation, lease_expires_at FROM automation_jobs WHERE id = ?;",
+        (job_id,),
+    ).fetchone()
+    if not row:
+        return False
+    previous_state = row["state"]
+    if previous_state == JobState.AMBIGUOUS_SUBMISSION.value:
+        if not repair_existing:
+            return False
+        open_attempt = conn.execute(
+            "SELECT id, attempt_number, completed_at, is_ambiguous FROM application_attempts WHERE job_id = ? ORDER BY created_at DESC LIMIT 1;",
+            (job_id,),
+        ).fetchone()
+        app_projection = conn.execute(
+            "SELECT status FROM applications WHERE id = ?;",
+            (row["app_id"],),
+        ).fetchone()
+        event_exists = conn.execute(
+            "SELECT 1 FROM automation_events WHERE job_id = ? AND event_type = 'ambiguous_submission' LIMIT 1;",
+            (job_id,),
+        ).fetchone()
+        outbox_exists = conn.execute(
+            "SELECT 1 FROM notification_outbox WHERE dedup_key = ?;",
+            (f"ambiguous_submission:{job_id}",),
+        ).fetchone()
+        # A job may have reached ambiguity before its attempt
+        # row was created. In that case there is no attempt
+        # projection to repair; repeated sweeps must be a no-op.
+        attempt_projection_ok = open_attempt is None or bool(
+            open_attempt["completed_at"] is not None and open_attempt["is_ambiguous"]
+        )
+        if (
+            attempt_projection_ok
+            and app_projection is not None
+            and app_projection["status"] == "ambiguous"
+            and event_exists
+            and outbox_exists
+        ):
+            return False
+        transitioned = True
+    else:
+        if previous_state not in source_states:
+            return False
+        predicates = ["id = ?", "state = ?"]
+        params: list[Any] = [job_id, previous_state]
+        if expected_worker_id is not None:
+            predicates.append("lease_owner = ?")
+            params.append(expected_worker_id)
+        if expected_generation is not None:
+            predicates.append("fencing_generation = ?")
+            params.append(expected_generation)
+        if require_live_lease:
+            predicates.append("lease_expires_at > ?")
+            params.append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        cursor = conn.execute(
+            f"""
+            UPDATE automation_jobs
+            SET state = 'ambiguous_submission', checkpoint = ?,
+                lease_owner = NULL, lease_expires_at = NULL,
+                fencing_generation = fencing_generation + 1,
+                error_code = ?, error_message = ?, updated_at = ?
+            WHERE {" AND ".join(predicates)};
+            """,
+            [
+                checkpoint,
+                error_code,
+                message,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                *params,
+            ],
+        )
+        if cursor.rowcount != 1:
+            return False
+        transitioned = True
+    if not transitioned:
+        return False
+    app_id = row["app_id"]
+    attempt = None
+    if attempt_id:
+        attempt = conn.execute(
+            "SELECT id, attempt_number FROM application_attempts WHERE id = ? AND job_id = ?;",
+            (attempt_id, job_id),
+        ).fetchone()
+    if attempt is None:
+        attempt = conn.execute(
+            """
+            SELECT id, attempt_number FROM application_attempts
+            WHERE job_id = ? AND (completed_at IS NULL OR is_ambiguous = 1)
+            ORDER BY created_at DESC LIMIT 1;
+            """,
+            (job_id,),
+        ).fetchone()
+    if attempt:
+        conn.execute(
+            """
+            UPDATE application_attempts
+            SET outcome = 'ambiguous', confirmation_evidence = ?,
+                error_details = ?, is_ambiguous = 1,
+                completed_at = COALESCE(completed_at, ?)
+            WHERE id = ? AND job_id = ?;
+            """,
+            (
+                message,
+                message,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                attempt["id"],
+                job_id,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE automation_job_status
+            SET attempt_id = ?, attempt_number = ?, outcome = 'ambiguous',
+                completed_at = COALESCE(completed_at, ?), updated_at = ?
+            WHERE job_id = ? AND (attempt_id IS NULL OR attempt_id = ?);
+            """,
+            (
+                attempt["id"],
+                attempt["attempt_number"],
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                job_id,
+                attempt["id"],
+            ),
+        )
+    conn.execute(
+        "UPDATE applications SET status = 'ambiguous', notes = ?, updated_at = ? WHERE id = ?;",
+        (message, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), app_id),
+    )
+    if pause_runtime:
+        conn.execute(
+            "UPDATE runtime_control SET is_paused = 1, updated_at = ? WHERE id = 1;",
+            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),),
+        )
+    event_id = record_event(
+        job_id=job_id,
+        app_id=app_id,
+        attempt_id=attempt["id"] if attempt else None,
+        attempt_number=attempt["attempt_number"] if attempt else None,
+        event_key=event_key,
+        event_type=event_type,
+        level="CRITICAL",
+        step="ambiguous_submission",
+        message=message,
+        details={
+            "previous_state": previous_state,
+            "error_code": error_code,
+        },
+        worker_id=expected_worker_id,
+        lease_generation=expected_generation,
+        from_state=previous_state,
+        to_state=JobState.AMBIGUOUS_SUBMISSION.value,
+        outcome_code=JobState.AMBIGUOUS_SUBMISSION.value,
+        custom_path=custom_path,
+        conn=conn,
+    )
+    _record_ambiguous_notification_on_conn(
+        conn,
+        job_id=job_id,
+        app_id=app_id,
+        event_id=event_id,
+        message=message,
+        custom_path=custom_path,
+    )
+    return True
+
+
+def mark_job_ambiguous(
+    job_id: str,
+    reason: str,
+    *,
+    custom_path: Path | None = None,
+    expected_worker_id: str | None = None,
+    expected_generation: int | None = None,
+    source_states: tuple[str, ...] = (
+        JobState.CLAIMED.value,
+        JobState.NAVIGATING.value,
+        JobState.FILLING.value,
+        JobState.VALIDATING.value,
+        JobState.SUBMIT_INTENT.value,
+        JobState.VERIFYING.value,
+    ),
+    checkpoint: str = "ambiguous_submission",
+    error_code: str = "POST_SUBMIT_UNCERTAIN",
+    pause_runtime: bool = True,
+    attempt_id: str | None = None,
+    operation_key: str | None = None,
+    repair_existing: bool = False,
+    event_type: str = "ambiguous_submission",
+    require_live_lease: bool = False,
+) -> bool:
+    """Atomically transition a job to ambiguous and repair all projections."""
+    init_db(custom_path)
+    with _QUEUE_LOCK:
+        conn = get_connection(custom_path)
+        try:
+            with conn:
+                return _mark_job_ambiguous_on_conn(
+                    conn,
+                    job_id,
+                    reason,
+                    custom_path=custom_path,
+                    expected_worker_id=expected_worker_id,
+                    expected_generation=expected_generation,
+                    source_states=source_states,
+                    checkpoint=checkpoint,
+                    error_code=error_code,
+                    pause_runtime=pause_runtime,
+                    attempt_id=attempt_id,
+                    operation_key=operation_key,
+                    repair_existing=repair_existing,
+                    event_type=event_type,
+                    require_live_lease=require_live_lease,
+                )
+        finally:
+            conn.close()
+
+
 def complete_attempt(
     attempt_id: str,
     outcome: str,
@@ -706,6 +1269,10 @@ def complete_attempt(
     error_details: str = "",
     is_ambiguous: bool = False,
     custom_path: Path | None = None,
+    *,
+    expected_job_id: str | None = None,
+    expected_worker_id: str | None = None,
+    expected_generation: int | None = None,
 ) -> bool:
     """Records the final audit outcome of an application attempt."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -719,8 +1286,24 @@ def complete_attempt(
                     if error_details
                     else ""
                 )
+                attempt_where = "id = ?"
+                attempt_params: list[Any] = [attempt_id]
+                if expected_job_id is not None:
+                    attempt_where += " AND job_id = ?"
+                    attempt_params.append(expected_job_id)
+                if expected_worker_id is not None:
+                    attempt_where += " AND worker_id = ?"
+                    attempt_params.append(expected_worker_id)
+                if expected_generation is not None:
+                    attempt_where += " AND lease_generation = ?"
+                    attempt_params.append(expected_generation)
+                if expected_job_id is not None and expected_generation is not None:
+                    attempt_where += " AND EXISTS (SELECT 1 FROM automation_jobs j WHERE j.id = application_attempts.job_id AND j.id = ? AND j.fencing_generation = ? AND j.lease_owner = ? AND j.state != 'ready')"
+                    attempt_params.extend(
+                        [expected_job_id, expected_generation, expected_worker_id]
+                    )
                 cursor = conn.execute(
-                    """
+                    f"""
                     UPDATE application_attempts
                     SET outcome = ?,
                         confirmation_evidence = ?,
@@ -728,7 +1311,7 @@ def complete_attempt(
                         redacted_error_code = CASE WHEN ? != '' THEN ? ELSE redacted_error_code END,
                         is_ambiguous = ?,
                         completed_at = ?
-                    WHERE id = ?;
+                    WHERE {attempt_where};
                     """,
                     (
                         outcome,
@@ -738,7 +1321,7 @@ def complete_attempt(
                         outcome,
                         1 if is_ambiguous else 0,
                         now,
-                        attempt_id,
+                        *attempt_params,
                     ),
                 )
                 if cursor.rowcount:
@@ -748,7 +1331,13 @@ def complete_attempt(
                     ).fetchone()
                     if row:
                         conn.execute(
-                            "UPDATE automation_job_status SET attempt_id = ?, attempt_number = ?, outcome = ?, completed_at = ?, updated_at = ? WHERE job_id = ?;",
+                            """
+                            UPDATE automation_job_status
+                            SET attempt_id = ?, attempt_number = ?, outcome = ?,
+                                completed_at = ?, updated_at = ?
+                            WHERE job_id = ?
+                              AND (attempt_id IS NULL OR attempt_id = ?);
+                            """,
                             (
                                 attempt_id,
                                 row["attempt_number"],
@@ -756,6 +1345,7 @@ def complete_attempt(
                                 now,
                                 now,
                                 row["job_id"],
+                                attempt_id,
                             ),
                         )
                 return cursor.rowcount > 0
@@ -781,20 +1371,11 @@ def handle_job_failure(
     """
     err_msg = str(error)
     now_dt = datetime.now()
-    now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
 
     # 1. Post-submit failure
     if not is_pre_submit:
         if error_category != "ambiguous_submission":
-            if attempt_id:
-                complete_attempt(
-                    attempt_id=attempt_id,
-                    outcome="failed_permanent",
-                    error_details=err_msg,
-                    is_ambiguous=False,
-                    custom_path=custom_path,
-                )
-            transition_job(
+            transitioned = transition_job(
                 job_id=job_id,
                 worker_id=worker_id,
                 generation=generation,
@@ -802,50 +1383,44 @@ def handle_job_failure(
                 error_code="SUBMISSION_REJECTED",
                 error_message=err_msg,
                 custom_path=custom_path,
+                require_live_lease=True,
             )
+            if not transitioned:
+                return "lease_lost"
+            if attempt_id:
+                complete_attempt(
+                    attempt_id=attempt_id,
+                    outcome="failed_permanent",
+                    error_details=err_msg,
+                    is_ambiguous=False,
+                    custom_path=custom_path,
+                    expected_job_id=job_id,
+                    expected_worker_id=worker_id,
+                    expected_generation=generation,
+                )
             return JobState.FAILED_PERMANENT.value
 
-        if attempt_id:
-            complete_attempt(
-                attempt_id=attempt_id,
-                outcome="ambiguous",
-                error_details=err_msg,
-                is_ambiguous=True,
-                custom_path=custom_path,
-            )
-        transition_job(
-            job_id=job_id,
-            worker_id=worker_id,
-            generation=generation,
-            to_state=JobState.AMBIGUOUS_SUBMISSION.value,
-            error_code="POST_SUBMIT_UNCERTAIN",
-            error_message=err_msg,
-            custom_path=custom_path,
-        )
         safe_msg = (
             f"Job attempt {job_id[:8] if job_id else ''} encountered an uncertain outcome after submission was triggered. "
             "Automatic retry is disabled to prevent duplicate submissions."
         )
-        enqueue_notification(
-            category="ambiguous_submission",
-            urgency="high",
-            title="Ambiguous Application Submission",
-            message=safe_msg,
+        transitioned = mark_job_ambiguous(
+            job_id,
+            safe_msg,
             custom_path=custom_path,
-            job_id=job_id,
+            expected_worker_id=worker_id,
+            expected_generation=generation,
+            attempt_id=attempt_id,
+            checkpoint="post_submit_ambiguous",
+            error_code="POST_SUBMIT_UNCERTAIN",
+            operation_key=f"post_submit_ambiguous:{job_id}:{generation}",
+            require_live_lease=True,
         )
-        return JobState.AMBIGUOUS_SUBMISSION.value
+        return JobState.AMBIGUOUS_SUBMISSION.value if transitioned else "lease_lost"
 
     # 2. Pre-submit interactive exceptions
     if error_category in EXCEPTION_STATES:
-        if attempt_id:
-            complete_attempt(
-                attempt_id=attempt_id,
-                outcome=error_category,
-                error_details=err_msg,
-                custom_path=custom_path,
-            )
-        transition_job(
+        transitioned = transition_job(
             job_id=job_id,
             worker_id=worker_id,
             generation=generation,
@@ -853,7 +1428,20 @@ def handle_job_failure(
             error_code=error_category.upper(),
             error_message=err_msg,
             custom_path=custom_path,
+            require_live_lease=True,
         )
+        if not transitioned:
+            return "lease_lost"
+        if attempt_id:
+            complete_attempt(
+                attempt_id=attempt_id,
+                outcome=error_category,
+                error_details=err_msg,
+                custom_path=custom_path,
+                expected_job_id=job_id,
+                expected_worker_id=worker_id,
+                expected_generation=generation,
+            )
         if error_category == "unknown_question":
             safe_title = "Action Required: Novel Screening Question"
             safe_msg = f"Job attempt {job_id[:8] if job_id else ''} paused: Unknown screening question requires approved answer."
@@ -879,14 +1467,7 @@ def handle_job_failure(
 
     # 2b. Pre-submit permanent failure (e.g. aggregator URL blocked)
     if error_category == "failed_permanent":
-        if attempt_id:
-            complete_attempt(
-                attempt_id=attempt_id,
-                outcome="failed_permanent",
-                error_details=err_msg,
-                custom_path=custom_path,
-            )
-        transition_job(
+        transitioned = transition_job(
             job_id=job_id,
             worker_id=worker_id,
             generation=generation,
@@ -894,7 +1475,20 @@ def handle_job_failure(
             error_code="FAILED_PERMANENT",
             error_message=err_msg,
             custom_path=custom_path,
+            require_live_lease=True,
         )
+        if not transitioned:
+            return "lease_lost"
+        if attempt_id:
+            complete_attempt(
+                attempt_id=attempt_id,
+                outcome="failed_permanent",
+                error_details=err_msg,
+                custom_path=custom_path,
+                expected_job_id=job_id,
+                expected_worker_id=worker_id,
+                expected_generation=generation,
+            )
         return JobState.FAILED_PERMANENT.value
 
     # 3. Pre-submit transient failure: bounded exponential backoff
@@ -917,40 +1511,33 @@ def handle_job_failure(
             "%Y-%m-%d %H:%M:%S"
         )
 
+        transitioned = transition_job(
+            job_id=job_id,
+            worker_id=worker_id,
+            generation=generation,
+            to_state=JobState.RETRY_WAIT.value,
+            checkpoint="retry_wait",
+            error_code="PRE_SUBMIT_TRANSIENT",
+            error_message=err_msg,
+            custom_path=custom_path,
+            require_live_lease=True,
+            next_retry_at=next_retry_str,
+        )
+        if not transitioned:
+            return "lease_lost"
         if attempt_id:
             complete_attempt(
                 attempt_id=attempt_id,
                 outcome="retry_wait",
                 error_details=err_msg,
                 custom_path=custom_path,
+                expected_job_id=job_id,
+                expected_worker_id=worker_id,
+                expected_generation=generation,
             )
 
-        with _QUEUE_LOCK:
-            conn = get_connection(custom_path)
-            try:
-                with conn:
-                    conn.execute(
-                        """
-                        UPDATE automation_jobs
-                        SET state = 'retry_wait',
-                            next_retry_at = ?,
-                            error_code = 'PRE_SUBMIT_TRANSIENT',
-                            error_message = ?,
-                            updated_at = ?
-                        WHERE id = ? AND lease_owner = ? AND fencing_generation = ?;
-                        """,
-                        (
-                            next_retry_str,
-                            err_msg,
-                            now_str,
-                            job_id,
-                            worker_id,
-                            generation,
-                        ),
-                    )
-            finally:
-                conn.close()
-
+        # The guarded transition above is the ownership decision. Only its
+        # winner may emit the retry event or project attempt status.
         record_event(
             job_id=job_id,
             app_id=None,
@@ -963,15 +1550,9 @@ def handle_job_failure(
         )
         return JobState.RETRY_WAIT.value
 
-    # Exhausted retries -> failed_permanent
-    if attempt_id:
-        complete_attempt(
-            attempt_id=attempt_id,
-            outcome="failed_permanent",
-            error_details=err_msg,
-            custom_path=custom_path,
-        )
-    transition_job(
+    # Exhausted retries -> failed_permanent. Transition first so a stale worker
+    # cannot complete an attempt or status row belonging to a replacement.
+    transitioned = transition_job(
         job_id=job_id,
         worker_id=worker_id,
         generation=generation,
@@ -979,7 +1560,20 @@ def handle_job_failure(
         error_code="MAX_RETRIES_EXCEEDED",
         error_message=err_msg,
         custom_path=custom_path,
+        require_live_lease=True,
     )
+    if not transitioned:
+        return "lease_lost"
+    if attempt_id:
+        complete_attempt(
+            attempt_id=attempt_id,
+            outcome="failed_permanent",
+            error_details=err_msg,
+            custom_path=custom_path,
+            expected_job_id=job_id,
+            expected_worker_id=worker_id,
+            expected_generation=generation,
+        )
     return JobState.FAILED_PERMANENT.value
 
 
@@ -994,47 +1588,35 @@ def reschedule_for_safety_gate(
 ) -> str:
     """Reschedules a job that hit a safety gate (pacing or daily limit) without burning retries."""
     now_dt = datetime.now()
-    now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
     next_retry_str = (now_dt + timedelta(seconds=retry_delay_seconds)).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
 
+    transitioned = transition_job(
+        job_id=job_id,
+        worker_id=worker_id,
+        generation=generation,
+        to_state=JobState.RETRY_WAIT.value,
+        checkpoint="safety_gate_wait",
+        error_code="SAFETY_GATE_WAIT",
+        error_message=reason,
+        custom_path=custom_path,
+        require_live_lease=True,
+        next_retry_at=next_retry_str,
+        decrement_attempt_count=True,
+    )
+    if not transitioned:
+        return "lease_lost"
     if attempt_id:
         complete_attempt(
             attempt_id=attempt_id,
             outcome="safety_gate_wait",
             error_details=reason,
             custom_path=custom_path,
+            expected_job_id=job_id,
+            expected_worker_id=worker_id,
+            expected_generation=generation,
         )
-
-    with _QUEUE_LOCK:
-        conn = get_connection(custom_path)
-        try:
-            with conn:
-                conn.execute(
-                    """
-                    UPDATE automation_jobs
-                    SET state = 'retry_wait',
-                        lease_owner = NULL,
-                        lease_expires_at = NULL,
-                        next_retry_at = ?,
-                        attempt_count = CASE WHEN attempt_count > 0 THEN attempt_count - 1 ELSE 0 END,
-                        error_code = 'SAFETY_GATE_WAIT',
-                        error_message = ?,
-                        updated_at = ?
-                    WHERE id = ? AND lease_owner = ? AND fencing_generation = ?;
-                    """,
-                    (
-                        next_retry_str,
-                        reason,
-                        now_str,
-                        job_id,
-                        worker_id,
-                        generation,
-                    ),
-                )
-        finally:
-            conn.close()
 
     record_event(
         job_id=job_id,
@@ -1139,81 +1721,170 @@ def cancel_job(job_id: str, reason: str = "", custom_path: Path | None = None) -
 
 
 def skip_job(job_id: str, reason: str = "", custom_path: Path | None = None) -> bool:
-    """Marks a job and associated application as skipped."""
+    """Fence a skip and preserve an outcome-unknown submission as ambiguous."""
+    init_db(custom_path)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
+    message = reason or "Skipped by operator"
     with _QUEUE_LOCK:
         conn = get_connection(custom_path)
         try:
             with conn:
                 row = conn.execute(
                     """
-                    SELECT id, app_id FROM automation_jobs
+                    SELECT id, app_id, state, lease_owner, fencing_generation
+                    FROM automation_jobs
                     WHERE id = ? OR app_id = ?
                     ORDER BY created_at DESC LIMIT 1;
                     """,
                     (job_id, job_id),
                 ).fetchone()
-
-                if row:
-                    actual_job_id = row["id"]
-                    app_id = row["app_id"]
-
+                if not row:
+                    app_row = conn.execute(
+                        "SELECT id FROM applications WHERE id = ?;", (job_id,)
+                    ).fetchone()
+                    if not app_row:
+                        return False
                     conn.execute(
-                        """
-                        UPDATE automation_jobs
-                        SET state = 'skipped', error_message = ?, updated_at = ?
-                        WHERE id = ?;
-                        """,
-                        (reason or "Skipped by operator", now, actual_job_id),
+                        "UPDATE applications SET status = 'skipped', notes = ?, updated_at = ? WHERE id = ?;",
+                        (reason, now, app_row["id"]),
                     )
-                    if app_id:
-                        conn.execute(
-                            """
-                            UPDATE applications
-                            SET status = 'skipped', notes = CASE WHEN ? != '' THEN ? ELSE notes END, updated_at = ?
-                            WHERE id = ?;
-                            """,
-                            (reason, reason, now, app_id),
-                        )
                     record_event(
-                        job_id=actual_job_id,
-                        app_id=app_id,
+                        job_id=None,
+                        app_id=app_row["id"],
                         event_type="job_skipped",
                         level="INFO",
                         step="skipped",
-                        message=f"Job skipped: {reason or 'Operator skipped'}",
+                        message=f"Job skipped: {message}",
                         custom_path=custom_path,
                         conn=conn,
                     )
                     return True
-                else:
-                    # Fallback: check applications table directly
-                    app_row = conn.execute(
-                        "SELECT id FROM applications WHERE id = ?;", (job_id,)
+
+                actual_job_id = row["id"]
+                app_id = row["app_id"]
+                if row["state"] in (
+                    JobState.SUBMIT_INTENT.value,
+                    JobState.VERIFYING.value,
+                ):
+                    # The source-state snapshot is fenced by this transaction.
+                    # A concurrent submit click either commits first or sees
+                    # this ambiguous transition and is rejected by its fence.
+                    updated = conn.execute(
+                        """
+                        UPDATE automation_jobs
+                        SET state = 'ambiguous_submission', checkpoint = 'skip_ambiguous',
+                            lease_owner = NULL, lease_expires_at = NULL,
+                            fencing_generation = fencing_generation + 1,
+                            error_code = 'SKIP_DURING_SUBMISSION', error_message = ?, updated_at = ?
+                        WHERE id = ? AND state = ? AND fencing_generation = ?;
+                        """,
+                        (
+                            message,
+                            now,
+                            actual_job_id,
+                            row["state"],
+                            row["fencing_generation"],
+                        ),
+                    ).rowcount
+                    if updated != 1:
+                        return False
+                    conn.execute(
+                        "UPDATE applications SET status = 'ambiguous', notes = ?, updated_at = ? WHERE id = ?;",
+                        (message, now, app_id),
+                    )
+                    attempt = conn.execute(
+                        """
+                        SELECT id FROM application_attempts
+                        WHERE job_id = ? AND completed_at IS NULL
+                        ORDER BY created_at DESC LIMIT 1;
+                        """,
+                        (actual_job_id,),
                     ).fetchone()
-                    if app_row:
-                        app_id = app_row["id"]
+                    if attempt:
                         conn.execute(
                             """
-                            UPDATE applications
-                            SET status = 'skipped', notes = CASE WHEN ? != '' THEN ? ELSE notes END, updated_at = ?
-                            WHERE id = ?;
+                            UPDATE application_attempts
+                            SET outcome = 'ambiguous', error_details = ?, is_ambiguous = 1,
+                                completed_at = ? WHERE id = ? AND job_id = ?;
                             """,
-                            (reason, reason, now, app_id),
+                            (message, now, attempt["id"], actual_job_id),
                         )
-                        record_event(
-                            job_id=None,
-                            app_id=app_id,
-                            event_type="job_skipped",
-                            level="INFO",
-                            step="skipped",
-                            message=f"Job skipped: {reason or 'Operator skipped'}",
-                            custom_path=custom_path,
-                            conn=conn,
-                        )
-                        return True
+                    event_id = record_event(
+                        job_id=actual_job_id,
+                        app_id=app_id,
+                        attempt_id=attempt["id"] if attempt else None,
+                        event_key=f"skip_ambiguous:{actual_job_id}:{row['fencing_generation']}",
+                        event_type="job_skip_ambiguous",
+                        level="CRITICAL",
+                        step="ambiguous_submission",
+                        message=message,
+                        details={"previous_state": row["state"]},
+                        custom_path=custom_path,
+                        conn=conn,
+                    )
+                    _record_ambiguous_notification_on_conn(
+                        conn,
+                        job_id=actual_job_id,
+                        app_id=app_id,
+                        event_id=event_id,
+                        message=message,
+                        custom_path=custom_path,
+                    )
+                    conn.execute(
+                        "UPDATE runtime_control SET is_paused = 1, updated_at = ? WHERE id = 1;",
+                        (now,),
+                    )
+                    return True
+
+                pre_submit_states = {
+                    JobState.READY.value,
+                    JobState.CLAIMED.value,
+                    JobState.NAVIGATING.value,
+                    JobState.FILLING.value,
+                    JobState.VALIDATING.value,
+                    JobState.RETRY_WAIT.value,
+                    JobState.AUTH_REQUIRED.value,
+                    JobState.MFA_REQUIRED.value,
+                    JobState.CAPTCHA_REQUIRED.value,
+                    JobState.UNKNOWN_QUESTION.value,
+                    JobState.SITE_CHANGED.value,
+                }
+                if row["state"] not in pre_submit_states:
                     return False
+                updated = conn.execute(
+                    """
+                    UPDATE automation_jobs
+                    SET state = 'skipped', is_cancelled = 1,
+                        lease_owner = NULL, lease_expires_at = NULL,
+                        fencing_generation = fencing_generation + 1,
+                        error_message = ?, updated_at = ?
+                    WHERE id = ? AND state = ? AND fencing_generation = ?;
+                    """,
+                    (
+                        message,
+                        now,
+                        actual_job_id,
+                        row["state"],
+                        row["fencing_generation"],
+                    ),
+                ).rowcount
+                if updated != 1:
+                    return False
+                conn.execute(
+                    "UPDATE applications SET status = 'skipped', notes = ?, updated_at = ? WHERE id = ?;",
+                    (reason, now, app_id),
+                )
+                record_event(
+                    job_id=actual_job_id,
+                    app_id=app_id,
+                    event_type="job_skipped",
+                    level="INFO",
+                    step="skipped",
+                    message=f"Job skipped: {message}",
+                    custom_path=custom_path,
+                    conn=conn,
+                )
+                return True
         finally:
             conn.close()
 
@@ -1226,6 +1897,7 @@ def resolve_job(
     approved_scope: str = "global",
     force: bool = False,
     custom_path: Path | None = None,
+    expected_owner: str | None = None,
 ) -> bool:
     """
     Operator resolution for paused jobs:
@@ -1234,7 +1906,9 @@ def resolve_job(
     """
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    with _QUEUE_LOCK:
+    # Resolve is a takeover-mutating action in Access mode. Keep the ownership
+    # check and job mutation under the same transport fence as the viewer relay.
+    with TAKEOVER_TRANSPORT_LOCK, _QUEUE_LOCK:
         conn = get_connection(custom_path)
         try:
             with conn:
@@ -1252,10 +1926,53 @@ def resolve_job(
                 actual_job_id = row["id"]
                 app_id = row["app_id"]
 
-                if row["state"] == JobState.AMBIGUOUS_SUBMISSION.value and not force:
+                if expected_owner is not None and not takeover_owner_matches(
+                    expected_owner, custom_path
+                ):
+                    raise ValueError("takeover_owner_required")
+
+                previous_state = row["state"]
+                if previous_state == JobState.AMBIGUOUS_SUBMISSION.value and not force:
                     raise ValueError(
                         "Job has ambiguous_submission outcome. Re-queueing requires explicit force=True."
                     )
+                if previous_state == JobState.SKIPPED.value:
+                    # Skipped jobs are explicitly resolvable, but resolution
+                    # must make them claimable again. Do not leave the
+                    # cancellation bit or skipped application projection set.
+                    pass
+                elif previous_state not in {
+                    JobState.AUTH_REQUIRED.value,
+                    JobState.MFA_REQUIRED.value,
+                    JobState.CAPTCHA_REQUIRED.value,
+                    JobState.UNKNOWN_QUESTION.value,
+                    JobState.SITE_CHANGED.value,
+                    JobState.AMBIGUOUS_SUBMISSION.value,
+                }:
+                    # Resolution is a one-shot transition from an operator
+                    # intervention state. In particular, ready -> ready must
+                    # not create duplicate events or answer revisions.
+                    raise ValueError(f"Job state '{previous_state}' is not resolvable")
+
+                # Force resolution is a generation replacement. A stale
+                # worker completing the old attempt must make zero writes.
+                resolved = conn.execute(
+                    """
+                    UPDATE automation_jobs
+                    SET state = 'ready',
+                        is_cancelled = 0,
+                        lease_owner = NULL,
+                        lease_expires_at = NULL,
+                        error_code = NULL,
+                        error_message = NULL,
+                        next_retry_at = NULL,
+                        updated_at = ?
+                    WHERE id = ? AND state = ? AND fencing_generation = ?;
+                    """,
+                    (now, actual_job_id, previous_state, row["fencing_generation"]),
+                )
+                if resolved.rowcount != 1:
+                    return False
 
                 if resolution_type == "answer" and question_key and answer_value:
                     norm_key = question_key.strip().lower()
@@ -1281,25 +1998,9 @@ def resolve_job(
                         ),
                     )
 
-                # Reset job to ready so it can be claimed afresh
-                conn.execute(
-                    """
-                    UPDATE automation_jobs
-                    SET state = 'ready',
-                        lease_owner = NULL,
-                        lease_expires_at = NULL,
-                        error_code = NULL,
-                        error_message = NULL,
-                        next_retry_at = NULL,
-                        updated_at = ?
-                    WHERE id = ?;
-                    """,
-                    (now, actual_job_id),
-                )
-
                 if app_id:
                     conn.execute(
-                        "UPDATE applications SET status = 'pending', updated_at = ? WHERE id = ? AND status IN ('ambiguous', 'failed');",
+                        "UPDATE applications SET status = 'pending', updated_at = ? WHERE id = ? AND status IN ('ambiguous', 'failed', 'skipped');",
                         (now, app_id),
                     )
 
@@ -1325,20 +2026,36 @@ def resolve_job(
 # --- Runtime Controls ---
 
 
-def set_runtime_pause(is_paused: bool, custom_path: Path | None = None) -> None:
-    """Sets global runtime automation pause state."""
+def set_runtime_pause(
+    is_paused: bool,
+    custom_path: Path | None = None,
+    expected_owner: str | None = None,
+) -> bool:
+    """Sets global pause state, optionally fenced to the current claimant."""
     init_db(custom_path)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with _QUEUE_LOCK:
-        conn = get_connection(custom_path)
-        try:
-            with conn:
-                conn.execute(
-                    "UPDATE runtime_control SET is_paused = ?, updated_at = ? WHERE id = 1;",
-                    (1 if is_paused else 0, now),
-                )
-        finally:
-            conn.close()
+
+    def update_pause() -> bool:
+        with _QUEUE_LOCK:
+            conn = get_connection(custom_path)
+            try:
+                with conn:
+                    if expected_owner is not None and not takeover_owner_matches(
+                        expected_owner, custom_path
+                    ):
+                        return False
+                    conn.execute(
+                        "UPDATE runtime_control SET is_paused = ?, updated_at = ? WHERE id = 1;",
+                        (1 if is_paused else 0, now),
+                    )
+                    return True
+            finally:
+                conn.close()
+
+    if expected_owner is None:
+        return update_pause()
+    with TAKEOVER_TRANSPORT_LOCK:
+        return update_pause()
 
 
 def set_runtime_stop(is_stopped: bool, custom_path: Path | None = None) -> None:
@@ -1360,109 +2077,124 @@ def set_runtime_stop(is_stopped: bool, custom_path: Path | None = None) -> None:
 def requeue_auth_required_job(
     job_id: str | None = None,
     custom_path: Path | None = None,
+    expected_owner: str | None = None,
 ) -> dict[str, Any]:
-    """Requeues an auth-paused job for a fresh controlled browser attempt.
+    """Requeue an auth-paused job while fencing takeover transport.
 
-    This is deliberately separate from safe resume: no browser state is trusted or
-    bypassed. The worker must navigate again, detect the authentication challenge,
-    and pause with a live browser for operator takeover.
+    Lock ordering is always TAKEOVER_TRANSPORT_LOCK -> _QUEUE_LOCK. The transport
+    fence is held through the lease-clearing UPDATE so a relay cannot authorize an
+    input frame concurrently with this release-equivalent transition.
     """
     init_db(custom_path)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with _QUEUE_LOCK:
-        conn = get_connection(custom_path)
-        try:
-            with conn:
-                if job_id is None:
-                    owner = conn.execute(
-                        "SELECT browser_job_id FROM runtime_control WHERE id = 1;"
-                    ).fetchone()
-                    job_id = owner["browser_job_id"] if owner else None
-                    if not job_id:
+    with TAKEOVER_TRANSPORT_LOCK:
+        with _QUEUE_LOCK:
+            conn = get_connection(custom_path)
+            try:
+                with conn:
+                    if expected_owner is not None and not takeover_owner_matches(
+                        expected_owner, custom_path
+                    ):
                         return {
                             "status": "rejected",
-                            "reason": "auth_job_target_required",
-                            "message": "Specify the authentication-paused job to reopen; no browser-owned job is available.",
+                            "reason": "takeover_owner_required",
+                            "message": "Only the current takeover owner may reopen authentication.",
+                        }
+                    if job_id is None:
+                        owner = conn.execute(
+                            "SELECT browser_job_id FROM runtime_control WHERE id = 1;"
+                        ).fetchone()
+                        job_id = owner["browser_job_id"] if owner else None
+                        if not job_id:
+                            return {
+                                "status": "rejected",
+                                "reason": "auth_job_target_required",
+                                "message": "Specify the authentication-paused job to reopen; no browser-owned job is available.",
+                            }
+
+                    row = conn.execute(
+                        """
+                        SELECT j.id, j.app_id, j.state, j.fencing_generation, a.company, a.title
+                        FROM automation_jobs j
+                        JOIN applications a ON a.id = j.app_id
+                        WHERE j.id = ? AND j.state = 'auth_required';
+                        """,
+                        (job_id,),
+                    ).fetchone()
+                    if not row:
+                        return {
+                            "status": "rejected",
+                            "reason": "auth_job_not_found",
+                            "message": "The requested authentication-paused job is not available to reopen.",
+                        }
+                    control = conn.execute(
+                        "SELECT is_stopped FROM runtime_control WHERE id = 1;"
+                    ).fetchone()
+                    if control and control["is_stopped"]:
+                        return {
+                            "status": "rejected",
+                            "reason": "emergency_stop_active",
+                            "message": "Emergency stop is active. Clear it explicitly before reopening authentication.",
                         }
 
-                row = conn.execute(
-                    """
-                    SELECT j.id, j.app_id, j.state, a.company, a.title
-                    FROM automation_jobs j
-                    JOIN applications a ON a.id = j.app_id
-                    WHERE j.id = ? AND j.state = 'auth_required';
-                    """,
-                    (job_id,),
-                ).fetchone()
-                if not row:
-                    return {
-                        "status": "rejected",
-                        "reason": "auth_job_not_found",
-                        "message": "The requested authentication-paused job is not available to reopen.",
-                    }
-                control = conn.execute(
-                    "SELECT is_stopped FROM runtime_control WHERE id = 1;"
-                ).fetchone()
-                if control and control["is_stopped"]:
-                    return {
-                        "status": "rejected",
-                        "reason": "emergency_stop_active",
-                        "message": "Emergency stop is active. Clear it explicitly before reopening authentication.",
-                    }
+                    # The runtime worker owns the browser in service mode. The
+                    # durable generation transition below is its cross-process
+                    # close signal; web must never try to reach a process-local
+                    # automator instance.
+                    next_browser_generation = int(row["fencing_generation"] or 0) + 1
 
-                conn.execute(
-                    """
-                    UPDATE automation_jobs
-                    SET state = 'ready',
-                        lease_owner = NULL,
-                        lease_expires_at = NULL,
-                        error_code = NULL,
-                        error_message = NULL,
-                        next_retry_at = NULL,
-                        checkpoint = 'auth_retry_requested',
-                        updated_at = ?
-                    WHERE id = ? AND state = 'auth_required';
-                    """,
-                    (now, row["id"]),
-                )
-                record_event(
-                    job_id=row["id"],
-                    app_id=row["app_id"],
-                    event_type="auth_retry_requested",
-                    level="WARN",
-                    step="auth_retry",
-                    message="Authentication session requested to reopen in a fresh controlled browser.",
-                    custom_path=custom_path,
-                    conn=conn,
-                )
-                conn.execute(
-                    """
-                    UPDATE runtime_control
-                    SET is_paused = 0,
-                        manual_takeover_owner = NULL,
-                        manual_takeover_expires_at = NULL,
-                        is_waiting_for_code = 0,
-                        pending_verification_code = NULL,
-                        browser_active = 0,
-                        browser_url = '',
-                        browser_page_text = '',
-                        browser_is_closed = 1,
-                        browser_updated_at = ?,
-                        browser_job_id = NULL,
-                        updated_at = ?
-                    WHERE id = 1;
-                    """,
-                    (now, now),
-                )
-                return {
-                    "status": "started",
-                    "action": "reopen_auth_session",
-                    "job_id": row["id"],
-                    "app_id": row["app_id"],
-                    "message": "Fresh browser session requested. Automation will pause again when authentication is detected; then open Browser View and log in.",
-                }
-        finally:
-            conn.close()
+                    conn.execute(
+                        """
+                        UPDATE automation_jobs
+                        SET state = 'ready', lease_owner = NULL, lease_expires_at = NULL,
+                            error_code = NULL, error_message = NULL, next_retry_at = NULL,
+                            checkpoint = 'auth_retry_requested', updated_at = ?
+                        WHERE id = ? AND state = 'auth_required';
+                        """,
+                        (now, row["id"]),
+                    )
+                    record_event(
+                        job_id=row["id"],
+                        app_id=row["app_id"],
+                        event_type="auth_retry_requested",
+                        level="WARN",
+                        step="auth_retry",
+                        message="Authentication session requested to reopen in a fresh controlled browser.",
+                        custom_path=custom_path,
+                        conn=conn,
+                    )
+                    conn.execute(
+                        """
+                        UPDATE runtime_control
+                        SET is_paused = 0, manual_takeover_owner = NULL,
+                            manual_takeover_expires_at = NULL, is_waiting_for_code = 0,
+                            pending_verification_code = NULL, browser_active = 0,
+                            browser_url = '', browser_page_text = '', browser_is_closed = 1,
+                            browser_shutdown_generation = MAX(
+                                COALESCE(browser_shutdown_generation, 0),
+                                COALESCE(browser_session_generation, 0), ?
+                            ),
+                            browser_updated_at = ?,
+                            browser_job_id = ?, browser_session_generation = ?, updated_at = ?
+                        WHERE id = 1;
+                        """,
+                        (
+                            next_browser_generation,
+                            now,
+                            row["id"],
+                            next_browser_generation,
+                            now,
+                        ),
+                    )
+                    return {
+                        "status": "started",
+                        "action": "reopen_auth_session",
+                        "job_id": row["id"],
+                        "app_id": row["app_id"],
+                        "message": "Fresh browser session requested. Automation will pause again when authentication is detected; then open Browser View and log in.",
+                    }
+            finally:
+                conn.close()
 
 
 def get_runtime_control(custom_path: Path | None = None) -> dict[str, Any]:
@@ -1504,31 +2236,50 @@ def get_runtime_control(custom_path: Path | None = None) -> dict[str, Any]:
             "browser_job_id": row["browser_job_id"]
             if "browser_job_id" in row.keys()
             else None,
+            "browser_session_generation": row["browser_session_generation"]
+            if "browser_session_generation" in row.keys()
+            else None,
+            "browser_shutdown_generation": row["browser_shutdown_generation"]
+            if "browser_shutdown_generation" in row.keys()
+            else None,
             "updated_at": row["updated_at"],
         }
     finally:
         conn.close()
 
 
-def set_pending_verification_code(code: str, custom_path: Path | None = None) -> None:
+def set_pending_verification_code(
+    code: str,
+    custom_path: Path | None = None,
+    expected_owner: str | None = None,
+) -> bool:
+    """Persist a verification code only while the expected takeover owns the session."""
     init_db(custom_path)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with _QUEUE_LOCK:
-        conn = get_connection(custom_path)
-        try:
-            with conn:
-                conn.execute(
-                    """
-                    UPDATE runtime_control
-                    SET pending_verification_code = ?,
-                        is_waiting_for_code = 0,
-                        updated_at = ?
-                    WHERE id = 1;
-                    """,
-                    (code, now_str),
-                )
-        finally:
-            conn.close()
+    # Keep ownership validation and the runtime-control mutation under the same
+    # fence used by the viewer relay and takeover transitions.
+    with TAKEOVER_TRANSPORT_LOCK:
+        with _QUEUE_LOCK:
+            conn = get_connection(custom_path)
+            try:
+                with conn:
+                    if expected_owner is not None and not takeover_owner_matches(
+                        expected_owner, custom_path
+                    ):
+                        return False
+                    conn.execute(
+                        """
+                        UPDATE runtime_control
+                        SET pending_verification_code = ?,
+                            is_waiting_for_code = 0,
+                            updated_at = ?
+                        WHERE id = 1;
+                        """,
+                        (code, now_str),
+                    )
+                    return True
+            finally:
+                conn.close()
 
 
 def consume_pending_verification_code(
@@ -1567,14 +2318,90 @@ def set_runtime_browser_state(
     is_closed: bool = True,
     is_waiting_for_code: bool = False,
     browser_job_id: str | None = None,
+    browser_session_generation: int | None = None,
     custom_path: Path | None = None,
 ) -> None:
     init_db(custom_path)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with _QUEUE_LOCK:
+    # Browser state updates share the takeover fence. This prevents a worker
+    # finishing an old session from overwriting a replacement browser state.
+    with TAKEOVER_TRANSPORT_LOCK, _QUEUE_LOCK:
         conn = get_connection(custom_path)
         try:
             with conn:
+                current = conn.execute(
+                    """
+                    SELECT browser_job_id, browser_session_generation,
+                           browser_shutdown_generation
+                    FROM runtime_control WHERE id = 1;
+                    """
+                ).fetchone()
+                current_job_id = current["browser_job_id"] if current else None
+                current_generation = (
+                    current["browser_session_generation"] if current else None
+                )
+                # A reclaimed worker keeps the same job ID but receives a new
+                # queue fencing generation. Permit its first active
+                # publication to replace the old runtime metadata only when
+                # the durable job claim already matches that generation. This
+                # also rejects an expired/stale worker before it can publish.
+                generation_is_current_claim = False
+                if (
+                    active
+                    and browser_job_id is not None
+                    and browser_session_generation is not None
+                ):
+                    claimed = conn.execute(
+                        """
+                        SELECT fencing_generation, lease_owner, lease_expires_at, state
+                        FROM automation_jobs
+                        WHERE id = ?;
+                        """,
+                        (browser_job_id,),
+                    ).fetchone()
+                    if (
+                        claimed
+                        and claimed["fencing_generation"] != browser_session_generation
+                    ):
+                        return
+                    generation_is_current_claim = bool(
+                        claimed
+                        and claimed["fencing_generation"] == browser_session_generation
+                        and claimed["lease_owner"]
+                        and claimed["lease_expires_at"]
+                        and claimed["lease_expires_at"] > now_str
+                        and claimed["state"]
+                        in (
+                            "claimed",
+                            "navigating",
+                            "filling",
+                            "validating",
+                            "submit_intent",
+                            "verifying",
+                            "auth_required",
+                            "mfa_required",
+                            "captcha_required",
+                            "unknown_question",
+                            "ambiguous_submission",
+                        )
+                    )
+                    # An expired worker must never republish an active browser
+                    # session, even when a replacement claim has not arrived yet.
+                    if not generation_is_current_claim:
+                        return
+                if browser_job_id is not None and current_job_id is not None:
+                    if current_job_id != browser_job_id:
+                        return
+                    # The queue fencing generation changes when a job is
+                    # reclaimed. A previous worker with the same job ID must
+                    # not publish into the replacement browser session.
+                    if (
+                        browser_session_generation is not None
+                        and current_generation is not None
+                        and browser_session_generation != current_generation
+                        and not generation_is_current_claim
+                    ):
+                        return
                 conn.execute(
                     """
                     UPDATE runtime_control
@@ -1584,6 +2411,15 @@ def set_runtime_browser_state(
                         browser_is_closed = ?,
                         is_waiting_for_code = ?,
                         browser_updated_at = ?,
+                        browser_session_generation = CASE
+                            WHEN ? = 1 THEN COALESCE(?, browser_session_generation)
+                            WHEN ? = 0 AND (? IS NULL OR browser_session_generation = ?) THEN NULL
+                            ELSE browser_session_generation
+                        END,
+                        browser_shutdown_generation = CASE
+                            WHEN ? = 1 AND ? = 1 THEN NULL
+                            ELSE browser_shutdown_generation
+                        END,
                         browser_job_id = CASE
                             WHEN ? = 1 THEN COALESCE(?, browser_job_id)
                             WHEN ? = 0 AND (? IS NULL OR browser_job_id = ?) THEN NULL
@@ -1600,12 +2436,59 @@ def set_runtime_browser_state(
                         1 if is_waiting_for_code else 0,
                         now_str,
                         1 if active else 0,
+                        browser_session_generation,
+                        1 if active else 0,
+                        browser_session_generation,
+                        browser_session_generation,
+                        1 if active else 0,
+                        1 if generation_is_current_claim else 0,
+                        1 if active else 0,
                         browser_job_id,
                         1 if active else 0,
                         browser_job_id,
                         browser_job_id,
                         now_str,
                     ),
+                )
+        finally:
+            conn.close()
+
+
+def mark_runtime_browser_shutdown(custom_path: Path | None = None) -> None:
+    """Durably fence the runtime browser before daemon/process teardown.
+
+    The worker may live in a different process, so an in-memory close is not
+    sufficient. Advancing both generations makes surviving stale workers'
+    active publications fail the durable generation check.
+    """
+    init_db(custom_path)
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with TAKEOVER_TRANSPORT_LOCK, _QUEUE_LOCK:
+        conn = get_connection(custom_path)
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    UPDATE runtime_control
+                    SET browser_active = 0,
+                        browser_url = '',
+                        browser_page_text = '',
+                        browser_is_closed = 1,
+                        is_waiting_for_code = 0,
+                        browser_job_id = NULL,
+                        browser_session_generation = MAX(
+                            COALESCE(browser_session_generation, 0),
+                            COALESCE(browser_shutdown_generation, 0)
+                        ) + 1,
+                        browser_shutdown_generation = MAX(
+                            COALESCE(browser_shutdown_generation, 0),
+                            COALESCE(browser_session_generation, 0)
+                        ) + 1,
+                        browser_updated_at = ?,
+                        updated_at = ?
+                    WHERE id = 1;
+                    """,
+                    (now_str, now_str),
                 )
         finally:
             conn.close()
@@ -1619,7 +2502,8 @@ def get_runtime_browser_state(custom_path: Path | None = None) -> dict[str, Any]
             """
             SELECT browser_active, browser_url, browser_page_text,
                    browser_is_closed, is_waiting_for_code, browser_updated_at,
-                   browser_job_id
+                   browser_job_id, browser_session_generation,
+                   browser_shutdown_generation
             FROM runtime_control WHERE id = 1;
             """
         ).fetchone()
@@ -1674,88 +2558,108 @@ def is_takeover_active(
 
 def claim_manual_takeover(
     owner: str,
-    lease_seconds: int = 300,
+    lease_seconds: int = TAKEOVER_DEFAULT_LEASE_SECONDS,
     custom_path: Path | None = None,
 ) -> dict[str, Any]:
     """
     Atomically acquires an exclusive manual takeover lease on the runtime browser.
     Immediately pauses the entire worker (is_paused = 1) so no automated actions take place.
+
+    Lease values are deliberately validated here as well as at the HTTP boundary so
+    local callers cannot create an owner row that is already expired or effectively
+    permanent.
     """
+    if (
+        isinstance(lease_seconds, bool)
+        or not isinstance(lease_seconds, int)
+        or not TAKEOVER_MIN_LEASE_SECONDS <= lease_seconds <= TAKEOVER_MAX_LEASE_SECONDS
+    ):
+        raise ValueError(
+            f"lease_seconds must be an integer from {TAKEOVER_MIN_LEASE_SECONDS} "
+            f"through {TAKEOVER_MAX_LEASE_SECONDS}"
+        )
+
     init_db(custom_path)
     now_dt = datetime.now()
     now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
     expires_dt = now_dt + timedelta(seconds=lease_seconds)
     expires_str = expires_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    with _QUEUE_LOCK:
-        conn = get_connection(custom_path)
-        try:
-            with conn:
-                row = conn.execute(
-                    "SELECT manual_takeover_owner, manual_takeover_expires_at FROM runtime_control WHERE id = 1;"
-                ).fetchone()
+    with TAKEOVER_TRANSPORT_LOCK:
+        with _QUEUE_LOCK:
+            conn = get_connection(custom_path)
+            try:
+                with conn:
+                    row = conn.execute(
+                        "SELECT manual_takeover_owner, manual_takeover_expires_at FROM runtime_control WHERE id = 1;"
+                    ).fetchone()
 
-                if (
-                    row
-                    and row["manual_takeover_owner"]
-                    and row["manual_takeover_expires_at"]
-                ):
-                    try:
-                        cur_expires = datetime.strptime(
-                            row["manual_takeover_expires_at"], "%Y-%m-%d %H:%M:%S"
-                        )
-                        if (
-                            now_dt < cur_expires
-                            and row["manual_takeover_owner"] != owner
-                        ):
-                            return {
-                                "status": "conflict",
-                                "message": f"Takeover is currently active by {row['manual_takeover_owner']} until {row['manual_takeover_expires_at']}.",
-                                "owner": row["manual_takeover_owner"],
-                                "expires_at": row["manual_takeover_expires_at"],
-                            }
-                    except ValueError:
-                        pass
+                    if (
+                        row
+                        and row["manual_takeover_owner"]
+                        and row["manual_takeover_expires_at"]
+                    ):
+                        try:
+                            cur_expires = datetime.strptime(
+                                row["manual_takeover_expires_at"], "%Y-%m-%d %H:%M:%S"
+                            )
+                            if (
+                                now_dt < cur_expires
+                                and row["manual_takeover_owner"] != owner
+                            ):
+                                return {
+                                    "status": "conflict",
+                                    "message": f"Takeover is currently active by {row['manual_takeover_owner']} until {row['manual_takeover_expires_at']}.",
+                                    "owner": row["manual_takeover_owner"],
+                                    "expires_at": row["manual_takeover_expires_at"],
+                                }
+                        except ValueError:
+                            pass
 
-                conn.execute(
-                    """
-                    UPDATE runtime_control
-                    SET is_paused = 1,
-                        manual_takeover_owner = ?,
-                        manual_takeover_expires_at = ?,
-                        updated_at = ?
-                    WHERE id = 1;
-                    """,
-                    (owner, expires_str, now_str),
-                )
+                    conn.execute(
+                        """
+                        UPDATE runtime_control
+                        SET is_paused = 1,
+                            manual_takeover_owner = ?,
+                            manual_takeover_expires_at = ?,
+                            updated_at = ?
+                        WHERE id = 1;
+                        """,
+                        (owner, expires_str, now_str),
+                    )
 
-                # Record audit event
-                record_event(
-                    job_id=None,
-                    app_id=None,
-                    event_type="manual_takeover_claimed",
-                    level="INFO",
-                    step="takeover",
-                    message=f"Manual takeover lease claimed by {owner} for {lease_seconds}s. Automation paused.",
-                    details={
+                    # Record audit event
+                    record_event(
+                        job_id=None,
+                        app_id=None,
+                        event_type="manual_takeover_claimed",
+                        level="INFO",
+                        step="takeover",
+                        message=f"Manual takeover lease claimed by {owner} for {lease_seconds}s. Automation paused.",
+                        details={
+                            "owner": owner,
+                            "lease_seconds": lease_seconds,
+                            "expires_at": expires_str,
+                        },
+                        custom_path=custom_path,
+                        conn=conn,
+                    )
+
+                    return {
+                        "status": "success",
                         "owner": owner,
                         "lease_seconds": lease_seconds,
                         "expires_at": expires_str,
-                    },
-                    custom_path=custom_path,
-                    conn=conn,
-                )
+                        "is_paused": True,
+                        "message": f"Takeover lease granted by {owner}. Automation worker paused.",
+                    }
+            finally:
+                conn.close()
 
-                return {
-                    "status": "success",
-                    "owner": owner,
-                    "lease_seconds": lease_seconds,
-                    "expires_at": expires_str,
-                    "is_paused": True,
-                    "message": f"Takeover lease granted to {owner}. Automation worker paused.",
-                }
-        finally:
-            conn.close()
+    return {
+        "status": "error",
+        "message": "Unable to acquire takeover lease.",
+    }
 
 
 def release_manual_takeover(
@@ -1770,51 +2674,52 @@ def release_manual_takeover(
     init_db(custom_path)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    with _QUEUE_LOCK:
-        conn = get_connection(custom_path)
-        try:
-            with conn:
-                row = conn.execute(
-                    "SELECT manual_takeover_owner, manual_takeover_expires_at FROM runtime_control WHERE id = 1;"
-                ).fetchone()
+    with TAKEOVER_TRANSPORT_LOCK:
+        with _QUEUE_LOCK:
+            conn = get_connection(custom_path)
+            try:
+                with conn:
+                    row = conn.execute(
+                        "SELECT manual_takeover_owner, manual_takeover_expires_at FROM runtime_control WHERE id = 1;"
+                    ).fetchone()
 
-                current_owner = row["manual_takeover_owner"] if row else None
-                if not force and owner and current_owner and current_owner != owner:
+                    current_owner = row["manual_takeover_owner"] if row else None
+                    if not force and owner and current_owner and current_owner != owner:
+                        return {
+                            "status": "error",
+                            "message": f"Cannot release takeover: owned by {current_owner}, not {owner}.",
+                        }
+
+                    conn.execute(
+                        """
+                        UPDATE runtime_control
+                        SET manual_takeover_owner = NULL,
+                            manual_takeover_expires_at = NULL,
+                            updated_at = ?
+                        WHERE id = 1;
+                        """,
+                        (now_str,),
+                    )
+
+                    # Record event
+                    record_event(
+                        job_id=None,
+                        app_id=None,
+                        event_type="manual_takeover_released",
+                        level="INFO",
+                        step="takeover",
+                        message=f"Manual takeover lease released by {owner or 'system'}. Worker remains paused awaiting safe resume.",
+                        details={"released_by": owner or "system"},
+                        custom_path=custom_path,
+                        conn=conn,
+                    )
+
                     return {
-                        "status": "error",
-                        "message": f"Cannot release takeover: owned by {current_owner}, not {owner}.",
+                        "status": "success",
+                        "message": "Takeover lease released. Automation remains paused awaiting safe resume revalidation.",
                     }
-
-                conn.execute(
-                    """
-                    UPDATE runtime_control
-                    SET manual_takeover_owner = NULL,
-                        manual_takeover_expires_at = NULL,
-                        updated_at = ?
-                    WHERE id = 1;
-                    """,
-                    (now_str,),
-                )
-
-                # Record event
-                record_event(
-                    job_id=None,
-                    app_id=None,
-                    event_type="manual_takeover_released",
-                    level="INFO",
-                    step="takeover",
-                    message=f"Manual takeover lease released by {owner or 'system'}. Worker remains paused awaiting safe resume.",
-                    details={"released_by": owner or "system"},
-                    custom_path=custom_path,
-                    conn=conn,
-                )
-
-                return {
-                    "status": "success",
-                    "message": "Takeover lease released. Automation remains paused awaiting safe resume revalidation.",
-                }
-        finally:
-            conn.close()
+            finally:
+                conn.close()
 
 
 # --- Notification Outbox & Durable In-App Notifications ---
@@ -1947,17 +2852,39 @@ def get_notifications(
         if unread_only:
             clauses.append("acknowledged = 0")
 
-        where_str = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        order_str = "ORDER BY id ASC" if query_after is not None else "ORDER BY id DESC"
         params.append(limit)
-
-        sql = f"""
-            SELECT * FROM notifications
-            {where_str}
-            {order_str}
-            LIMIT ?;
-        """
-        rows = conn.execute(sql, params).fetchall()
+        if query_after is not None:
+            if unread_only:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM notifications
+                    WHERE id > ? AND acknowledged = 0
+                    ORDER BY id ASC LIMIT ?;
+                    """,
+                    (query_after, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM notifications
+                    WHERE id > ?
+                    ORDER BY id ASC LIMIT ?;
+                    """,
+                    (query_after, limit),
+                ).fetchall()
+        elif unread_only:
+            rows = conn.execute(
+                """
+                SELECT * FROM notifications
+                WHERE acknowledged = 0
+                ORDER BY id DESC LIMIT ?;
+                """,
+                (limit,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM notifications ORDER BY id DESC LIMIT ?;", (limit,)
+            ).fetchall()
         result = []
         for r in rows:
             d = dict(r)
@@ -2047,6 +2974,7 @@ def ack_notification(
                             "acknowledged_at": now,
                         },
                         custom_path=custom_path,
+                        conn=conn,
                     )
                 except Exception:
                     pass
@@ -2108,6 +3036,7 @@ def ack_all_notifications(
                                 "up_to_id": up_to_id,
                             },
                             custom_path=custom_path,
+                            conn=conn,
                         )
                     except Exception:
                         pass
@@ -2163,6 +3092,7 @@ def clear_all_notifications(
                             message=f"Cleared {deleted_count} notifications.",
                             details={"cleared_count": deleted_count},
                             custom_path=custom_path,
+                            conn=conn,
                         )
                     except Exception:
                         logger.debug(
@@ -2196,6 +3126,94 @@ def get_notification_stats(custom_path: Path | None = None) -> dict[str, Any]:
         }
     finally:
         conn.close()
+
+
+def _enqueue_notification_on_conn(
+    conn: sqlite3.Connection,
+    *,
+    category: str,
+    title: str,
+    message: str,
+    urgency: str = "normal",
+    url: str = "",
+    payload: dict[str, Any] | None = None,
+    dedup_key: str | None = None,
+    job_id: str | None = None,
+    app_id: str | None = None,
+    severity: str | None = None,
+    event_id: int | None = None,
+) -> str:
+    """Write an in-app notification and outbox item on an existing transaction."""
+    notif_id = f"notif_{uuid.uuid4().hex[:8]}"
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    payload_str = json.dumps(payload or {})
+    effective_dedup = dedup_key or f"{category}_{notif_id}"
+    effective_severity = severity or (
+        "critical"
+        if urgency in ("critical", "high")
+        else ("warning" if urgency == "normal" else "info")
+    )
+    linked_event_id = event_id
+    if linked_event_id is None:
+        linked_event_id = record_event(
+            job_id=job_id,
+            app_id=app_id,
+            event_type="notification",
+            level=effective_severity.upper(),
+            step="alert",
+            message=f"{title}: {message}",
+            details={
+                "notification_id": notif_id,
+                "category": category,
+                "severity": effective_severity,
+            },
+            custom_path=None,
+            conn=conn,
+        )
+    conn.execute(
+        """
+        INSERT INTO notifications (
+            notification_id, job_id, app_id, event_id, category,
+            severity, title, message, url, details_json, acknowledged, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?);
+        """,
+        (
+            notif_id,
+            job_id,
+            app_id,
+            linked_event_id,
+            category,
+            effective_severity,
+            title,
+            message,
+            url,
+            payload_str,
+            now,
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO notification_outbox (
+            id, dedup_key, status, category, urgency, title, message, url,
+            payload_json, attempt_count, created_at
+        ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, 0, ?)
+        ON CONFLICT(dedup_key) DO UPDATE SET
+            message = excluded.message,
+            created_at = excluded.created_at;
+        """,
+        (
+            notif_id,
+            effective_dedup,
+            category,
+            urgency,
+            title,
+            message,
+            url,
+            payload_str,
+            now,
+        ),
+    )
+    return notif_id
 
 
 def enqueue_notification(
@@ -2300,20 +3318,23 @@ def get_pending_notifications(
     conn = get_connection(custom_path)
     try:
         if due_only:
-            query = """
+            rows = conn.execute(
+                """
                 SELECT * FROM notification_outbox
                 WHERE status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= ?)
                 ORDER BY created_at ASC LIMIT ?;
-            """
-            params: tuple[Any, ...] = (now_str, limit)
+                """,
+                (now_str, limit),
+            ).fetchall()
         else:
-            query = """
+            rows = conn.execute(
+                """
                 SELECT * FROM notification_outbox
                 WHERE status = 'pending'
                 ORDER BY created_at ASC LIMIT ?;
-            """
-            params = (limit,)
-        rows = conn.execute(query, params).fetchall()
+                """,
+                (limit,),
+            ).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
@@ -2527,6 +3548,18 @@ def _append_event_on_conn(
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     safe_message = _sanitize_event_message(message, event_type)
     safe_details = _sanitize_event_details(details)
+    # Event keys are operation idempotency keys even for jobs without an
+    # attempt. The schema's partial attempt/event index cannot deduplicate
+    # repair events whose attempt was never created, so check the job scope
+    # explicitly before inserting.
+    if event_key is not None:
+        existing_event = active_conn.execute(
+            "SELECT id FROM automation_events WHERE job_id IS ? AND event_key = ? LIMIT 1;",
+            (job_id, event_key),
+        ).fetchone()
+        if existing_event:
+            return int(existing_event["id"])
+
     cursor = active_conn.execute(
         """
         INSERT OR IGNORE INTO automation_events (
@@ -2752,13 +3785,25 @@ def get_application_automation_status(
     init_db(custom_path)
     conn = get_connection(custom_path)
     try:
-        query = "SELECT * FROM automation_job_status WHERE app_id = ?"
-        params: list[Any] = [app_id]
         if job_id:
-            query += " AND job_id = ?"
-            params.append(job_id)
-        query += " ORDER BY updated_at DESC, job_id ASC LIMIT 100;"
-        return [dict(row) for row in conn.execute(query, params).fetchall()]
+            rows = conn.execute(
+                """
+                SELECT * FROM automation_job_status
+                WHERE app_id = ? AND job_id = ?
+                ORDER BY updated_at DESC, job_id ASC LIMIT 100;
+                """,
+                (app_id, job_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM automation_job_status
+                WHERE app_id = ?
+                ORDER BY updated_at DESC, job_id ASC LIMIT 100;
+                """,
+                (app_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
     finally:
         conn.close()
 
@@ -2775,14 +3820,24 @@ def get_application_automation_events(
     init_db(custom_path)
     conn = get_connection(custom_path)
     try:
-        query = "SELECT * FROM automation_events WHERE app_id = ? AND id > ?"
-        params: list[Any] = [app_id, after_id]
         if job_id:
-            query += " AND job_id = ?"
-            params.append(job_id)
-        query += " ORDER BY id ASC LIMIT ?"
-        params.append(safe_limit)
-        rows = conn.execute(query, params).fetchall()
+            rows = conn.execute(
+                """
+                SELECT * FROM automation_events
+                WHERE app_id = ? AND id > ? AND job_id = ?
+                ORDER BY id ASC LIMIT ?;
+                """,
+                (app_id, after_id, job_id, safe_limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM automation_events
+                WHERE app_id = ? AND id > ?
+                ORDER BY id ASC LIMIT ?;
+                """,
+                (app_id, after_id, safe_limit),
+            ).fetchall()
         items: list[dict[str, Any]] = []
         for row in rows:
             item = dict(row)
@@ -2971,6 +4026,7 @@ def get_browser_owner_job(custom_path: Path | None = None) -> dict[str, Any] | N
             JOIN applications a ON a.id = j.app_id
             JOIN runtime_control rc ON rc.browser_job_id = j.id
             WHERE rc.id = 1
+              AND rc.browser_session_generation = j.fencing_generation
               AND rc.browser_active = 1
               AND rc.browser_is_closed = 0
               AND j.state IN (
@@ -3028,6 +4084,7 @@ def get_latest_job(custom_path: Path | None = None) -> dict[str, Any] | None:
 
 def clear_automation_state(
     custom_path: Path | None = None,
+    expected_owner: str | None = None,
 ) -> dict[str, Any]:
     """
     Fully resets all runtime locks, clears emergency stop / pause flags,
@@ -3038,66 +4095,96 @@ def clear_automation_state(
     now_dt = datetime.now()
     now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    # 1. Close any active in-memory browser automator instance if alive
-    browser_closed = False
-    try:
-        from job_applier.automation.browser_automator import get_active_automator
-
-        active_automator = get_active_automator()
-        if active_automator is not None:
-            active_automator.close()
-            browser_closed = True
-    except Exception as ex:
-        logger.debug(f"Active automator close exception during state clear: {ex}")
-
-    # 2. Reset runtime_control table and release stuck jobs atomically
+    # Reset runtime_control table and release stuck jobs atomically. The
+    # transport fence is acquired before _QUEUE_LOCK, matching relay forwarding.
     reset_jobs_count = 0
-    with _QUEUE_LOCK:
+    browser_closed = False
+    with TAKEOVER_TRANSPORT_LOCK, _QUEUE_LOCK:
         conn = get_connection(custom_path)
         try:
+            if expected_owner is not None and not takeover_owner_matches(
+                expected_owner, custom_path
+            ):
+                return {
+                    "status": "rejected",
+                    "reason": "takeover_owner_required",
+                    "message": "Only the current takeover owner may clear automation state.",
+                }
+
+            # Close any active in-memory browser automator only after the owner
+            # check and while the transport fence prevents concurrent input.
+            try:
+                from job_applier.automation.browser_automator import (
+                    get_active_automator,
+                )
+
+                active_automator = get_active_automator()
+                if active_automator is not None:
+                    request_close = getattr(active_automator, "request_close", None)
+                    if callable(request_close):
+                        # The web/API thread must not touch Playwright objects.
+                        # The owning worker observes this request and closes on
+                        # its own thread; durable runtime state is fenced below.
+                        request_close()
+                    browser_closed = True
+            except Exception as ex:
+                logger.debug(
+                    f"Active automator close exception during state clear: {ex}"
+                )
+
+            ambiguous_rows = conn.execute(
+                "SELECT id, state, lease_owner, fencing_generation FROM automation_jobs WHERE state IN ('submit_intent', 'verifying') AND is_cancelled = 0;"
+            ).fetchall()
+            conn.close()
+            for row in ambiguous_rows:
+                message = f"Clear State interrupted {row['state']}; manual outcome verification is required."
+                if mark_job_ambiguous(
+                    row["id"],
+                    message,
+                    custom_path=custom_path,
+                    expected_worker_id=row["lease_owner"],
+                    expected_generation=row["fencing_generation"],
+                    checkpoint="clear_state_ambiguous",
+                    error_code="CLEAR_STATE_AMBIGUOUS",
+                    operation_key=f"clear_state_ambiguous:{row['id']}:{row['fencing_generation']}",
+                    event_type="clear_state_ambiguous",
+                ):
+                    reset_jobs_count += 1
+            conn = get_connection(custom_path)
             with conn:
-                # Reset runtime_control flags
                 conn.execute(
                     """
                     UPDATE runtime_control
-                    SET is_paused = 0,
-                        is_stopped = 0,
-                        manual_takeover_owner = NULL,
-                        manual_takeover_expires_at = NULL,
-                        browser_active = 0,
-                        browser_url = '',
-                        browser_page_text = '',
-                        browser_is_closed = 1,
-                        is_waiting_for_code = 0,
-                        pending_verification_code = NULL,
-                        browser_job_id = NULL,
-                        browser_updated_at = ?,
-                        updated_at = ?
+                    SET is_paused = 0, is_stopped = 0,
+                        manual_takeover_owner = NULL, manual_takeover_expires_at = NULL,
+                        browser_active = 0, browser_url = '', browser_page_text = '',
+                        browser_is_closed = 1, is_waiting_for_code = 0,
+                        pending_verification_code = NULL, browser_job_id = NULL,
+                        browser_shutdown_generation = MAX(
+                            COALESCE(browser_shutdown_generation, 0),
+                            COALESCE(browser_session_generation, 0)
+                        ) + 1,
+                        browser_updated_at = ?, updated_at = ?
                     WHERE id = 1;
                     """,
                     (now_str, now_str),
                 )
-
-                # Reset stuck or in-flight jobs in automation_jobs back to ready
-                # (claimed, navigating, filling, validating, submit_intent, verifying, auth_required, mfa_required, captcha_required)
+                # Only pre-submit, recoverable states may return to ready.
                 cur = conn.execute(
                     """
                     UPDATE automation_jobs
-                    SET state = 'ready',
-                        lease_owner = NULL,
+                    SET state = 'ready', lease_owner = NULL,
                         lease_expires_at = NULL,
                         fencing_generation = fencing_generation + 1,
-                        checkpoint = NULL,
-                        updated_at = ?
+                        checkpoint = NULL, updated_at = ?
                     WHERE state IN (
                         'claimed', 'navigating', 'filling', 'validating',
-                        'submit_intent', 'verifying', 'auth_required',
-                        'mfa_required', 'captcha_required'
+                        'auth_required', 'mfa_required', 'captcha_required'
                     ) AND is_cancelled = 0;
                     """,
                     (now_str,),
                 )
-                reset_jobs_count = cur.rowcount
+                reset_jobs_count += cur.rowcount
 
             # Record event
             record_event(
@@ -3123,8 +4210,37 @@ def clear_automation_state(
         "is_stopped": False,
         "browser_closed": browser_closed,
         "reset_jobs_count": reset_jobs_count,
-        "message": f"Automation state cleared. Reset {reset_jobs_count} job(s) and restored ready state.",
+        "message": (
+            f"Automation state cleared. Recovered {reset_jobs_count} job(s); "
+            "outcome-unknown submissions remain ambiguous for explicit resolution."
+        ),
     }
+
+
+def repair_ambiguous_projections(custom_path: Path | None = None) -> list[str]:
+    """Repair incomplete ambiguous projections without making jobs claimable."""
+    init_db(custom_path)
+    with _QUEUE_LOCK:
+        conn = get_connection(custom_path)
+        try:
+            rows = conn.execute(
+                "SELECT id FROM automation_jobs WHERE state = 'ambiguous_submission';"
+            ).fetchall()
+        finally:
+            conn.close()
+    repaired: list[str] = []
+    for row in rows:
+        if mark_job_ambiguous(
+            row["id"],
+            "Ambiguous submission projection repaired after an interrupted transaction.",
+            custom_path=custom_path,
+            checkpoint="ambiguous_projection_repair",
+            error_code="AMBIGUOUS_PROJECTION_REPAIR",
+            operation_key=f"projection_repair:{row['id']}",
+            repair_existing=True,
+        ):
+            repaired.append(row["id"])
+    return repaired
 
 
 def reconcile_stranded_jobs(custom_path: Path | None = None) -> list[str]:
@@ -3144,103 +4260,33 @@ def reconcile_stranded_jobs(custom_path: Path | None = None) -> list[str]:
     with _QUEUE_LOCK:
         conn = get_connection(custom_path)
         try:
-            with conn:
-                stranded = conn.execute(
-                    """
-                    SELECT j.id, j.app_id, j.state, j.adapter, j.fencing_generation, a.company, a.title
-                    FROM automation_jobs j
-                    LEFT JOIN applications a ON a.id = j.app_id
-                    WHERE j.state IN ('submit_intent', 'verifying')
-                      AND (j.lease_expires_at IS NULL OR j.lease_expires_at <= ?);
-                    """,
-                    (now_str,),
-                ).fetchall()
-
-                now = now_dt.isoformat()
-                for row in stranded:
-                    job_id = row["id"]
-                    app_id = row["app_id"]
-                    prior_state = row["state"]
-                    adapter_name = row["adapter"] or "unknown"
-                    company = row["company"] or "Unknown Company"
-                    gen = row["fencing_generation"]
-
-                    # Transition to ambiguous_submission
-                    conn.execute(
-                        """
-                        UPDATE automation_jobs
-                        SET state = ?,
-                            lease_owner = NULL,
-                            fencing_generation = fencing_generation + 1,
-                            lease_expires_at = NULL,
-                            checkpoint = 'stranded_crash_recovery',
-                            error_code = 'CRASH_DURING_SUBMISSION',
-                            updated_at = ?
-                        WHERE id = ?;
-                        """,
-                        (JobState.AMBIGUOUS_SUBMISSION.value, now, job_id),
-                    )
-
-                    # Update uncompleted attempt
-                    conn.execute(
-                        """
-                        UPDATE application_attempts
-                        SET outcome = 'ambiguous_crash_recovery',
-                            confirmation_evidence = 'Worker crashed while in submit_intent/verifying; recovered on startup.',
-                            completed_at = ?
-                        WHERE job_id = ? AND outcome IS NULL;
-                        """,
-                        (now, job_id),
-                    )
-
-                    # Record audit event
-                    record_event(
-                        job_id=job_id,
-                        app_id=app_id,
-                        event_type="application_stranded_recovered",
-                        level="CRITICAL",
-                        step="recovery",
-                        message=(
-                            f"Crash during submission detected for {company}: job was stranded in "
-                            f"'{prior_state}' with expired lease. Fencing generation incremented to {gen + 1}. "
-                            "Marked ambiguous_submission for manual operator inspection."
-                        ),
-                        details={
-                            "prior_state": prior_state,
-                            "adapter": adapter_name,
-                            "fencing_generation": gen + 1,
-                        },
-                        conn=conn,
-                        custom_path=custom_path,
-                    )
-
-                    if app_id:
-                        conn.execute(
-                            "UPDATE applications SET status = 'ambiguous', notes = 'Worker crashed while in submit_intent/verifying; recovered on startup.', updated_at = ? WHERE id = ?;",
-                            (now, app_id),
-                        )
-
-                    reconciled.append(job_id)
-
+            stranded = conn.execute(
+                """
+                SELECT id, state, lease_owner, fencing_generation
+                FROM automation_jobs
+                WHERE state IN ('submit_intent', 'verifying')
+                  AND (lease_expires_at IS NULL OR lease_expires_at <= ?);
+                """,
+                (now_str,),
+            ).fetchall()
         finally:
             conn.close()
 
-    if reconciled:
-        # Enforce whole-worker pause to halt subsequent claims until operator inspects
-        set_runtime_pause(True, custom_path=custom_path)
-
-    # Emit durable notifications outside lock
-    for j_id in reconciled:
-        enqueue_notification(
-            category="submission_ambiguous",
-            title="Crash During Submission Recovered",
-            message=(
-                f"Job {j_id} crashed while in submit_intent/verifying. Marked ambiguous_submission. "
-                "Runtime automation paused. Inspect employer portal or email manually."
-            ),
-            urgency="critical",
-            job_id=j_id,
-            custom_path=custom_path,
+    for row in stranded:
+        job_id = row["id"]
+        recovery_message = (
+            "Worker lost its lease while in submit_intent/verifying; "
+            "recovered by the active sweeper."
         )
-
+        if mark_job_ambiguous(
+            job_id,
+            recovery_message,
+            custom_path=custom_path,
+            expected_worker_id=row["lease_owner"],
+            expected_generation=row["fencing_generation"],
+            checkpoint="stranded_crash_recovery",
+            error_code="CRASH_DURING_SUBMISSION",
+            operation_key=f"crash_recovery:{job_id}:{row['fencing_generation']}",
+        ):
+            reconciled.append(job_id)
     return reconciled

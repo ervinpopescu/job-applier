@@ -15,7 +15,12 @@ import pandas as pd  # type: ignore[import-untyped]
 from job_applier.utils import get_project_root
 
 _DB_LOCK = threading.Lock()
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 7
+# Submit fencing intentionally holds a SQLite write transaction across the final
+# browser click. Every process must wait for that bounded operation instead of
+# failing with ``database is locked`` and incorrectly treating normal fence
+# contention as a lost lease.
+SQLITE_BUSY_TIMEOUT_SECONDS = 300.0
 
 
 def get_db_path(custom_path: Path | None = None) -> Path:
@@ -33,14 +38,25 @@ def get_db_path(custom_path: Path | None = None) -> Path:
     return db_file
 
 
-def get_connection(custom_path: Path | None = None) -> sqlite3.Connection:
-    """Creates a connection with WAL mode enabled for concurrent reading/writing."""
+def get_connection(
+    custom_path: Path | None = None,
+    *,
+    timeout: float = SQLITE_BUSY_TIMEOUT_SECONDS,
+) -> sqlite3.Connection:
+    """Create a WAL connection with bounded cross-process busy handling.
+
+    Submit fencing may hold ``BEGIN IMMEDIATE`` while Playwright performs one
+    bounded click. A short SQLite default timeout turns that expected ordering
+    wait into a false lease loss, so all readers/writers use the same explicit
+    upper bound. Callers still fail closed when the bound is exceeded.
+    """
     path = get_db_path(custom_path)
-    conn = sqlite3.connect(str(path), check_same_thread=False)
+    conn = sqlite3.connect(str(path), timeout=timeout, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL;")
     conn.execute("PRAGMA synchronous = NORMAL;")
     conn.execute("PRAGMA foreign_keys = ON;")
+    conn.execute(f"PRAGMA busy_timeout = {max(0, int(timeout * 1000))};")
     return conn
 
 
@@ -251,6 +267,8 @@ def _migration_2_automation(conn: sqlite3.Connection) -> None:
             browser_is_closed INTEGER NOT NULL DEFAULT 1,
             browser_updated_at TEXT,
             browser_job_id TEXT,
+            browser_session_generation INTEGER,
+            browser_shutdown_generation INTEGER,
             updated_at TEXT NOT NULL
         );
         """
@@ -267,6 +285,8 @@ def _migration_2_automation(conn: sqlite3.Connection) -> None:
         ("browser_is_closed", "INTEGER NOT NULL DEFAULT 1"),
         ("browser_updated_at", "TEXT"),
         ("browser_job_id", "TEXT"),
+        ("browser_session_generation", "INTEGER"),
+        ("browser_shutdown_generation", "INTEGER"),
     ]:
         if col_name not in existing_rc_cols:
             conn.execute(
@@ -465,6 +485,28 @@ def _migration_5_automation_observability(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_6_browser_session_fencing(conn: sqlite3.Connection) -> None:
+    """Migration 6: durable browser session generation fencing."""
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(runtime_control);").fetchall()
+    }
+    if "browser_session_generation" not in columns:
+        conn.execute(
+            "ALTER TABLE runtime_control ADD COLUMN browser_session_generation INTEGER;"
+        )
+
+
+def _migration_7_browser_shutdown_signal(conn: sqlite3.Connection) -> None:
+    """Migration 7: durable cross-process browser shutdown generation."""
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(runtime_control);").fetchall()
+    }
+    if "browser_shutdown_generation" not in columns:
+        conn.execute(
+            "ALTER TABLE runtime_control ADD COLUMN browser_shutdown_generation INTEGER;"
+        )
+
+
 def _migration_4_adapter_safety_controls(conn: sqlite3.Connection) -> None:
     """Migration 4: Adapter safety controls, canary approvals, and submission rate limits."""
     conn.execute(
@@ -517,6 +559,8 @@ MIGRATIONS = [
     (3, "durable_notifications_and_acknowledgements", _migration_3_notifications),
     (4, "adapter_safety_controls_and_canaries", _migration_4_adapter_safety_controls),
     (5, "automation_observability", _migration_5_automation_observability),
+    (6, "browser_session_fencing", _migration_6_browser_session_fencing),
+    (7, "browser_shutdown_signal", _migration_7_browser_shutdown_signal),
 ]
 
 
@@ -609,6 +653,8 @@ def ensure_runtime_control_columns(conn: sqlite3.Connection) -> None:
         ("browser_is_closed", "INTEGER NOT NULL DEFAULT 1"),
         ("browser_updated_at", "TEXT"),
         ("browser_job_id", "TEXT"),
+        ("browser_session_generation", "INTEGER"),
+        ("browser_shutdown_generation", "INTEGER"),
     ]:
         if col_name not in existing_rc_cols:
             conn.execute(

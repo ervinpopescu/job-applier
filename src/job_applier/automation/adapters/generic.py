@@ -242,7 +242,9 @@ class GenericFormAdapter(BaseATSAdapter):
     def submit(
         self,
         page: Any,
+        *,
         on_submit_intent: Callable[[], None] | None = None,
+        on_submit_permit: Callable[[], None] | None = None,
     ) -> bool:
         """
         STRICTLY PROHIBITED: Generic forms are fill-only.

@@ -17,8 +17,10 @@ from job_applier.automation.profile_lock import ProfileOwnershipLock
 from job_applier.automation.queue import (
     JobState,
     claim_next_job,
+    create_attempt,
     enqueue_job,
     get_runtime_control,
+    record_submit_intent,
     set_runtime_pause,
 )
 from job_applier.automation.safety_guard import SubmissionSafetyGuard
@@ -569,6 +571,53 @@ def test_emergency_stop_sets_ambiguous_submission(tmp_path: Path):
 
     assert row["state"] == JobState.AMBIGUOUS_SUBMISSION.value
     assert row["checkpoint"] == "emergency_stop_ambiguous"
+
+
+def test_emergency_stop_closes_ambiguous_attempt_and_application(tmp_path: Path):
+    db_file = tmp_path / "em_stop_projection.db"
+    init_db(db_file)
+    upsert_application(
+        app_id="app-em-projection",
+        company="Emergency Corp",
+        title="SRE",
+        job_url="https://emergency.example/job/2",
+        custom_path=db_file,
+    )
+    enqueue_job("app-em-projection", adapter="ashby", custom_path=db_file)
+    claimed = claim_next_job("emergency-worker", lease_seconds=60, custom_path=db_file)
+    assert claimed is not None
+    attempt = create_attempt(
+        claimed.id,
+        claimed.app_id,
+        worker_id="emergency-worker",
+        lease_generation=claimed.fencing_generation,
+        custom_path=db_file,
+    )
+    assert record_submit_intent(
+        attempt.id,
+        claimed.id,
+        "emergency-worker",
+        claimed.fencing_generation,
+        custom_path=db_file,
+    )
+    emergency_stop(reason="projection test", custom_db_path=db_file)
+    conn = get_connection(db_file)
+    job = conn.execute(
+        "SELECT state FROM automation_jobs WHERE id = ?", (claimed.id,)
+    ).fetchone()
+    attempt_row = conn.execute(
+        "SELECT outcome, is_ambiguous, completed_at FROM application_attempts WHERE id = ?",
+        (attempt.id,),
+    ).fetchone()
+    app = conn.execute(
+        "SELECT status FROM applications WHERE id = ?", (claimed.app_id,)
+    ).fetchone()
+    conn.close()
+    assert job["state"] == JobState.AMBIGUOUS_SUBMISSION.value
+    assert attempt_row["outcome"] == "ambiguous"
+    assert attempt_row["is_ambiguous"] == 1
+    assert attempt_row["completed_at"] is not None
+    assert app["status"] == "ambiguous"
 
 
 def test_emergency_stop_enqueues_to_notification_outbox(tmp_path: Path):
