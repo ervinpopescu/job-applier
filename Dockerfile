@@ -51,7 +51,7 @@ USER job-applier
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=5 \
-    CMD ["/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5)"]
+    CMD ["/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/internal', timeout=5)"]
 
 ENTRYPOINT ["job-applier-entrypoint"]
 CMD ["/app/.venv/bin/python", "-m", "job_applier.cli.web_app", "--host", "0.0.0.0", "--port", "8000", "--no-browser", "--no-reload"]

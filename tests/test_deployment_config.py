@@ -97,3 +97,26 @@ def test_caddyfile_browser_viewer_path_stripping() -> None:
     assert "handle_path /browser* {" in caddyfile
     assert "reverse_proxy @static_viewer runtime:6080" in caddyfile
     assert "uri /api/auth/viewer-gate" in caddyfile
+
+
+def test_health_routes_keep_public_access_protected() -> None:
+    """Only loopback Caddy traffic with the shared probe token may use the internal probe."""
+    caddyfile = (PROJECT_ROOT / "deploy" / "Caddyfile").read_text(encoding="utf-8")
+    compose = (PROJECT_ROOT / "compose.yaml").read_text(encoding="utf-8")
+    assert "path /api/health/internal" in caddyfile
+    assert "remote_ip 127.0.0.1 ::1" in caddyfile
+    assert (
+        "header_up X-Internal-Health-Check {$INTERNAL_HEALTH_CHECK_TOKEN}" in caddyfile
+    )
+    assert "INTERNAL_HEALTH_CHECK_TOKEN" in compose
+    assert "LOCAL_GATEWAY_VIEWER_TOKEN" in compose
+    assert "@local_vnc_credentials" in caddyfile
+    assert "header_up X-Local-Gateway-Viewer {$LOCAL_GATEWAY_VIEWER_TOKEN}" in caddyfile
+    assert compose.count("VNC_PASSWORD: ${VNC_PASSWORD:-}") == 2
+    assert "header_up -X-Internal-Health-Check" in caddyfile
+    assert "/api/health/internal" in compose
+    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "/api/health/internal" in dockerfile
+    env_example = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
+    assert "VNC_PASSWORD=" in env_example
+    assert "8 ASCII bytes" in env_example

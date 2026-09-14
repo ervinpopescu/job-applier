@@ -21,7 +21,7 @@ curl -fsSLO https://raw.githubusercontent.com/ervinpopescu/job-applier/main/comp
 curl -fsSL https://raw.githubusercontent.com/ervinpopescu/job-applier/main/.env.example -o .env
 ```
 
-Edit `.env` and set at least `GOOGLE_API_KEY`. Forks should also change `JOB_APPLIER_IMAGE` to their own GHCR package:
+Edit `.env` and set at least `GOOGLE_API_KEY` and `VNC_PASSWORD`. `VNC_PASSWORD` must be 1–8 ASCII bytes for classic VNC; use a deployment secret/file rather than committing it. Forks should also change `JOB_APPLIER_IMAGE` to their own GHCR package:
 
 ```dotenv
 JOB_APPLIER_IMAGE=ghcr.io/owner/job-applier:latest
@@ -34,6 +34,8 @@ CLOUDFLARE_TUNNEL_TOKEN=eyJh...
 CF_ACCESS_AUD=0cf8...
 CF_ACCESS_TEAM_DOMAIN=aged-sunset-0292.cloudflareaccess.com
 CF_ACCESS_ALLOWED_IDENTITIES=ervin.popescu10@gmail.com
+# Required, never commit a real value; Docker secrets are also supported.
+VNC_PASSWORD=replace-with-1-to-8-ascii-bytes
 ```
 
 Start the application:
@@ -51,6 +53,10 @@ ssh -L 8089:127.0.0.1:8089 -L 8001:127.0.0.1:8001 user@server
 ```
 
 Then visit <http://127.0.0.1:8089> (through gateway) or <http://127.0.0.1:8001> (direct web) locally.
+
+The runtime requires the same `VNC_PASSWORD` as the web service. It validates the classic VNC limit (1–8 ASCII bytes), generates an ephemeral mode-0600 x11vnc password file, and removes it on shutdown. The dashboard obtains credentials only from its Access-protected same-origin endpoint; they are never placed in URLs or logs. For Docker secrets, mount a secret named `VNC_PASSWORD` at `/run/secrets/VNC_PASSWORD` in both services instead of using an environment value.
+
+For an Access-disabled SSH-tunnel viewer through the loopback gateway, set a separate high-entropy `LOCAL_GATEWAY_VIEWER_TOKEN` in the environment shared by Caddy and web. Caddy injects it only for requests whose Host is `localhost` or `127.0.0.1`; web additionally requires the trusted proxy source and local Host before returning the no-store VNC credential response. Direct web access on loopback remains supported without this gateway token.
 
 The first startup creates privacy-safe candidate and resume templates in the persistent data volume. Complete the candidate profile in the dashboard. To replace the master resume JSON while preserving container ownership:
 
