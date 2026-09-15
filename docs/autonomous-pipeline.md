@@ -101,7 +101,7 @@ approved_answers (Phase 1 Target)
   - Server-Side Lifetime: Viewer WebSocket connection is capped at `min(300, token_exp - now)` seconds (5-minute maximum).
   - SSE Expiry: Server-Sent Events stream emits `event: expired` and terminates when token expires.
   - Origin & CSRF: Mutating requests require exact canonical Origin; cross-origin mutations return HTTP 403. No credentialed cross-origin CORS.
-  - Minimal Private Health: `/api/health` returns only minimal non-sensitive status and is exempted for loopback health checks.
+  - Minimal Private Health: Public `/api/health` remains Access-protected. Loopback-only `/api/health/internal` is reserved for the container health probe; both routes return only minimal non-sensitive status.
   - Preserved Volumes: `job-applier-data`, `job-applier-output`, `job-applier-browser-profile`, `job-applier-ntfy-data`, `caddy-data`, `caddy-config`.
 
 ---
@@ -171,14 +171,25 @@ When an exception occurs (CAPTCHA, MFA challenge, novel screening question, or a
 
 ### Operator Takeover & Authenticated noVNC Integration
 
+- **Direct Mobile noVNC Client**:
+  - The Angular takeover modal controls noVNC directly through `/browser/websockify`; it does not embed a legacy viewer page in an iframe.
+  - **Readable Pan (1:1)** keeps the remote desktop at native scale and permits touch dragging of the clipped viewport. **Fit Overview** scales the complete desktop to the panel. Page Up/Page Down keys and clipboard text input are available while control is authorized.
 - **Server-Enforced Read-Only Default**:
-  - Browser viewer connections through `/browser/` or `/api/browser/ws` are read-only by default. Mouse clicks and keystrokes are blocked server-side.
+  - Browser viewer connections through `/browser/` or `/api/browser/ws` are read-only by default. Mouse, keyboard, pointer, and clipboard messages are filtered server-side unless the viewer identity owns the active takeover lease.
 - **Exclusive Operator Takeover**:
-  - `POST /api/automation/takeover/claim`: Atomically pauses the worker and acquires an exclusive 300-second operator lease.
-  - `POST /api/automation/takeover/release`: Releases the operator lease. Worker remains paused awaiting safe resume revalidation.
-  - `POST /api/automation/takeover/resume`: Safe resume endpoint that revalidates page URL origin, checks CAPTCHA/MFA resolution, and verifies completion state before clearing takeover and unpausing automation.
+  - `POST /api/automation/takeover/claim`: Atomically pauses the worker and acquires an exclusive 300-second operator lease. In Access mode, ownership is derived from the verified identity; a caller cannot choose another owner.
+  - `POST /api/automation/takeover/release`: Releases the operator lease. The worker remains paused awaiting safe resume revalidation.
+  - `POST /api/automation/takeover/resume`: Safe resume endpoint that revalidates the current owner, page URL origin, CAPTCHA/MFA resolution, and completion state before clearing takeover and unpausing automation.
+  - Lease expiry, stale status, worker replacement, runtime shutdown, and emergency stop revoke input. A closed viewer or released lease never resumes work automatically.
 - **UI HUD & Modal**:
-  - Authenticated noVNC viewer modal embedded in Angular dashboard with live countdown timer, interactive takeover claim/release controls, and safe resume triggers.
+  - The authenticated modal shows connection/lease state and countdown, obtains ephemeral VNC credentials through a no-store same-origin endpoint, retries transient connection loss up to three times, and requires an explicit retry after terminal failure.
+
+### Consent, Sensitive Answers, and Resolution Gates
+
+- Standard privacy, GDPR, and application-processing consent may be accepted automatically when recognized by an adapter.
+- Demographic, background-check, work-authorization, sponsorship, legal, waiver, and other sensitive declarations remain blocked for explicit operator approval; the system does not invent answers.
+- Physical submission is guarded by durable `submit_intent`, active worker ownership, fencing, and an immediately adjacent permit check. A crash, runtime shutdown, lease loss, or worker replacement around the click fails closed.
+- A missing or ambiguous confirmation pauses the worker and is never auto-resubmitted. Re-queueing an `ambiguous_submission` job requires the explicit `force=true` resolution gate after the operator determines whether an external submission occurred.
 
 ### ntfy Mobile Push Subsystem & Outbox Processor
 

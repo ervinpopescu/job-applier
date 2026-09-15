@@ -11,6 +11,7 @@ Job Applier automates the job search lifecycle: scraping technical positions, ta
 - **AI Resume & Cover Letter Tailoring:** Analyzes job descriptions and dynamically tailors your master JSON resume and generates targeted cover letters using Google Gemini 3.8-Flash.
 - **Autonomous Execution & Safety Guard:** Durable SQLite execution queue with worker leasing, typed ATS adapters (Greenhouse, Lever, Ashby), canary verification gates, central submission safety guard, and rate-limited pacing (5/day, 300s spacing).
 - **Browser Automation:** Assisted and autonomous Playwright engine with form autofill, CV upload, and AI screening question answering.
+- **Mobile Browser Takeover:** Authenticated in-dashboard noVNC client with Readable Pan, Fit Overview, remote scrolling, text input, and lease-bound controls.
 - **Session Vault & Desktop Sync:** Persistent browser profile with 1-click session synchronization from your desktop Chrome browser.
 - **SQLite Database & Portable Sync:** Relational SQLite database with WAL concurrency, plus 1-click export/import of portable `.zip` backup bundles between machines.
 - **Portable Deployment:** Multi-architecture Docker image, multi-service Compose architecture (gateway, web, runtime, cloudflared, ntfy), health checks, and zero-trust edge authentication.

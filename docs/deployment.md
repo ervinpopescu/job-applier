@@ -80,7 +80,7 @@ The Docker build excludes repository `data/`, `output/`, `.env`, and `.browser_p
 
 ## Persistent data and backups
 
-Compose bind-mounts the canonical host data directories and keeps four service volumes:
+Compose bind-mounts the canonical host data directories and keeps four named service volumes:
 
 - `${DATA_DIR}` (default `/home/ervin/prjs/job-applier/data`) — profile, master resume, SQLite database, and tracker data
 - `${OUTPUT_DIR}` (default `/home/ervin/prjs/job-applier/output`) — generated application packages and PDFs
@@ -91,7 +91,7 @@ Compose bind-mounts the canonical host data directories and keeps four service v
 
 The data and output bind mounts are shared by the web and runtime containers, so recreating containers does not require copying the database or generated packages. Ensure the rootless container UID has read/write access to both host directories.
 
-Upgrades preserve all named volumes:
+Upgrades preserve the bind-mounted data/output directories and all named service volumes:
 
 ```bash
 docker compose pull
@@ -195,7 +195,7 @@ DEPLOY_ENABLED=true
 
 The workflow contains only secret names. It never contains the host, username, port, or deployment path. Do not enable verbose SSH logging because a resolved IP address may not be covered by GitHub's exact-value masking.
 
-The deploy job runs only for pushes to `main`, pulls the immutable `sha-<full commit>` image, restarts the Compose service, and waits for `/api/health` to respond. Protect the `production` Environment with required reviewers if deployments need approval.
+The deploy job runs only for pushes to `main`, pulls the immutable `sha-<full commit>` image, restarts the Compose service, and waits for a loopback health response. The Compose web healthcheck uses `/api/health/internal`; the native systemd deployment check uses `/api/health` on loopback, while the public `/api/health` route remains Access-protected. Protect the `production` Environment with required reviewers if deployments need approval.
 
 ## Publishing from a fork
 

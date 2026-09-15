@@ -66,8 +66,11 @@ Customize your contact info, location, URLs (LinkedIn, GitHub, Portfolio), curre
 ### 6. Real-Time Notifications & Operator Takeover
 
 - **Durable Notification Tray:** Real-time stream over Server-Sent Events (`/api/automation/events`) delivering immediate challenge alerts (CAPTCHA, MFA, screening questions) with cross-tab Web Locks deduplication and unread counter badges.
-- **Embedded Browser Viewer:** Authenticated live stream (`/browser/`) through internal gateway and noVNC with server-side 5-minute session lifetime limits.
-- **Atomic Takeover & Safe Resume:** Operators can engage manual takeover to solve challenges in the live browser, then trigger safe resume (`/api/automation/safe-resume`), which revalidates URL security, domain matching, and tenant consistency before handing execution back to the autonomous worker.
+- **Direct noVNC Viewer:** The takeover modal controls the noVNC client directly through the authenticated `/browser/websockify` transport; it does not embed a legacy viewer page in an iframe. The gateway protects viewer assets and WebSocket upgrades.
+- **Mobile View Modes:** **Readable Pan (1:1)** keeps the remote desktop at native scale and allows touch dragging of the clipped viewport. **Fit Overview** scales the whole desktop into the available panel. `Page Up`, `Page Down`, and text paste send input to the remote browser when control is authorized.
+- **Exclusive Takeover Lease:** Opening takeover claims a 300-second lease and pauses the worker. Only the current authenticated claimant can send mouse, keyboard, scroll, or clipboard input; other viewers remain read-only. Lease expiry, release, worker replacement, runtime shutdown, or emergency stop revokes input safely.
+- **Safe Resume:** Use `POST /api/automation/takeover/resume` after completing a challenge. It revalidates ownership, page URL security, challenge state, and completion state before handing execution back to the worker. Closing the viewer or releasing control does not resume automation.
+- **Connection recovery:** The client obtains VNC credentials without exposing them in URLs or logs, reports authentication/runtime failures, and retries transient disconnects up to three times. Reauthenticate or explicitly retry after a terminal failure.
 
 ---
 

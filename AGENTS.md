@@ -22,9 +22,9 @@ The codebase is structured as a standard Python package under `src/job_applier/`
   - `emergency_stop.py`: Atomic circuit breaker halting execution, revoking worker leases, and pausing queue.
 - **`src/job_applier/sync.py`**: Portable self-contained backup engine packaging applications and SQLite mappings into `.zip` bundles.
 - **`src/job_applier/web/`**: Full-stack web dashboard application.
-  - `app.py`: FastAPI server hosting the compiled Angular frontend and REST APIs for applications, batch auto-applying, tracking, profile editing, and background scraping pipeline execution.
+  - `app.py`: FastAPI server hosting the compiled Angular frontend, REST APIs, and authenticated direct noVNC/takeover transport for applications, batch auto-applying, tracking, profile editing, and background scraping pipeline execution.
   - `edge_auth.py`: Zero-trust Cloudflare Access middleware with RS256 JWT validation, identity allowlists, CSRF origin verification, and gateway noVNC authorization gate.
-- **`frontend/`**: Modern Angular 21 Single-Page Application (Standalone components, Signals, TypeScript, Tailwind CSS, Lucide icons).
+- **`frontend/`**: Modern Angular 21 Single-Page Application (Standalone components, Signals, TypeScript, Tailwind CSS, Lucide icons), including the lease-bound mobile noVNC takeover client.
 - **`src/job_applier/automation/`**: Modules dedicated to browser automation and form autofilling.
   - `adapters/`: Versioned typed ATS adapters implementing `BaseATSAdapter` for Greenhouse, Lever, Ashby, and Generic form filling.
   - `safety_guard.py`: Central submission safety guard enforcing canary approvals, rate limiting (5/day), pacing (300s spacing), worker lease fencing, and frozen revision validation.

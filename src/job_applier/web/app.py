@@ -1655,7 +1655,7 @@ def release_takeover_endpoint(
 
 
 def _require_current_takeover_owner(request: Request) -> str | None:
-    """Require the verified Access identity to own an active takeover lease."""
+    """Enforce takeover lease ownership if a lease is active; allow any authenticated operator otherwise."""
     owner = _takeover_request_owner(request, "")
     from job_applier.automation.queue import is_takeover_active
 
@@ -1723,7 +1723,7 @@ def resume_from_takeover_endpoint(
 
 @app.post("/api/automation/pause")
 def pause_automation_endpoint(request: Request) -> dict[str, Any]:
-    """Sets global automation pause for the current takeover owner."""
+    """Sets global automation pause, enforcing takeover ownership if a lease is active."""
     from job_applier.automation.queue import set_runtime_pause
 
     owner = _require_current_takeover_owner(request)
@@ -1791,7 +1791,7 @@ def stop_automation_endpoint(request: Request) -> dict[str, Any]:
 
 @app.post("/api/automation/clear-state")
 def clear_automation_state_endpoint(request: Request) -> dict[str, Any]:
-    """Fully clears automation state for the current takeover owner."""
+    """Fully clears automation state, enforcing takeover ownership if a lease is active."""
     from job_applier.automation.queue import clear_automation_state
 
     owner = _require_current_takeover_owner(request)
