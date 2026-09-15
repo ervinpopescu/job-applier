@@ -607,7 +607,7 @@
           <button
             *ngIf="notifService.isPaused() && !notifService.isStopped()"
             (click)="resumeAutomation()"
-            [disabled]="isResumingAutomation() || !takeoverOwnerActionEnabled()"
+            [disabled]="isResumingAutomation() || !runtimeActionEnabled()"
             class="px-3.5 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs rounded-xl transition shadow flex items-center gap-1.5 disabled:opacity-50"
             title="Perform safe revalidation and resume automation"
           >
@@ -657,7 +657,7 @@
           <button
             *ngIf="!notifService.isStopped()"
             (click)="stopAutomation()"
-            [disabled]="isStoppingAutomation() || !takeoverOwnerActionEnabled()"
+            [disabled]="isStoppingAutomation() || !runtimeActionEnabled()"
             class="px-3 py-1.5 bg-rose-950/80 hover:bg-rose-900 text-rose-300 border border-rose-800 rounded-xl text-xs font-medium flex items-center gap-1.5 transition shadow"
             title="Emergency halt all automation"
           >
@@ -828,7 +828,7 @@
           <button
             *ngIf="notifService.isPaused() && !notifService.isStopped()"
             (click)="resumeAutomation()"
-            [disabled]="isResumingAutomation() || !takeoverOwnerActionEnabled()"
+            [disabled]="isResumingAutomation() || !runtimeActionEnabled()"
             class="px-2.5 py-1 bg-emerald-950 hover:bg-emerald-900 border border-emerald-800 text-emerald-300 rounded-lg font-medium transition flex items-center gap-1.5"
             title="Resume automation after safe revalidation"
           >
@@ -838,7 +838,7 @@
           <button
             *ngIf="!notifService.isStopped()"
             (click)="stopAutomation()"
-            [disabled]="isStoppingAutomation() || !takeoverOwnerActionEnabled()"
+            [disabled]="isStoppingAutomation() || !runtimeActionEnabled()"
             class="px-2.5 py-1 bg-rose-950/60 hover:bg-rose-900 border border-rose-800 text-rose-300 rounded-lg font-medium transition flex items-center gap-1.5"
             title="Emergency halt all worker processes"
           >
@@ -847,7 +847,7 @@
           </button>
           <button
             (click)="clearAutomationState()"
-            [disabled]="isClearingAutomationState() || !takeoverOwnerActionEnabled()"
+            [disabled]="isClearingAutomationState() || !runtimeActionEnabled()"
             class="px-2.5 py-1 bg-amber-950/50 hover:bg-amber-900/60 border border-amber-800 text-amber-300 rounded-lg font-medium transition flex items-center gap-1.5"
             title="Recover pre-submit jobs; ambiguous submissions remain blocked for explicit resolution"
           >
@@ -906,7 +906,7 @@
           />
           <button
             type="submit"
-            [disabled]="!takeoverOwnerActionEnabled()"
+            [disabled]="!runtimeActionEnabled()"
             class="px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-xl text-xs font-bold transition shadow whitespace-nowrap disabled:opacity-50"
           >
             Submit Code
@@ -2643,7 +2643,8 @@
       <div class="p-3 sm:p-6 overflow-y-auto space-y-4 text-xs">
         <pre
           class="bg-slate-950 p-4 rounded-xl font-mono text-slate-300 overflow-x-auto border border-slate-800"
-          >{{ diagData() | json }}</pre>
+          >{{ diagData() | json }}</pre
+        >
       </div>
     </div>
   </div>

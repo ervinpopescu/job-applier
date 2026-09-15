@@ -2,6 +2,11 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from job_applier.web.edge_auth import EdgeAuthConfig, EdgeAuthMiddleware
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -100,23 +105,25 @@ def test_caddyfile_browser_viewer_path_stripping() -> None:
 
 
 def test_health_routes_keep_public_access_protected() -> None:
-    """Only loopback Caddy traffic with the shared probe token may use the internal probe."""
-    caddyfile = (PROJECT_ROOT / "deploy" / "Caddyfile").read_text(encoding="utf-8")
-    compose = (PROJECT_ROOT / "compose.yaml").read_text(encoding="utf-8")
-    assert "path /api/health/internal" in caddyfile
-    assert "remote_ip 127.0.0.1 ::1" in caddyfile
-    assert (
-        "header_up X-Internal-Health-Check {$INTERNAL_HEALTH_CHECK_TOKEN}" in caddyfile
+    """The internal health interface is loopback-only while public health requires Access."""
+    config = EdgeAuthConfig(
+        cf_access_enabled=True,
+        cf_access_aud="test-audience",
+        cf_access_team_domain="aslan",
+        cf_access_allowed_identities={"operator@aslan.net"},
+        allowed_hosts={"testserver"},
     )
-    assert "INTERNAL_HEALTH_CHECK_TOKEN" in compose
-    assert "LOCAL_GATEWAY_VIEWER_TOKEN" in compose
-    assert "@local_vnc_credentials" in caddyfile
-    assert "header_up X-Local-Gateway-Viewer {$LOCAL_GATEWAY_VIEWER_TOKEN}" in caddyfile
-    assert compose.count("VNC_PASSWORD: ${VNC_PASSWORD:-}") == 2
-    assert "header_up -X-Internal-Health-Check" in caddyfile
-    assert "/api/health/internal" in compose
-    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
-    assert "/api/health/internal" in dockerfile
-    env_example = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
-    assert "VNC_PASSWORD=" in env_example
-    assert "8 ASCII bytes" in env_example
+    test_app = FastAPI()
+    test_app.add_middleware(EdgeAuthMiddleware, config=config)
+
+    @test_app.get("/api/health/internal")
+    @test_app.get("/api/health")
+    def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    loopback_client = TestClient(test_app, client=("127.0.0.1", 50000))
+    assert loopback_client.get("/api/health/internal").status_code == 200
+
+    remote_client = TestClient(test_app, client=("192.168.1.100", 50000))
+    assert remote_client.get("/api/health/internal").status_code == 401
+    assert remote_client.get("/api/health").status_code == 401

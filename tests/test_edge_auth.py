@@ -830,11 +830,10 @@ class TestEdgeAuthMiddlewareIntegration:
         assert res.status_code == 200
         assert res.json() == {"status": "ok", "service": "job-applier"}
 
-    def test_internal_health_marker_requires_secret_and_trusted_source(self):
+    def test_internal_health_rejects_non_loopback_source(self):
         config = EdgeAuthConfig(
             cf_access_enabled=False,
             allowed_hosts={"testserver"},
-            internal_health_check_token="gateway-health-secret",
         )
         test_app = FastAPI()
         test_app.add_middleware(EdgeAuthMiddleware, config=config)
@@ -844,28 +843,12 @@ class TestEdgeAuthMiddlewareIntegration:
             return {"status": "ok"}
 
         client = TestClient(test_app, client=("10.0.0.8", 50000))
-        assert (
-            client.get(
-                "/api/health/internal",
-                headers={"X-Internal-Health-Check": "caddy-local"},
-            ).status_code
-            == 404
-        )
-        assert (
-            client.get(
-                "/api/health/internal",
-                headers={
-                    "X-Internal-Health-Check": "gateway-health-secret",
-                },
-            ).status_code
-            == 200
-        )
+        assert client.get("/api/health/internal").status_code == 404
 
     def test_internal_health_missing_client_metadata_is_untrusted(self):
         config = EdgeAuthConfig(
             cf_access_enabled=False,
             allowed_hosts={"testserver"},
-            internal_health_check_token="gateway-health-secret",
         )
         test_app = FastAPI()
         test_app.add_middleware(EdgeAuthMiddleware, config=config)
@@ -875,10 +858,7 @@ class TestEdgeAuthMiddlewareIntegration:
             return {"status": "ok"}
 
         client = TestClient(test_app, client=None)  # type: ignore[arg-type]
-        response = client.get(
-            "/api/health/internal",
-            headers={"X-Internal-Health-Check": "gateway-health-secret"},
-        )
+        response = client.get("/api/health/internal")
         assert response.status_code == 404
 
     def test_public_internal_health_requires_access_before_private_404(

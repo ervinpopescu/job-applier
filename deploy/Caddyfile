@@ -25,18 +25,6 @@
 	header @html_navigation Pragma "no-cache"
 	header @html_navigation Expires "0"
 
-	# Local-only internal health probe. The public tunnel does not originate from
-	# loopback, so it falls through to the authenticated catch-all below.
-	@internal_health {
-		path /api/health/internal
-		remote_ip 127.0.0.1 ::1
-	}
-	handle @internal_health {
-		reverse_proxy web:8000 {
-			header_up X-Internal-Health-Check {$INTERNAL_HEALTH_CHECK_TOKEN}
-		}
-	}
-
 	# Local SSH-tunnel viewer credential delivery. The gateway is host-bound to
 	# loopback; inject a separate secret only for local Host aliases, never public
 	# requests. The web service verifies this token and the trusted proxy source.
@@ -103,9 +91,6 @@
 		reverse_proxy web:8000 {
 			header_up Host {host}
 			header_up X-Real-IP {remote_host}
-			# Never pass a client-supplied internal health marker through the
-			# public route; only the loopback matcher above may set it.
-			header_up -X-Internal-Health-Check
 		}
 	}
 }

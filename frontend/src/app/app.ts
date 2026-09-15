@@ -1413,15 +1413,17 @@ export class App implements OnInit, OnDestroy {
   }
 
   submitCode() {
-    const code = this.verificationCode().trim();
-    if (!code || !this.takeoverOwnerActionEnabled()) return;
+    const code = this.verificationCode()?.trim();
+    if (!code) return;
     this.api.submitVerificationCode(code).subscribe({
-      next: () => {
-        this.showToast('Verification code submitted to browser!');
+      next: (res: any) => {
+        this.showToast(res.message || 'Verification code submitted!', 'success');
         this.verificationCode.set('');
+        this.refreshPoll();
       },
-      error: (err) =>
-        this.showToast(classifyHttpError(err).message || 'Failed to submit code', 'error'),
+      error: (err) => {
+        this.showToast(classifyHttpError(err).message || 'Failed to submit code', 'error');
+      },
     });
   }
 

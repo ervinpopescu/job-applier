@@ -1654,13 +1654,15 @@ def release_takeover_endpoint(
     return result
 
 
-def _require_current_takeover_owner(request: Request) -> str:
-    """Require the verified Access identity to own the active takeover lease."""
+def _require_current_takeover_owner(request: Request) -> str | None:
+    """Require the verified Access identity to own an active takeover lease."""
     owner = _takeover_request_owner(request, "")
     from job_applier.automation.queue import is_takeover_active
 
     active, current_owner, _ = is_takeover_active()
-    if edge_config.cf_access_enabled and (not active or current_owner != owner):
+    if not active:
+        return None
+    if edge_config.cf_access_enabled and current_owner != owner:
         raise HTTPException(
             status_code=403,
             detail="Only the current takeover owner may perform this action.",
@@ -1740,9 +1742,7 @@ def resume_automation_endpoint(request: Request = None) -> dict[str, Any]:  # ty
     from job_applier.automation.safe_resume import safe_resume_revalidate
     from job_applier.automation.queue import get_runtime_browser_state
 
-    owner = (
-        _require_current_takeover_owner(request) if request is not None else "operator"
-    )
+    owner = _require_current_takeover_owner(request) if request is not None else None
     expected_owner = owner if edge_config.cf_access_enabled else None
     browser_state = get_runtime_browser_state()
     current_url = (

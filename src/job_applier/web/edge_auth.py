@@ -10,7 +10,7 @@ Implements Zero-Trust Edge Security according to autonomous pipeline specificati
 - Host header enforcement and trusted proxy CIDR filtering.
 - CSRF protection and exact Origin verification for mutating requests.
 - No credentialed cross-origin CORS.
-- Public health authentication with a loopback/token-authenticated internal probe.
+- Public health authentication with a loopback-only internal probe.
 - Gateway authorization endpoint for noVNC HTTP/WebSocket upgrades (/api/auth/viewer-gate).
 - Server-side 5-minute / token-expiry viewer WebSocket lifetime enforcement.
 """
@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hmac
 import ipaddress
 import json
 import logging
@@ -125,7 +124,6 @@ class EdgeAuthConfig:
         ]
     )
     viewer_max_duration_seconds: int = 300  # Strict 5-minute maximum viewer lifetime
-    internal_health_check_token: str = ""
     local_gateway_viewer_token: str = ""
     jwks_cache_ttl_seconds: int = 3600  # 1 hour JWKS TTL
     jwks_rate_limit_seconds: int = 60  # Rate-limit remote refresh to at most once/min
@@ -263,10 +261,6 @@ class EdgeAuthConfig:
         except ValueError:
             viewer_duration = 300
 
-        internal_health_check_token = get_secret(
-            "INTERNAL_HEALTH_CHECK_TOKEN",
-            os.getenv("INTERNAL_HEALTH_CHECK_TOKEN", ""),
-        ).strip()
         local_gateway_viewer_token = get_secret(
             "LOCAL_GATEWAY_VIEWER_TOKEN",
             os.getenv("LOCAL_GATEWAY_VIEWER_TOKEN", ""),
@@ -282,7 +276,6 @@ class EdgeAuthConfig:
             allowed_hosts=allowed_hosts,
             trusted_proxies=trusted_proxies,
             viewer_max_duration_seconds=min(300, max(30, viewer_duration)),
-            internal_health_check_token=internal_health_check_token,
             local_gateway_viewer_token=local_gateway_viewer_token,
         )
 
@@ -627,8 +620,7 @@ class EdgeAuthMiddleware(BaseHTTPMiddleware):
 
         # 2. Internal health probe exemption
         # Public /api/health remains behind Access. The internal endpoint is only
-        # reachable from the loopback-bound Caddy route or the web container's
-        # own loopback healthcheck; Caddy strips this marker on public routes.
+        # reachable from the web container's own loopback healthcheck.
         internal_health_allowed = False
         if path == "/api/health/internal":
             loopback_client = False
@@ -636,16 +628,7 @@ class EdgeAuthMiddleware(BaseHTTPMiddleware):
                 loopback_client = ipaddress.ip_address(client_ip).is_loopback
             except ValueError:
                 pass
-            configured_probe_token = self.config.internal_health_check_token
-            caddy_local_probe = (
-                bool(configured_probe_token)
-                and hmac.compare_digest(
-                    request.headers.get("X-Internal-Health-Check", ""),
-                    configured_probe_token,
-                )
-                and trusted_client
-            )
-            internal_health_allowed = loopback_client or caddy_local_probe
+            internal_health_allowed = loopback_client
             if internal_health_allowed:
                 return await call_next(request)
 

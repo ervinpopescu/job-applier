@@ -1019,10 +1019,17 @@ def test_resolve_job_monotonic_and_ambiguous_force(tmp_path: Path):
     )
     assert success is True
 
-    # Claim afresh: fencing_generation must be monotonically 2 (not reset to 1)
+    conn = get_connection(db_file)
+    resolved_row = conn.execute(
+        "SELECT fencing_generation FROM automation_jobs WHERE id = ?;", (claimed.id,)
+    ).fetchone()
+    conn.close()
+    assert resolved_row["fencing_generation"] == 2
+
+    # Claim afresh: fencing_generation advances again without resetting.
     claimed2 = claim_next_job("worker-res-2", custom_path=db_file)
     assert claimed2 is not None
-    assert claimed2.fencing_generation == 2
+    assert claimed2.fencing_generation == 3
 
 
 def test_queue_updates_applications_status_on_cancellation(tmp_path: Path):

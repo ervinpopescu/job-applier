@@ -16,7 +16,6 @@ services:
     cap_add:
       - NET_BIND_SERVICE
     environment:
-      INTERNAL_HEALTH_CHECK_TOKEN: ${INTERNAL_HEALTH_CHECK_TOKEN:-}
       LOCAL_GATEWAY_VIEWER_TOKEN: ${LOCAL_GATEWAY_VIEWER_TOKEN:-}
     security_opt:
       - "no-new-privileges:true"
@@ -46,7 +45,6 @@ services:
     cap_drop:
       - ALL
     environment:
-      INTERNAL_HEALTH_CHECK_TOKEN: ${INTERNAL_HEALTH_CHECK_TOKEN:-}
       LOCAL_GATEWAY_VIEWER_TOKEN: ${LOCAL_GATEWAY_VIEWER_TOKEN:-}
       VNC_PASSWORD: ${VNC_PASSWORD:-}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
@@ -97,7 +95,6 @@ services:
       - ALL
     shm_size: "1gb"
     environment:
-      INTERNAL_HEALTH_CHECK_TOKEN: ${INTERNAL_HEALTH_CHECK_TOKEN:-}
       VNC_PASSWORD: ${VNC_PASSWORD:-}
       JOB_APPLIER_DB_PATH: /app/data/job_applier.db
       JOB_APPLIER_TRACKER_PATH: /app/data/applications_tracker.csv

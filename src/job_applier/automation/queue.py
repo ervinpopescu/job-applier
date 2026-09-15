@@ -1963,6 +1963,7 @@ def resolve_job(
                         is_cancelled = 0,
                         lease_owner = NULL,
                         lease_expires_at = NULL,
+                        fencing_generation = fencing_generation + 1,
                         error_code = NULL,
                         error_message = NULL,
                         next_retry_at = NULL,
