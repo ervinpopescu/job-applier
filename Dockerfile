@@ -14,7 +14,18 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    xvfb \
+    x11vnc \
+    websockify \
+    novnc \
+    net-tools \
+    procps \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/share/novnc /usr/share/novnc/browser
 
 RUN pip install --no-cache-dir "uv==${UV_VERSION}"
 
@@ -33,14 +44,14 @@ RUN uv sync --frozen --no-dev \
     && chmod 0755 /usr/local/bin/job-applier-entrypoint \
     && groupadd --gid 10001 job-applier \
     && useradd --uid 10001 --gid job-applier --home-dir /app --no-create-home --shell /usr/sbin/nologin job-applier \
-    && mkdir -p /app/data /app/output/applications /app/output/applied /app/.browser_profile \
-    && chown -R job-applier:job-applier /app/data /app/output /app/.browser_profile
+    && mkdir -p /app/data /app/output/applications /app/output/applied /app/.browser_profile /app/.browser_profile_firefox \
+    && chown -R job-applier:job-applier /app/data /app/output /app/.browser_profile /app/.browser_profile_firefox
 
 USER job-applier
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=5 \
-    CMD ["/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5)"]
+    CMD ["/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/internal', timeout=5)"]
 
 ENTRYPOINT ["job-applier-entrypoint"]
 CMD ["/app/.venv/bin/python", "-m", "job_applier.cli.web_app", "--host", "0.0.0.0", "--port", "8000", "--no-browser", "--no-reload"]

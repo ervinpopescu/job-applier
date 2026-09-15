@@ -65,13 +65,14 @@ def run_batch_auto_apply(
     batch_size: int = 5,
     autonomous: bool = False,
     headless: bool = False,
+    browser: str | None = None,
 ) -> None:
     """Runs automated browser application sequentially across a batch of applications."""
     project_root = get_project_root()
     applied_dir = project_root / "output" / "applied"
     applied_dir.mkdir(parents=True, exist_ok=True)
 
-    automator = BrowserAutomator(headless=headless)
+    automator = BrowserAutomator(headless=headless, browser=browser)
     processed = 0
 
     print(
@@ -129,6 +130,7 @@ def apply_assistant(
     autonomous: bool = False,
     batch_count: int | None = None,
     headless: bool = False,
+    browser: str | None = None,
 ) -> None:
     project_root = get_project_root()
     applications_dir = project_root / "output" / "applications"
@@ -162,7 +164,11 @@ def apply_assistant(
     if batch_count or auto_mode:
         count = batch_count if batch_count else len(all_apps)
         run_batch_auto_apply(
-            all_apps, batch_size=count, autonomous=autonomous, headless=headless
+            all_apps,
+            batch_size=count,
+            autonomous=autonomous,
+            headless=headless,
+            browser=browser,
         )
         return
 
@@ -235,7 +241,7 @@ def apply_assistant(
                 # Assisted Auto-Apply
                 if browser_automator is None:
                     browser_automator = BrowserAutomator(
-                        profile=candidate_profile, headless=headless
+                        profile=candidate_profile, headless=headless, browser=browser
                     )
                 if not browser_automator:
                     continue
@@ -262,7 +268,7 @@ def apply_assistant(
                 # Autonomous Auto-Apply
                 if browser_automator is None:
                     browser_automator = BrowserAutomator(
-                        profile=candidate_profile, headless=headless
+                        profile=candidate_profile, headless=headless, browser=browser
                     )
                 if not browser_automator:
                     continue
@@ -307,6 +313,7 @@ def apply_assistant(
                     batch_size=num,
                     autonomous=is_auto,
                     headless=headless,
+                    browser=browser,
                 )
                 # Refresh app list after batch
                 all_apps = sorted([d for d in applications_dir.iterdir() if d.is_dir()])
@@ -434,6 +441,12 @@ def main():
         "--headless", action="store_true", help="Run browser in headless mode"
     )
     parser.add_argument(
+        "--browser",
+        choices=["auto", "chrome", "chromium", "firefox"],
+        default=None,
+        help="Browser engine to use (auto, chrome, chromium, firefox)",
+    )
+    parser.add_argument(
         "--stats",
         action="store_true",
         help="Show application tracker statistics and exit",
@@ -451,6 +464,7 @@ def main():
         autonomous=args.autonomous,
         batch_count=args.batch,
         headless=args.headless,
+        browser=args.browser,
     )
 
 

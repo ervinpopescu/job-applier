@@ -22,6 +22,12 @@ def test_is_direct_ats_url() -> None:
     assert is_direct_ats_url("https://ro.indeed.com/viewjob?jk=123") is False
     assert is_direct_ats_url("https://www.linkedin.com/jobs/view/12345") is False
     assert is_direct_ats_url("https://www.bestjobs.eu/loc-de-munca/123") is False
+    assert (
+        is_direct_ats_url(
+            "https://jobicy.com/jobs/152572-area-pre-sales-engineer-france"
+        )
+        is False
+    )
 
 
 def test_extract_redirect_target() -> None:
@@ -62,3 +68,43 @@ def test_resolve_application_url_undelucram_scraping() -> None:
         )
         assert resolved == "https://careers.capgemini.com/job/DevOps/999"
         assert platform == "Capgemini"
+
+
+def test_scrape_remote_jobs_uses_remoteok_direct_urls() -> None:
+    from job_applier.scrapers.remote_scraper import scrape_remote_jobs
+
+    mock_remoteok_payload = [
+        {"legal": "disclaimer"},
+        {
+            "id": "1137300",
+            "company": "Direct Tech Corp",
+            "position": "Cloud Engineer",
+            "location": "Worldwide",
+            "apply_url": "https://careers.directtech.com/jobs/123",
+            "url": "https://remoteok.com/remote-jobs/1137300",
+            "description": "<p>Direct application on our company careers site.</p>",
+            "tags": ["cloud", "python"],
+        },
+        {
+            "id": "1137301",
+            "company": "Another Corp",
+            "position": "Sales Rep",
+            "location": "Worldwide",
+            "apply_url": "https://careers.another.com/jobs/456",
+            "url": "https://remoteok.com/remote-jobs/1137301",
+            "description": "Sales role",
+            "tags": ["sales"],
+        },
+    ]
+
+    with patch("requests.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = mock_remoteok_payload
+        mock_get.return_value = mock_resp
+
+        df = scrape_remote_jobs(search_term="Cloud", count=5, emea_only=False)
+        assert len(df) == 1
+        assert df.iloc[0]["company"] == "Direct Tech Corp"
+        assert df.iloc[0]["site"] == "remoteok_remote"
+        assert df.iloc[0]["job_url"] == "https://careers.directtech.com/jobs/123"

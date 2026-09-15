@@ -3,6 +3,7 @@ import {
   type ElementRef,
   type OnDestroy,
   type OnInit,
+  HostListener,
   ViewChild,
   computed,
   inject,
@@ -11,14 +12,20 @@ import {
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { DomSanitizer, type SafeResourceUrl } from '@angular/platform-browser';
-import { type Observable, forkJoin, of } from 'rxjs';
+import { firstValueFrom, type Observable, forkJoin, of } from 'rxjs';
 import { catchError, tap } from 'rxjs/operators';
 import { IconComponent } from './components/icon.component';
 import { ApiService, resolveFileUrl } from './services/api.service';
 import {
+  type AppFilterCounts,
   type ApplicationDetail,
   type ApplicationItem,
+  type MainResume,
+  type MainResumeResponse,
   type AuthStatusReport,
+  type AutomationEvent,
+  type AutomationFunnel,
+  type AutomationJobStatus,
   type AutomationStatus,
   type CandidateProfile,
   type ClassifiedError,
@@ -26,13 +33,24 @@ import {
   type ResourceKey,
   type ResourceState,
   type ResourceStateStatus,
+  type TakeoverStatus,
   type ToastNotification,
   type TrackerRecord,
   type TrackerStats,
   classifyHttpError,
 } from './models/types';
+import { NotificationService } from './services/notification.service';
+import {
+  VncClientService,
+  type RfbConnectionEvent,
+  type RfbLike,
+} from './services/vnc-client.service';
 
 const RETRY_BACKOFF_STEPS = [5, 15, 30];
+const VNC_RETRY_DELAYS_MS = [1000, 2000, 5000];
+const XK_PAGE_UP = 0xff55;
+const XK_PAGE_DOWN = 0xff56;
+const XK_RETURN = 0xff0d;
 
 @Component({
   selector: 'app-root',
@@ -43,22 +61,148 @@ const RETRY_BACKOFF_STEPS = [5, 15, 30];
 })
 export class App implements OnInit, OnDestroy {
   api = inject(ApiService);
+  notifService = inject(NotificationService);
+  private vncClient = inject(VncClientService);
   private sanitizer = inject(DomSanitizer);
 
   @ViewChild('consoleContainer') consoleContainer?: ElementRef<HTMLDivElement>;
+  @ViewChild('moreActionsButton') moreActionsButton?: ElementRef<HTMLButtonElement>;
+
+  private vncDialog?: ElementRef<HTMLDivElement>;
+  @ViewChild('vncDialog')
+  set vncDialogRef(ref: ElementRef<HTMLDivElement> | undefined) {
+    this.vncDialog = ref;
+    if (ref && this.vncModalOpen()) {
+      queueMicrotask(() => ref.nativeElement.focus({ preventScroll: true }));
+    }
+  }
+
+  @ViewChild('vncTarget')
+  set vncTargetRef(ref: ElementRef<HTMLDivElement> | undefined) {
+    this.vncTarget = ref;
+    if (ref && this.vncModalOpen()) {
+      queueMicrotask(() => this.connectRfb());
+    }
+  }
 
   // Tabs
-  activeTab = signal<'queue' | 'tracker' | 'scraper' | 'console' | 'profile'>('queue');
+  activeTab = signal<
+    'applications' | 'metrics' | 'scraper' | 'console' | 'profile' | 'queue' | 'tracker'
+  >('applications');
 
   // Core Data Signals
   stats = signal<TrackerStats | null>(null);
+  automationFunnel = signal<AutomationFunnel | null>(null);
   applications = signal<ApplicationItem[]>([]);
+  appFilter = signal<'all' | 'queued' | 'action_required' | 'pending' | 'applied' | 'skipped'>(
+    'all',
+  );
+  appFilterCounts = signal<AppFilterCounts>({
+    all: 0,
+    queued: 0,
+    action_required: 0,
+    pending: 0,
+    applied: 0,
+    skipped: 0,
+    failed: 0,
+  });
+
+  // Unified Applications Multi-Selection
+  selectedAppIds = signal<Set<string>>(new Set());
+  selectedAppCount = computed(() => this.selectedAppIds().size);
+  isAllAppsSelected = computed(() => {
+    const apps = this.applications();
+    if (apps.length === 0) return false;
+    const selected = this.selectedAppIds();
+    return apps.every((a) => selected.has(a.id));
+  });
   selectedApp = signal<ApplicationDetail | null>(null);
   trackerRecords = signal<TrackerRecord[]>([]);
   pipelineStatus = signal<PipelineStatus | null>(null);
   automationStatus = signal<AutomationStatus | null>(null);
   profile = signal<CandidateProfile | null>(null);
   authStatus = signal<AuthStatusReport | null>(null);
+
+  // Takeover & noVNC Viewer State
+  vncModalOpen = signal(false);
+  activeTakeoverJobId = signal<string | null>(null);
+  takeoverStatus = signal<TakeoverStatus | null>(null);
+  takeoverCountdown = signal(300);
+  isClaimingTakeover = signal(false);
+  isReleasingTakeover = signal(false);
+  isResumingTakeover = signal(false);
+  isReopeningAuth = signal(false);
+  vncMode = signal<'pan' | 'fit'>('pan');
+  vncModeManuallySelected = signal(false);
+  vncConnection = signal<
+    'idle' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected' | 'error'
+  >('idle');
+  vncError = signal<string | null>(null);
+  vncRetryCount = signal(0);
+  vncInputText = signal('');
+  private vncTarget?: ElementRef<HTMLDivElement>;
+  private rfb?: RfbLike;
+  private vncRetryTimerId: ReturnType<typeof setTimeout> | null = null;
+  private vncIntentionalDisconnect = false;
+  private vncSecurityFailure = false;
+  private vncCredentials: { password: string } | null = null;
+  private vncCredentialsRequest: Promise<{ password: string }> | null = null;
+  private vncConnecting = false;
+  private takeoverInputRevoked = false;
+  private takeoverEpoch = 0;
+  private takeoverStatusRequest = 0;
+  private takeoverTimerId: ReturnType<typeof setInterval> | null = null;
+
+  // Queue & Automation Runtime Controls
+  isPausingAutomation = signal(false);
+  isResumingAutomation = signal(false);
+  isStoppingAutomation = signal(false);
+  isClearingAutomationState = signal(false);
+
+  // Responsive overflow menu
+  moreActionsOpen = signal(false);
+
+  // Per-application durable automation history. Event messages are sanitized by the API;
+  // the UI renders only plain text fields and never interprets event details as HTML.
+  automationHistoryOpen = signal<Record<string, boolean>>({});
+  automationHistory = signal<
+    Record<
+      string,
+      {
+        jobs: AutomationJobStatus[];
+        events: AutomationEvent[];
+        nextAfter: number;
+        hasMore: boolean;
+        loading: boolean;
+        error: string | null;
+      }
+    >
+  >({});
+
+  // Main resume viewer
+  resumeModalOpen = signal(false);
+  mainResume = signal<MainResume | null>(null);
+  resumeViewStatus = signal<'idle' | 'loading' | 'stale' | 'generating' | 'ready' | 'error'>(
+    'idle',
+  );
+  resumeArtifactUrl = signal<string | null>(null);
+  resumeArtifactDownloadUrl = signal<string | null>(null);
+  resumeViewerMode = signal<'structured' | 'preview'>('structured');
+  resumeViewError = signal<string | null>(null);
+  private resumePollTimerId: ReturnType<typeof setInterval> | null = null;
+  private resumePollAttempts = 0;
+
+  // Notifications Drawer & Settings Modal
+  notificationsDrawerOpen = signal(false);
+  notifSettingsModalOpen = signal(false);
+
+  // Exception Resolution Modal
+  resolveModalOpen = signal(false);
+  resolveJobId = signal('');
+  resolveQuestionKey = signal('');
+  resolveAnswerValue = signal('');
+  resolveApprovedScope = signal<string>('global');
+  isResolvingJob = signal(false);
 
   // Per-Resource State Tracking
   resourceStates = signal<Record<ResourceKey, ResourceState>>({
@@ -97,6 +241,16 @@ export class App implements OnInit, OnDestroy {
   sortAsc = signal(false);
   verificationCode = signal('');
 
+  // Tracker Multi-Selection
+  selectedTrackerUrls = signal<Set<string>>(new Set());
+  selectedTrackerCount = computed(() => this.selectedTrackerUrls().size);
+  isAllTrackerSelected = computed(() => {
+    const records = this.filteredTrackerRecords();
+    if (records.length === 0) return false;
+    const selected = this.selectedTrackerUrls();
+    return records.every((r) => r.job_url && selected.has(r.job_url));
+  });
+
   // Scraper Form
   scraperTerms = signal(
     'Software Engineer, Solutions Architect, DevOps Engineer, Cloud Architect, Python Dev',
@@ -130,6 +284,8 @@ export class App implements OnInit, OnDestroy {
 
   // Activity spinners
   isLoading = signal(false);
+  isFunnelLoading = signal(false);
+  funnelError = signal<string | null>(null);
   isBatchRunning = signal(false);
   isApplying = signal<Record<string, boolean>>({});
   isPruning = signal(false);
@@ -223,19 +379,29 @@ export class App implements OnInit, OnDestroy {
   });
 
   ngOnInit() {
+    this.notifService.connectEventStream((msg, type) => this.showToast(msg, type));
     this.loadInitialData();
+    this.refreshTakeoverStatus();
     // Periodic background poll
     this.pollIntervalId = setInterval(() => {
       this.refreshPoll();
+      if (this.vncModalOpen()) this.refreshTakeoverStatus();
     }, 2000);
   }
 
   ngOnDestroy() {
+    this.notifService.disconnectEventStream();
     if (this.pollIntervalId) {
       clearInterval(this.pollIntervalId);
       this.pollIntervalId = null;
     }
     this.stopCountdownTimer();
+    if (this.takeoverTimerId) {
+      clearInterval(this.takeoverTimerId);
+      this.takeoverTimerId = null;
+    }
+    this.stopResumePolling();
+    this.disconnectRfb();
   }
 
   setResourceStatus(
@@ -305,6 +471,7 @@ export class App implements OnInit, OnDestroy {
     const observables = [
       this.fetchStats(),
       this.fetchApplications(),
+      ...(typeof this.api.getAutomationFunnel === 'function' ? [this.fetchAutomationFunnel()] : []),
       this.fetchTracker(),
       this.fetchProfile(),
       this.fetchAuthStatus(),
@@ -343,6 +510,7 @@ export class App implements OnInit, OnDestroy {
     if (states.auth.error) tasks.push(this.fetchAuthStatus());
     if (states.pipeline.error) tasks.push(this.fetchPipelineStatus());
     if (states.automation.error) tasks.push(this.fetchAutomationStatus());
+    if (this.funnelError()) tasks.push(this.fetchAutomationFunnel());
 
     if (tasks.length === 0) {
       // If none specifically marked error, refresh all core
@@ -352,6 +520,9 @@ export class App implements OnInit, OnDestroy {
         this.fetchTracker(),
         this.fetchProfile(),
         this.fetchAuthStatus(),
+        ...(typeof this.api.getAutomationFunnel === 'function'
+          ? [this.fetchAutomationFunnel()]
+          : []),
       );
     }
 
@@ -400,11 +571,36 @@ export class App implements OnInit, OnDestroy {
     this.fetchStats().subscribe();
   }
 
+  fetchAutomationFunnel() {
+    this.isFunnelLoading.set(true);
+    return this.api.getAutomationFunnel().pipe(
+      tap((data) => {
+        this.automationFunnel.set(data);
+        this.funnelError.set(null);
+        this.isFunnelLoading.set(false);
+      }),
+      catchError(() => {
+        this.funnelError.set('Automation metrics are temporarily unavailable.');
+        this.isFunnelLoading.set(false);
+        return of(null);
+      }),
+    );
+  }
+
+  loadAutomationFunnel() {
+    if (typeof this.api.getAutomationFunnel === 'function') {
+      this.fetchAutomationFunnel().subscribe();
+    }
+  }
+
   fetchApplications() {
     this.setResourceStatus('applications', 'loading');
-    return this.api.getApplications(this.searchQuery()).pipe(
+    return this.api.getApplications(this.searchQuery(), 100, 0, undefined, this.appFilter()).pipe(
       tap((data) => {
         this.applications.set(data.items || []);
+        if (data.counts) {
+          this.appFilterCounts.set(data.counts);
+        }
         this.setResourceStatus('applications', 'ready', null, true);
       }),
       catchError((err) => {
@@ -420,6 +616,244 @@ export class App implements OnInit, OnDestroy {
 
   loadApplications() {
     this.fetchApplications().subscribe();
+  }
+
+  setAppFilter(filter: 'all' | 'queued' | 'action_required' | 'pending' | 'applied' | 'skipped') {
+    this.appFilter.set(filter);
+    this.selectedAppIds.set(new Set());
+    this.loadApplications();
+  }
+
+  toggleSelectAllApps() {
+    if (this.isAllAppsSelected()) {
+      this.selectedAppIds.set(new Set());
+    } else {
+      this.selectedAppIds.set(new Set(this.applications().map((a) => a.id)));
+    }
+  }
+
+  toggleAppSelection(appId: string, event?: Event) {
+    if (event) {
+      event.stopPropagation();
+    }
+    this.selectedAppIds.update((current) => {
+      const next = new Set(current);
+      if (next.has(appId)) {
+        next.delete(appId);
+      } else {
+        next.add(appId);
+      }
+      return next;
+    });
+  }
+
+  isAppSelected(appId: string): boolean {
+    return this.selectedAppIds().has(appId);
+  }
+
+  queueSelectedApps() {
+    const ids = Array.from(this.selectedAppIds());
+    if (ids.length === 0) return;
+    this.api.batchApply(ids.length, 'assisted', ids).subscribe({
+      next: () => {
+        this.showToast(`Enqueued ${ids.length} selected applications!`, 'success');
+        this.selectedAppIds.set(new Set());
+        this.loadApplications();
+        this.loadStats();
+      },
+      error: (err) => {
+        this.showToast(err?.message || 'Failed to enqueue selected applications.', 'error');
+      },
+    });
+  }
+
+  queueAllPending() {
+    this.api.batchRequeue({ requeue_all: true, status_filter: 'pending' }).subscribe({
+      next: (res) => {
+        const count = (res as { count?: number })?.count ?? res?.['requeued_count'] ?? 'all';
+        this.showToast(`Enqueued ${count} pending applications!`, 'success');
+        this.loadApplications();
+        this.loadStats();
+      },
+      error: (err) => {
+        this.showToast(err?.message || 'Failed to enqueue pending applications.', 'error');
+      },
+    });
+  }
+
+  exportCsv() {
+    const url = this.api.getTrackerExportCsvUrl();
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', 'applications_tracker.csv');
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+
+  isAppCancellable(app: ApplicationItem): boolean {
+    return (
+      Boolean(app.job_id) &&
+      ['ready', 'claimed', 'navigating', 'filling', 'validating', 'retry_wait'].includes(
+        (app.job_state || app.automation_state || '').toLowerCase(),
+      )
+    );
+  }
+
+  toggleQueueApp(app: ApplicationItem, event?: Event) {
+    if (event) event.stopPropagation();
+    const isQueued = this.isAppCancellable(app);
+
+    if (isQueued && app.job_id) {
+      this.api.cancelJob(app.job_id).subscribe({
+        next: () => {
+          this.showToast(`Cancelled queue job for ${app.company}.`, 'info');
+          this.loadApplications();
+          this.loadStats();
+        },
+        error: (err) => this.showToast(err?.message || 'Failed to cancel job', 'error'),
+      });
+    } else {
+      this.api.batchApply(1, 'assisted', [app.id]).subscribe({
+        next: () => {
+          this.showToast(`Enqueued ${app.company} to automation queue!`, 'success');
+          this.loadApplications();
+          this.loadStats();
+        },
+        error: (err) => this.showToast(err?.message || 'Failed to enqueue application', 'error'),
+      });
+    }
+  }
+
+  openTakeoverForJob(jobId?: string | null, event?: Event) {
+    if (event) event.stopPropagation();
+    this.activeTakeoverJobId.set(jobId || null);
+    this.openTakeoverModal();
+  }
+
+  appQueueStatusLabel(app: ApplicationItem): string {
+    const state = (app.job_state || app.automation_state || '').toLowerCase();
+    if (!state || state === 'none') return 'Not Queued';
+    if (state === 'ready') return 'Ready in Queue';
+    if (['claimed', 'navigating', 'filling', 'validating', 'submit_intent'].includes(state))
+      return 'Running';
+    if (['auth_required', 'mfa_required', 'captcha_required'].includes(state))
+      return 'Login Required';
+    if (state === 'manual_takeover') return 'Takeover Active';
+    if (state === 'retry_wait') return 'Retrying';
+    if (state === 'completed') return 'Completed';
+    if (state === 'skipped') return 'Skipped';
+    return state.replace(/_/g, ' ');
+  }
+
+  appQueueStatusClass(app: ApplicationItem): string {
+    const state = (app.job_state || app.automation_state || '').toLowerCase();
+    if (!state || state === 'none') return 'bg-slate-900 text-slate-500 border-slate-800';
+    if (state === 'ready') return 'bg-teal-950/60 text-teal-300 border-teal-800/80';
+    if (['claimed', 'navigating', 'filling', 'validating', 'submit_intent'].includes(state))
+      return 'bg-blue-950/60 text-blue-300 border-blue-800/80 animate-pulse';
+    if (['auth_required', 'mfa_required', 'captcha_required', 'manual_takeover'].includes(state))
+      return 'bg-amber-950/60 text-amber-300 border-amber-800/80 font-bold';
+    if (state === 'retry_wait') return 'bg-indigo-950/60 text-indigo-300 border-indigo-800/80';
+    if (state === 'completed') return 'bg-emerald-950/60 text-emerald-300 border-emerald-800/80';
+    return 'bg-slate-900 text-slate-400 border-slate-800';
+  }
+
+  appStatusClass(status?: string): string {
+    const st = (status || 'pending').toLowerCase();
+    if (st === 'applied') return 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30';
+    if (st === 'auto_filled') return 'bg-blue-500/15 text-blue-400 border-blue-500/30';
+    if (st === 'failed' || st === 'validation_failed')
+      return 'bg-rose-500/15 text-rose-400 border-rose-500/30';
+    if (st === 'skipped' || st === 'dismissed')
+      return 'bg-slate-800 text-slate-400 border-slate-700';
+    return 'bg-amber-500/15 text-amber-400 border-amber-500/30';
+  }
+
+  automationStateLabel(app: ApplicationItem): string {
+    const state = app.automation_state || app.status;
+    if (!state) return 'Not queued';
+    return state.replace(/_/g, ' ');
+  }
+
+  automationStepLabel(app: ApplicationItem): string {
+    const history = this.automationHistory()[app.id];
+    const latest = history?.jobs?.[0];
+    const step = latest?.step || latest?.state || app.automation_state;
+    return step ? step.replace(/_/g, ' ') : 'Awaiting attempt';
+  }
+
+  isAutomationHistoryOpen(appId: string): boolean {
+    return Boolean(this.automationHistoryOpen()[appId]);
+  }
+
+  toggleAutomationHistory(app: ApplicationItem) {
+    const open = this.isAutomationHistoryOpen(app.id);
+    this.automationHistoryOpen.update((state) => ({ ...state, [app.id]: !open }));
+    if (!open && !this.automationHistory()[app.id]) {
+      this.loadAutomationHistory(app);
+    }
+  }
+
+  loadMoreAutomationEvents(app: ApplicationItem) {
+    const current = this.automationHistory()[app.id];
+    if (!current || current.loading || !current.hasMore) return;
+    this.api.getApplicationAutomationEvents(app.id, app.job_id, current.nextAfter, 50).subscribe({
+      next: (response) => {
+        this.automationHistory.update((state) => ({
+          ...state,
+          [app.id]: {
+            ...current,
+            events: [...current.events, ...(response.events || [])],
+            nextAfter: response.next_after,
+            hasMore: response.has_more,
+            loading: false,
+          },
+        }));
+      },
+      error: () => {
+        this.automationHistory.update((state) => ({
+          ...state,
+          [app.id]: { ...current, loading: false, error: 'Unable to load more history.' },
+        }));
+      },
+    });
+  }
+
+  private loadAutomationHistory(app: ApplicationItem) {
+    const empty = {
+      jobs: [] as AutomationJobStatus[],
+      events: [] as AutomationEvent[],
+      nextAfter: 0,
+      hasMore: false,
+      loading: true,
+      error: null as string | null,
+    };
+    this.automationHistory.update((state) => ({ ...state, [app.id]: empty }));
+    forkJoin({
+      status: this.api.getApplicationAutomationStatus(app.id, app.job_id),
+      events: this.api.getApplicationAutomationEvents(app.id, app.job_id, 0, 50),
+    }).subscribe({
+      next: (response) => {
+        this.automationHistory.update((state) => ({
+          ...state,
+          [app.id]: {
+            jobs: response.status.jobs || [],
+            events: response.events.events || [],
+            nextAfter: response.events.next_after,
+            hasMore: response.events.has_more,
+            loading: false,
+            error: null,
+          },
+        }));
+      },
+      error: () => {
+        this.automationHistory.update((state) => ({
+          ...state,
+          [app.id]: { ...empty, loading: false, error: 'Automation history is unavailable.' },
+        }));
+      },
+    });
   }
 
   fetchTracker() {
@@ -496,11 +930,45 @@ export class App implements OnInit, OnDestroy {
     );
   }
 
+  isAuthenticationWaiting(): boolean {
+    return this.automationStatus()?.step === 'auth_required';
+  }
+
+  automationBannerTitle(): string {
+    if (this.notifService.isStopped()) return 'Automation Stopped (Emergency Stop)';
+    if (this.isAuthenticationWaiting()) return 'Waiting for Authentication';
+    return 'Automation Paused';
+  }
+
+  automationBannerMessage(): string {
+    if (this.notifService.isStopped()) {
+      return 'Emergency stop engaged. Worker operations halted.';
+    }
+    if (this.isAuthenticationWaiting()) {
+      if (this.automationStatus()?.browser_is_closed || !this.automationStatus()?.browser_active) {
+        return 'Authentication is required, but the previous browser closed. Open Browser View and choose Reopen Authentication.';
+      }
+      return 'Authentication required. Open Browser View and log in; automation remains paused.';
+    }
+    return 'Automation is paused awaiting operator intervention or safe resume.';
+  }
+
   fetchAutomationStatus() {
     this.setResourceStatus('automation', 'loading');
     return this.api.getAutomationStatus().pipe(
       tap((data) => {
         this.automationStatus.set(data);
+        if (data) {
+          if (typeof data.is_paused === 'boolean') {
+            this.notifService.isPaused.set(data.is_paused);
+          }
+          if (typeof data.is_stopped === 'boolean') {
+            this.notifService.isStopped.set(data.is_stopped);
+          }
+          if (data.active_job) {
+            this.notifService.activeJob.set(data.active_job);
+          }
+        }
         this.setResourceStatus('automation', 'ready', null, true);
       }),
       catchError((err) => {
@@ -738,10 +1206,134 @@ export class App implements OnInit, OnDestroy {
     });
   }
 
+  isTrackerSelected(url: string): boolean {
+    return this.selectedTrackerUrls().has(url);
+  }
+
+  toggleTrackerSelection(url: string, event: Event) {
+    const checked = (event.target as HTMLInputElement).checked;
+    this.selectedTrackerUrls.update((current) => {
+      const next = new Set(current);
+      if (checked) {
+        next.add(url);
+      } else {
+        next.delete(url);
+      }
+      return next;
+    });
+  }
+
+  toggleSelectAllTracker() {
+    const records = this.filteredTrackerRecords();
+    if (this.isAllTrackerSelected()) {
+      this.selectedTrackerUrls.update((current) => {
+        const next = new Set(current);
+        for (const r of records) {
+          if (r.job_url) {
+            next.delete(r.job_url);
+          }
+        }
+        return next;
+      });
+    } else {
+      this.selectedTrackerUrls.update((current) => {
+        const next = new Set(current);
+        for (const r of records) {
+          if (r.job_url) {
+            next.add(r.job_url);
+          }
+        }
+        return next;
+      });
+    }
+  }
+
+  sendSelectedToQueue() {
+    const selectedUrls = Array.from(this.selectedTrackerUrls());
+    if (selectedUrls.length === 0) return;
+
+    const records = this.trackerRecords().filter(
+      (r) => r.job_url && selectedUrls.includes(r.job_url),
+    );
+    const items = records.map((r) => ({
+      job_url: r.job_url,
+      folder_name: r.folder_name || '',
+    }));
+
+    this.api.batchRequeue({ items }).subscribe({
+      next: (res: any) => {
+        const count = res.count ?? items.length;
+        this.showToast(`Enqueued ${count} applications to the queue!`, 'success');
+        this.selectedTrackerUrls.set(new Set());
+        this.loadApplications();
+        this.loadTracker();
+        this.loadStats();
+      },
+      error: (err) => {
+        this.showToast(
+          `Failed to enqueue applications: ${err?.error?.detail || err.message || err}`,
+          'error',
+        );
+      },
+    });
+  }
+
+  sendAllToQueue() {
+    const records = this.filteredTrackerRecords();
+    if (records.length === 0) return;
+
+    const count = records.length;
+    const filterDesc = this.trackerFilter()
+      ? `with status "${this.trackerFilter()}"`
+      : 'currently displayed';
+    if (
+      !confirm(
+        `Are you sure you want to send all ${count} applications (${filterDesc}) to the automation queue?`,
+      )
+    ) {
+      return;
+    }
+
+    const items = records.map((r) => ({
+      job_url: r.job_url,
+      folder_name: r.folder_name || '',
+    }));
+
+    this.api
+      .batchRequeue({
+        items,
+        requeue_all: false,
+        status_filter: this.trackerFilter() || undefined,
+      })
+      .subscribe({
+        next: (res: any) => {
+          const countRes = res.count ?? count;
+          this.showToast(`Successfully enqueued ${countRes} applications!`, 'success');
+          this.selectedTrackerUrls.set(new Set());
+          this.loadApplications();
+          this.loadTracker();
+          this.loadStats();
+        },
+        error: (err) => {
+          this.showToast(
+            `Failed to enqueue applications: ${err?.error?.detail || err.message || err}`,
+            'error',
+          );
+        },
+      });
+  }
+
   requeueApp(record: TrackerRecord) {
     this.api.requeue(record.job_url, record.folder_name).subscribe({
       next: () => {
         this.showToast('Moved application back to queue!');
+        if (record.job_url) {
+          this.selectedTrackerUrls.update((s) => {
+            const next = new Set(s);
+            next.delete(record.job_url);
+            return next;
+          });
+        }
         this.loadApplications();
         this.loadTracker();
         this.loadStats();
@@ -821,19 +1413,150 @@ export class App implements OnInit, OnDestroy {
   }
 
   submitCode() {
-    const code = this.verificationCode().trim();
+    const code = this.verificationCode()?.trim();
     if (!code) return;
     this.api.submitVerificationCode(code).subscribe({
-      next: () => {
-        this.showToast('Verification code submitted to browser!');
+      next: (res: any) => {
+        this.showToast(res.message || 'Verification code submitted!', 'success');
         this.verificationCode.set('');
+        this.refreshPoll();
       },
-      error: (err) =>
-        this.showToast(classifyHttpError(err).message || 'Failed to submit code', 'error'),
+      error: (err) => {
+        this.showToast(classifyHttpError(err).message || 'Failed to submit code', 'error');
+      },
     });
   }
 
+  @HostListener('document:keydown.escape')
+  onEscapeKey() {
+    if (this.moreActionsOpen()) {
+      this.closeMoreActions(true);
+    }
+  }
+
+  @HostListener('document:click', ['$event'])
+  onDocumentClick(event: MouseEvent) {
+    if (!this.moreActionsOpen()) return;
+    const target = event.target as Element | null;
+    if (!target?.closest('.more-actions')) {
+      this.closeMoreActions(true);
+    }
+  }
+
+  toggleMoreActions() {
+    if (this.moreActionsOpen()) {
+      this.closeMoreActions(true);
+    } else {
+      this.moreActionsOpen.set(true);
+    }
+  }
+
+  closeMoreActions(restoreFocus = false) {
+    this.moreActionsOpen.set(false);
+    if (restoreFocus) {
+      queueMicrotask(() => this.moreActionsButton?.nativeElement.focus());
+    }
+  }
+
+  openResumeViewer() {
+    this.closeMoreActions();
+    this.resumeViewerMode.set('structured');
+    this.resumeModalOpen.set(true);
+    this.loadMainResume();
+  }
+
+  openPdfPreview() {
+    this.resumeViewerMode.set('preview');
+    if (!this.resumeModalOpen()) {
+      this.closeMoreActions();
+      this.resumeModalOpen.set(true);
+      this.loadMainResume();
+    }
+  }
+
+  setResumeViewerMode(mode: 'structured' | 'preview') {
+    this.resumeViewerMode.set(mode);
+  }
+
+  closeResumeViewer() {
+    this.resumeModalOpen.set(false);
+    this.resumeViewerMode.set('structured');
+    this.stopResumePolling();
+  }
+
+  retryMainResume() {
+    this.loadMainResume();
+  }
+
+  private loadMainResume() {
+    this.stopResumePolling();
+    this.resumeViewStatus.set('loading');
+    this.resumeViewError.set(null);
+    this.api.getMainResume().subscribe({
+      next: (response: MainResumeResponse) => {
+        this.applyMainResumeResponse(response);
+        if (response.status === 'generating' || response.status === 'stale')
+          this.startResumePolling();
+      },
+      error: (err) => {
+        this.resumeViewStatus.set('error');
+        this.resumeViewError.set(classifyHttpError(err).message || 'Unable to load main resume.');
+      },
+    });
+  }
+
+  private applyMainResumeResponse(response: MainResumeResponse) {
+    this.mainResume.set(response.resume);
+    this.resumeArtifactUrl.set(
+      response.artifact_url ? resolveFileUrl(response.artifact_url) : null,
+    );
+    let downloadUrl: string | null = null;
+    if (response.download_url) {
+      downloadUrl = resolveFileUrl(response.download_url);
+    } else if (response.artifact_url) {
+      downloadUrl = `${resolveFileUrl(response.artifact_url)}?download=true`;
+    }
+    this.resumeArtifactDownloadUrl.set(downloadUrl);
+    this.resumeViewStatus.set(response.status);
+    this.resumeViewError.set(response.error);
+  }
+
+  private startResumePolling() {
+    if (this.resumePollTimerId) return;
+    this.resumePollAttempts = 0;
+    this.resumePollTimerId = setInterval(() => {
+      this.resumePollAttempts += 1;
+      if (this.resumePollAttempts > 15) {
+        this.stopResumePolling();
+        this.resumeViewStatus.set('error');
+        this.resumeViewError.set('Resume generation is taking longer than expected. Retry.');
+        return;
+      }
+      this.api.getMainResume().subscribe({
+        next: (response) => {
+          this.applyMainResumeResponse(response);
+          if (response.status !== 'generating' && response.status !== 'stale')
+            this.stopResumePolling();
+        },
+        error: () => {
+          this.stopResumePolling();
+          this.resumeViewStatus.set('error');
+          this.resumeViewError.set('Unable to check resume generation status. Retry.');
+        },
+      });
+    }, 2000);
+  }
+
+  private stopResumePolling() {
+    if (this.resumePollTimerId) {
+      clearInterval(this.resumePollTimerId);
+      this.resumePollTimerId = null;
+    }
+    this.resumePollAttempts = 0;
+  }
+
   openAuthModal() {
+    this.closeMoreActions();
     this.checkAuthStatus();
     this.authModalOpen.set(true);
   }
@@ -911,13 +1634,13 @@ export class App implements OnInit, OnDestroy {
                 'warning',
               );
             } else if (importedApps > 0) {
-              this.activeTab.set('queue');
+              this.activeTab.set('applications');
               this.showToast(
                 `Successfully imported ${importedApps} applications and ${mergedRecords} records!`,
                 'success',
               );
             } else {
-              this.activeTab.set('tracker');
+              this.activeTab.set('applications');
               this.showToast(`Successfully imported ${mergedRecords} tracker records!`, 'success');
             }
           } catch {
@@ -947,6 +1670,622 @@ export class App implements OnInit, OnDestroy {
     this.api.updateProfile(p).subscribe({
       next: () => this.showToast('Candidate profile saved successfully!'),
       error: () => this.showToast('Failed to save profile', 'error'),
+    });
+  }
+
+  // --- Notifications Drawer & Opt-In Controls ---
+
+  openNotificationsDrawer() {
+    this.notificationsDrawerOpen.set(true);
+    this.notifService.fetchNotifications();
+  }
+
+  closeNotificationsDrawer() {
+    this.notificationsDrawerOpen.set(false);
+  }
+
+  openNotifSettingsModal() {
+    this.notifSettingsModalOpen.set(true);
+  }
+
+  closeNotifSettingsModal() {
+    this.notifSettingsModalOpen.set(false);
+  }
+
+  ackNotification(id: number | string) {
+    this.notifService.ackNotification(id);
+    this.showToast('Notification acknowledged', 'info');
+  }
+
+  ackAllNotifications() {
+    this.notifService.ackAll();
+    this.showToast('All notifications acknowledged', 'info');
+  }
+
+  dismissNotification(id: number | string) {
+    this.notifService.dismissNotification(id);
+    this.showToast('Notification dismissed', 'info');
+  }
+
+  clearAllNotifications() {
+    this.notifService.clearAll();
+    this.showToast('All notifications cleared', 'info');
+  }
+
+  // --- Automation Runtime Controls (Pause / Resume / Stop) ---
+
+  runtimeActionEnabled(): boolean {
+    const takeover = this.takeoverStatus();
+    return !takeover?.is_takeover_active || takeover.is_current_owner;
+  }
+
+  pauseAutomation() {
+    if (!this.runtimeActionEnabled()) {
+      this.showToast('Only the current takeover owner may pause automation.', 'warning');
+      return;
+    }
+    this.isPausingAutomation.set(true);
+    this.api.pauseAutomation().subscribe({
+      next: () => {
+        this.notifService.isPaused.set(true);
+        this.showToast('Automation paused. Active browser state preserved.', 'warning');
+        this.isPausingAutomation.set(false);
+        this.refreshPoll();
+      },
+      error: (err) => {
+        this.showToast(classifyHttpError(err).message || 'Failed to pause automation', 'error');
+        this.isPausingAutomation.set(false);
+      },
+    });
+  }
+
+  resumeAutomation() {
+    this.isResumingAutomation.set(true);
+    this.api.resumeAutomation().subscribe({
+      next: (res) => {
+        this.notifService.isPaused.set(false);
+        this.showToast(res.message || 'Automation resumed after safe revalidation!', 'success');
+        this.isResumingAutomation.set(false);
+        this.refreshPoll();
+      },
+      error: (err) => {
+        this.showToast(
+          classifyHttpError(err).message || 'Resume rejected: revalidation checks failed',
+          'error',
+        );
+        this.isResumingAutomation.set(false);
+      },
+    });
+  }
+
+  stopAutomation() {
+    if (!confirm('Engage Emergency Stop? All active worker operations will immediately halt.'))
+      return;
+    this.isStoppingAutomation.set(true);
+    this.api.stopAutomation().subscribe({
+      next: () => {
+        this.notifService.isStopped.set(true);
+        this.notifService.isPaused.set(true);
+        this.showToast('EMERGENCY STOP engaged. All operations halted.', 'error');
+        this.isStoppingAutomation.set(false);
+        this.refreshPoll();
+      },
+      error: (err) => {
+        this.showToast(classifyHttpError(err).message || 'Failed to stop automation', 'error');
+        this.isStoppingAutomation.set(false);
+      },
+    });
+  }
+
+  clearAutomationState() {
+    if (
+      !confirm(
+        'Clear automation state? Recoverable pre-submit jobs return to ready, while submit_intent/verifying jobs remain ambiguous and require explicit outcome resolution. Orphaned browser sessions are closed and emergency stop is cleared.',
+      )
+    )
+      return;
+    this.isClearingAutomationState.set(true);
+    this.api.clearAutomationState().subscribe({
+      next: (res) => {
+        this.notifService.isStopped.set(false);
+        this.notifService.isPaused.set(false);
+        this.showToast(res.message || 'Automation state cleared successfully!', 'success');
+        this.isClearingAutomationState.set(false);
+        this.loadApplications();
+        this.loadTracker();
+        this.loadStats();
+        this.refreshPoll();
+      },
+      error: (err) => {
+        this.showToast(
+          classifyHttpError(err).message || 'Failed to clear automation state',
+          'error',
+        );
+        this.isClearingAutomationState.set(false);
+      },
+    });
+  }
+
+  // --- Queue Job Actions (Skip / Cancel / Resolve) ---
+
+  skipActiveJob(jobId: string) {
+    if (!confirm(`Skip job ${jobId}?`)) return;
+    this.api.skipJob(jobId).subscribe({
+      next: () => {
+        this.showToast(`Job ${jobId} marked as skipped.`);
+        this.refreshPoll();
+        this.loadApplications();
+      },
+      error: (err) => {
+        this.showToast(classifyHttpError(err).message || 'Failed to skip job', 'error');
+      },
+    });
+  }
+
+  cancelActiveJob(jobId: string) {
+    if (!confirm(`Cancel job ${jobId}?`)) return;
+    this.api.cancelJob(jobId).subscribe({
+      next: () => {
+        this.showToast(`Job ${jobId} cancelled.`);
+        this.refreshPoll();
+        this.loadApplications();
+      },
+      error: (err) => {
+        this.showToast(classifyHttpError(err).message || 'Failed to cancel job', 'error');
+      },
+    });
+  }
+
+  openResolveModal(jobId: string, questionKey = '') {
+    this.resolveJobId.set(jobId);
+    this.resolveQuestionKey.set(questionKey);
+    this.resolveAnswerValue.set('');
+    this.resolveApprovedScope.set('global');
+    this.resolveModalOpen.set(true);
+  }
+
+  closeResolveModal() {
+    this.resolveModalOpen.set(false);
+  }
+
+  submitResolution() {
+    const jid = this.resolveJobId();
+    if (!jid) return;
+    this.isResolvingJob.set(true);
+    this.api
+      .resolveJob(
+        jid,
+        'answer',
+        this.resolveAnswerValue(),
+        this.resolveQuestionKey(),
+        this.resolveApprovedScope(),
+      )
+      .subscribe({
+        next: () => {
+          this.showToast(`Job ${jid} resolved with approved answer and requeued!`, 'success');
+          this.closeResolveModal();
+          this.isResolvingJob.set(false);
+          this.refreshPoll();
+        },
+        error: (err) => {
+          this.showToast(classifyHttpError(err).message || 'Failed to resolve job', 'error');
+          this.isResolvingJob.set(false);
+        },
+      });
+  }
+
+  // --- noVNC Viewer & Operator Takeover Controls ---
+
+  vncConnectionLabel(): string {
+    switch (this.vncConnection()) {
+      case 'connecting':
+        return 'Connecting';
+      case 'connected':
+        if (!this.takeoverStatus()?.is_takeover_active) {
+          return 'Read-only until takeover is active';
+        }
+        return this.takeoverStatus()?.is_current_owner
+          ? 'Connected'
+          : 'Read-only: another operator controls the session';
+      case 'reconnecting':
+        return `Reconnecting (attempt ${this.vncRetryCount()}/3)`;
+      case 'disconnected':
+        return 'Disconnected';
+      case 'error':
+        return this.vncError() || 'Connection error';
+      default:
+        return 'Waiting to connect';
+    }
+  }
+
+  takeoverOwnerActionEnabled(): boolean {
+    return (
+      !this.takeoverInputRevoked &&
+      this.takeoverStatus()?.is_takeover_active === true &&
+      this.takeoverStatus()?.is_current_owner === true
+    );
+  }
+
+  vncInputEnabled(): boolean {
+    return this.vncConnection() === 'connected' && this.takeoverOwnerActionEnabled();
+  }
+
+  private websocketUrl(): string {
+    const path = this.api.resolveUrl('/browser/websockify');
+    const base = typeof window === 'undefined' ? 'http://localhost' : window.location.origin;
+    const url = new URL(path, base);
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    return url.toString();
+  }
+
+  private setVncModeProperties() {
+    if (!this.rfb) return;
+    if (this.vncMode() === 'pan') {
+      this.rfb.scaleViewport = false;
+      this.rfb.clipViewport = true;
+      this.rfb.dragViewport = true;
+    } else {
+      this.rfb.dragViewport = false;
+      this.rfb.clipViewport = false;
+      this.rfb.scaleViewport = true;
+    }
+    this.rfb.resizeSession = false;
+    this.rfb.viewOnly = !this.vncInputEnabled();
+  }
+
+  private chooseDefaultVncMode() {
+    if (this.vncModeManuallySelected()) return;
+    const narrow =
+      typeof window !== 'undefined' && window.matchMedia?.('(max-width: 767px)').matches;
+    this.vncMode.set(narrow === false ? 'fit' : 'pan');
+  }
+
+  setVncMode(mode: 'pan' | 'fit') {
+    this.vncModeManuallySelected.set(true);
+    this.vncMode.set(mode);
+    this.setVncModeProperties();
+  }
+
+  private clearVncRetryTimer() {
+    if (this.vncRetryTimerId) {
+      clearTimeout(this.vncRetryTimerId);
+      this.vncRetryTimerId = null;
+    }
+  }
+
+  private scheduleVncReconnect() {
+    if (this.vncIntentionalDisconnect || this.vncSecurityFailure || !this.vncModalOpen()) return;
+    const attempt = this.vncRetryCount();
+    if (attempt >= VNC_RETRY_DELAYS_MS.length) {
+      this.vncConnection.set('error');
+      this.vncError.set('Connection failed after 3 attempts. Retry connection.');
+      return;
+    }
+    this.vncRetryCount.set(attempt + 1);
+    this.vncConnection.set('reconnecting');
+    this.clearVncRetryTimer();
+    this.vncRetryTimerId = setTimeout(() => {
+      this.vncRetryTimerId = null;
+      this.connectRfb();
+    }, VNC_RETRY_DELAYS_MS[attempt]);
+  }
+
+  private onRfbConnect = () => {
+    this.vncConnection.set('connected');
+    this.vncError.set(null);
+    this.vncRetryCount.set(0);
+    this.setVncModeProperties();
+    if (this.vncInputEnabled()) this.rfb?.focus({ preventScroll: true });
+  };
+
+  private onRfbDisconnect = (event: RfbConnectionEvent) => {
+    const clean = event instanceof CustomEvent ? Boolean(event.detail?.clean) : false;
+    this.rfb = undefined;
+    if (this.vncIntentionalDisconnect) return;
+    if (clean) {
+      this.vncConnection.set('disconnected');
+      this.vncError.set('Disconnected. Retry connection when ready.');
+      return;
+    }
+    this.scheduleVncReconnect();
+  };
+
+  private onRfbSecurityFailure = (event: RfbConnectionEvent) => {
+    this.vncSecurityFailure = true;
+    const detail = event instanceof CustomEvent ? event.detail : undefined;
+    this.vncConnection.set('error');
+    this.vncError.set(
+      detail?.reason || 'Authentication or VNC security failure. Reauthenticate, then retry.',
+    );
+    this.setVncModeProperties();
+  };
+
+  private async connectRfb() {
+    if (
+      !this.vncModalOpen() ||
+      !this.vncTarget ||
+      this.rfb ||
+      this.vncRetryTimerId ||
+      this.vncConnecting
+    )
+      return;
+    this.vncConnecting = true;
+    this.vncIntentionalDisconnect = false;
+    this.vncSecurityFailure = false;
+    this.vncConnection.set(this.vncRetryCount() ? 'reconnecting' : 'connecting');
+    this.vncError.set(null);
+    try {
+      if (!this.vncCredentials) {
+        this.vncCredentialsRequest ??= firstValueFrom(this.api.getVncCredentials());
+        const credentials = await this.vncCredentialsRequest;
+        this.vncCredentialsRequest = null;
+        if (!credentials?.password) throw new Error('VNC credentials were unavailable.');
+        if (this.vncIntentionalDisconnect || !this.vncModalOpen() || !this.vncTarget) return;
+        this.vncCredentials = { password: credentials.password };
+      }
+      if (this.vncIntentionalDisconnect || !this.vncModalOpen() || !this.vncTarget) return;
+      this.rfb = this.vncClient.create(
+        this.vncTarget.nativeElement,
+        this.websocketUrl(),
+        this.vncCredentials,
+      );
+      this.rfb.addEventListener('connect', this.onRfbConnect);
+      this.rfb.addEventListener('disconnect', this.onRfbDisconnect);
+      this.rfb.addEventListener('securityfailure', this.onRfbSecurityFailure);
+      this.setVncModeProperties();
+    } catch (error) {
+      this.vncCredentialsRequest = null;
+      this.rfb = undefined;
+      this.vncConnection.set('error');
+      this.vncError.set(error instanceof Error ? error.message : 'Unable to start VNC connection.');
+    } finally {
+      this.vncConnecting = false;
+    }
+  }
+
+  private disconnectRfb() {
+    this.vncIntentionalDisconnect = true;
+    this.clearVncRetryTimer();
+    const client = this.rfb;
+    this.rfb = undefined;
+    if (client) {
+      client.removeEventListener('connect', this.onRfbConnect);
+      client.removeEventListener('disconnect', this.onRfbDisconnect);
+      client.removeEventListener('securityfailure', this.onRfbSecurityFailure);
+      client.disconnect();
+    }
+    this.vncCredentials = null;
+    this.vncCredentialsRequest = null;
+    this.vncConnection.set('idle');
+  }
+
+  retryVncConnection() {
+    if (!this.vncModalOpen() || this.vncConnection() === 'connecting') return;
+    this.disconnectRfb();
+    this.vncIntentionalDisconnect = false;
+    this.vncSecurityFailure = false;
+    this.vncRetryCount.set(0);
+    this.vncConnection.set('connecting');
+    this.connectRfb();
+  }
+
+  sendRemotePage(direction: 'up' | 'down') {
+    if (!this.vncInputEnabled() || !this.rfb) return;
+    this.rfb.sendKey(
+      direction === 'up' ? XK_PAGE_UP : XK_PAGE_DOWN,
+      direction === 'up' ? 'PageUp' : 'PageDown',
+    );
+  }
+
+  pasteTextToRemote() {
+    const text = this.vncInputText();
+    if (!this.vncInputEnabled() || !this.rfb || !text) return;
+    if ([...text].some((character) => (character.codePointAt(0) ?? 0) > 0xff)) {
+      this.showToast(
+        'This text contains Unicode characters that cannot be sent safely through the remote clipboard. The text was kept for editing.',
+        'warning',
+      );
+      return;
+    }
+    this.rfb.clipboardPasteFrom(text);
+    this.vncInputText.set('');
+    this.rfb.focus({ preventScroll: true });
+  }
+
+  private markTakeoverInactive() {
+    this.takeoverInputRevoked = true;
+    const current = this.takeoverStatus();
+    this.takeoverStatus.set({
+      status: 'inactive',
+      is_takeover_active: false,
+      owner: null,
+      expires_at: null,
+      is_current_owner: false,
+      is_paused: current?.is_paused ?? true,
+      is_stopped: current?.is_stopped ?? false,
+      read_only: true,
+    });
+    this.stopTakeoverTimer();
+    this.setVncModeProperties();
+  }
+
+  sendRemoteEnter() {
+    if (!this.vncInputEnabled() || !this.rfb) return;
+    this.rfb.sendKey(XK_RETURN, 'Enter');
+    this.rfb.focus({ preventScroll: true });
+  }
+
+  refreshTakeoverStatus() {
+    const epoch = this.takeoverEpoch;
+    const request = ++this.takeoverStatusRequest;
+    this.api
+      .getTakeoverStatus()
+      .pipe(catchError(() => of(null)))
+      .subscribe({
+        next: (status) => {
+          // Ignore responses from before a claim/release, and older requests
+          // superseded by a newer poll. This prevents stale lease state from
+          // changing input permissions after a newer mutation succeeded.
+          if (epoch !== this.takeoverEpoch || request !== this.takeoverStatusRequest) return;
+          if (!status) {
+            this.markTakeoverInactive();
+            return;
+          }
+          // Once a local release/expiry fence is active, an active response
+          // can only be accepted after a new successful claim. Generation
+          // ordering handles old requests; this guard handles a response that
+          // was already in flight when release completed.
+          if (this.takeoverInputRevoked && status.is_takeover_active) return;
+          this.takeoverInputRevoked = !status.is_takeover_active;
+          this.takeoverStatus.set(status);
+          this.setVncModeProperties();
+          if (status.is_takeover_active) {
+            this.startTakeoverTimer();
+          } else {
+            this.stopTakeoverTimer();
+          }
+        },
+      });
+  }
+
+  private startTakeoverTimer() {
+    if (this.takeoverTimerId) return;
+    this.takeoverTimerId = setInterval(() => {
+      const current = this.takeoverCountdown();
+      if (current <= 1) {
+        this.takeoverEpoch += 1;
+        this.markTakeoverInactive();
+        this.refreshTakeoverStatus();
+      } else {
+        this.takeoverCountdown.set(current - 1);
+      }
+    }, 1000);
+  }
+
+  private stopTakeoverTimer() {
+    if (this.takeoverTimerId) {
+      clearInterval(this.takeoverTimerId);
+      this.takeoverTimerId = null;
+    }
+  }
+
+  openTakeoverModal() {
+    this.chooseDefaultVncMode();
+    this.vncConnection.set('idle');
+    this.vncError.set(null);
+    this.vncRetryCount.set(0);
+    this.vncModalOpen.set(true);
+    if (this.takeoverStatus()?.is_takeover_active && !this.takeoverInputRevoked) {
+      this.refreshTakeoverStatus();
+    } else {
+      this.claimTakeover();
+    }
+  }
+
+  closeTakeoverModal() {
+    this.disconnectRfb();
+    this.vncTarget = undefined;
+    this.vncModeManuallySelected.set(false);
+    this.vncModalOpen.set(false);
+    this.activeTakeoverJobId.set(null);
+  }
+
+  claimTakeover() {
+    const epoch = ++this.takeoverEpoch;
+    this.isClaimingTakeover.set(true);
+    this.api.claimTakeover('operator', 300).subscribe({
+      next: (res) => {
+        if (epoch !== this.takeoverEpoch) return;
+        this.takeoverInputRevoked = false;
+        this.showToast('Exclusive operator takeover claimed! Automation paused.', 'warning');
+        this.isClaimingTakeover.set(false);
+        this.takeoverCountdown.set(res.lease_seconds || 300);
+        this.refreshTakeoverStatus();
+      },
+      error: (err) => {
+        if (epoch !== this.takeoverEpoch) return;
+        this.markTakeoverInactive();
+        this.showToast(classifyHttpError(err).message || 'Failed to claim takeover lease', 'error');
+        this.isClaimingTakeover.set(false);
+      },
+    });
+  }
+
+  releaseTakeover() {
+    if (!this.takeoverOwnerActionEnabled()) return;
+    const epoch = ++this.takeoverEpoch;
+    this.isReleasingTakeover.set(true);
+    this.markTakeoverInactive();
+    this.api.releaseTakeover('operator', false).subscribe({
+      next: () => {
+        if (epoch !== this.takeoverEpoch) return;
+        this.showToast(
+          'Takeover lease released. Automation remains paused awaiting safe resume revalidation.',
+          'info',
+        );
+        this.isReleasingTakeover.set(false);
+        this.stopTakeoverTimer();
+        this.refreshTakeoverStatus();
+      },
+      error: (err) => {
+        if (epoch !== this.takeoverEpoch) return;
+        this.showToast(classifyHttpError(err).message || 'Failed to release takeover', 'error');
+        this.isReleasingTakeover.set(false);
+      },
+    });
+  }
+
+  reopenAuthSession() {
+    if (!this.takeoverOwnerActionEnabled()) return;
+    this.isReopeningAuth.set(true);
+    const jobId =
+      this.activeTakeoverJobId() ||
+      (this.automationStatus()?.active_job as { id?: string } | undefined)?.id;
+    this.api.reopenAuthSession(jobId).subscribe({
+      next: (res) => {
+        this.showToast(
+          res.message || 'Fresh browser session requested. Waiting for authentication challenge.',
+          'info',
+        );
+        this.isReopeningAuth.set(false);
+        this.closeTakeoverModal();
+        this.refreshTakeoverStatus();
+        this.refreshPoll();
+      },
+      error: (err) => {
+        this.showToast(
+          classifyHttpError(err).message || 'Unable to reopen authentication session',
+          'error',
+        );
+        this.isReopeningAuth.set(false);
+      },
+    });
+  }
+
+  resumeFromTakeover() {
+    if (!this.takeoverOwnerActionEnabled()) return;
+    this.isResumingTakeover.set(true);
+    const jobId =
+      this.activeTakeoverJobId() ||
+      (this.automationStatus()?.active_job as { id?: string } | undefined)?.id;
+    this.api.resumeTakeover(jobId).subscribe({
+      next: (res) => {
+        this.showToast(
+          res.message || 'Safe resume revalidation succeeded! Automation unpaused.',
+          'success',
+        );
+        this.isResumingTakeover.set(false);
+        this.closeTakeoverModal();
+        this.refreshTakeoverStatus();
+        this.refreshPoll();
+      },
+      error: (err) => {
+        this.showToast(
+          classifyHttpError(err).message || 'Safe resume rejected: revalidation checks failed',
+          'error',
+        );
+        this.isResumingTakeover.set(false);
+      },
     });
   }
 

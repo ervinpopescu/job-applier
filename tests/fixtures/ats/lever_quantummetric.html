@@ -1,0 +1,15 @@
+<!doctype html>
+<html><body>
+<form id="application-form" class="lever-form">
+  <div data-qa="input-resume"><label>Resume/CV</label><input type="file" name="resume"></div>
+  <label>Full name</label><input data-qa="name-input" name="name" required>
+  <label>Email</label><input data-qa="email-input" name="email" type="email" required>
+  <label>Phone</label><input data-qa="phone-input" name="phone" required>
+  <label>Current location</label><input data-qa="location-input" name="location">
+  <label>Current company</label><input data-qa="org-input" name="org">
+  <li class="application-question custom-question"><div class="application-label"><div class="text">Will you now or in the future require sponsorship?</div></div><ul data-qa="multiple-choice"><li><label><input type="radio" name="sponsorship" value="Yes" required>Yes</label></li><li><label><input type="radio" name="sponsorship" value="No" required>No</label></li></ul></li>
+  <li class="application-question custom-question"><div class="application-label"><div class="text">I consent to identity verification</div></div><ul data-qa="checkboxes"><li><label><input type="checkbox" name="consent" required>I consent</label></li></ul></li>
+  <li class="application-question custom-question"><div class="application-label"><div class="text">LinkedIn URL</div></div><input name="urls[LinkedIn]" required></li>
+  <button type="submit" data-qa="btn-submit">Submit Application</button>
+</form>
+</body></html>

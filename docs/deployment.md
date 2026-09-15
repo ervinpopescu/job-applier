@@ -21,13 +21,21 @@ curl -fsSLO https://raw.githubusercontent.com/ervinpopescu/job-applier/main/comp
 curl -fsSL https://raw.githubusercontent.com/ervinpopescu/job-applier/main/.env.example -o .env
 ```
 
-Edit `.env` and set at least `GOOGLE_API_KEY`. Forks should also change `JOB_APPLIER_IMAGE` to their own GHCR package:
+Edit `.env` and set at least `GOOGLE_API_KEY` and `VNC_PASSWORD`. `VNC_PASSWORD` must be 1–8 ASCII bytes for classic VNC; use a deployment secret/file rather than committing it. Forks should also change `JOB_APPLIER_IMAGE` to their own GHCR package:
 
 ```dotenv
 JOB_APPLIER_IMAGE=ghcr.io/owner/job-applier:latest
 GOOGLE_API_KEY=replace-me
 JOB_APPLIER_BIND_ADDRESS=127.0.0.1
-JOB_APPLIER_PORT=8000
+JOB_APPLIER_PORT=8001
+GATEWAY_PORT=8089
+PUBLIC_ORIGIN=https://jobs.archnet.lol
+CLOUDFLARE_TUNNEL_TOKEN=eyJh...
+CF_ACCESS_AUD=0cf8...
+CF_ACCESS_TEAM_DOMAIN=aged-sunset-0292.cloudflareaccess.com
+CF_ACCESS_ALLOWED_IDENTITIES=ervin.popescu10@gmail.com
+# Required, never commit a real value; Docker secrets are also supported.
+VNC_PASSWORD=replace-with-1-to-8-ascii-bytes
 ```
 
 Start the application:
@@ -38,18 +46,22 @@ docker compose up -d
 docker compose ps
 ```
 
-Open it through an SSH tunnel:
+Open it through an SSH tunnel (for local inspection):
 
 ```bash
-ssh -L 8000:127.0.0.1:8000 user@server
+ssh -L 8089:127.0.0.1:8089 -L 8001:127.0.0.1:8001 user@server
 ```
 
-Then visit <http://127.0.0.1:8000> locally.
+Then visit <http://127.0.0.1:8089> (through gateway) or <http://127.0.0.1:8001> (direct web) locally.
+
+The runtime requires the same `VNC_PASSWORD` as the web service. It validates the classic VNC limit (1–8 ASCII bytes), generates an ephemeral mode-0600 x11vnc password file, and removes it on shutdown. The dashboard obtains credentials only from its Access-protected same-origin endpoint; they are never placed in URLs or logs. For Docker secrets, mount a secret named `VNC_PASSWORD` at `/run/secrets/VNC_PASSWORD` in both services instead of using an environment value.
+
+For an Access-disabled SSH-tunnel viewer through the loopback gateway, set a separate high-entropy `LOCAL_GATEWAY_VIEWER_TOKEN` in the environment shared by Caddy and web. Caddy injects it only for requests whose Host is `localhost` or `127.0.0.1`; web additionally requires the trusted proxy source and local Host before returning the no-store VNC credential response. Direct web access on loopback remains supported without this gateway token.
 
 The first startup creates privacy-safe candidate and resume templates in the persistent data volume. Complete the candidate profile in the dashboard. To replace the master resume JSON while preserving container ownership:
 
 ```bash
-docker compose exec -T app sh -c 'cat > /app/data/master_resume.json' < master_resume.json
+docker compose exec -T web sh -c 'cat > /app/data/master_resume.json' < master_resume.json
 ```
 
 ## Build locally instead of using GHCR
@@ -68,13 +80,18 @@ The Docker build excludes repository `data/`, `output/`, `.env`, and `.browser_p
 
 ## Persistent data and backups
 
-Compose creates three named volumes:
+Compose bind-mounts the canonical host data directories and keeps four named service volumes:
 
-- `job-applier-data` — profile, master resume, SQLite database, and tracker data
-- `job-applier-output` — generated application packages and PDFs
+- `${DATA_DIR}` (default `/home/ervin/prjs/job-applier/data`) — profile, master resume, SQLite database, and tracker data
+- `${OUTPUT_DIR}` (default `/home/ervin/prjs/job-applier/output`) — generated application packages and PDFs
 - `job-applier-browser-profile` — persistent Playwright sessions
+- `job-applier-ntfy-data` — persistent notification cache and user db
+- `caddy-data` — internal reverse proxy state
+- `caddy-config` — internal reverse proxy runtime configuration
 
-Upgrades preserve all three volumes:
+The data and output bind mounts are shared by the web and runtime containers, so recreating containers does not require copying the database or generated packages. Ensure the rootless container UID has read/write access to both host directories.
+
+Upgrades preserve the bind-mounted data/output directories and all named service volumes:
 
 ```bash
 docker compose pull
@@ -84,10 +101,12 @@ docker compose up -d --remove-orphans
 Create an application-level portable backup from the dashboard or with:
 
 ```bash
-curl -f http://127.0.0.1:8000/api/export -o job-applier-backup.zip
+curl -f http://127.0.0.1:8089/api/export -o job-applier-backup.zip
+# or directly from the web container port:
+# curl -f http://127.0.0.1:8001/api/export -o job-applier-backup.zip
 ```
 
-Removing the Compose stack with `docker compose down` preserves data. Adding `--volumes` permanently deletes the volumes and must only be used when intentionally resetting the installation.
+Removing the Compose stack with `docker compose down` preserves the bind-mounted data and output directories. Adding `--volumes` only removes the remaining named service volumes, but deleting or replacing the host bind-mounted directories still destroys application data and must only be done after a verified backup.
 
 ## Browser automation in containers
 
@@ -97,7 +116,21 @@ Chromium receives a 1 GiB shared-memory allocation through Compose. Increase `sh
 
 ## Reverse proxy and authentication
 
-Keep `JOB_APPLIER_BIND_ADDRESS=127.0.0.1` when using Caddy, Nginx, Traefik, Cloudflare Tunnel, or Tailscale. Terminate HTTPS and require authentication at that layer. The application currently does not provide its own multi-user authentication boundary.
+For production zero-trust deployments, see the full guide in [Edge Authentication & Zero-Trust Deployment](edge_auth_deployment.md).
+
+Key architectural points:
+
+- **Canonical Origin**: `https://jobs.archnet.lol/` (with `jobs.aslan.net` and `aslan.archnet.lol/job-applier/` supported as migration/secondary aliases; root path directly targets dashboard and APIs; legacy `/job-applier` route requires full authentication and issues a permanent redirect).
+- **Topology**: `cloudflared` -> internal `gateway` (Caddy :80) -> `web:8000` / `runtime:6080` / `ntfy:80`.
+- **No Public Origin Ports**: No container ports (`8000`, `6080`, `5900`, `80`) are exposed to the public internet (`0.0.0.0`). Only loopback `127.0.0.1` binds are permitted for local inspection.
+- **Edge Access Policy**: Cloudflare Access with exact identity allowlists (`CF_ACCESS_ALLOWED_IDENTITIES`). Cryptographic RS256 JWT validation, bounded JWKS caching, and fail-closed startup verification.
+- **Gateway Viewer Authorization**: Caddy enforces `/api/auth/viewer-gate` subrequest authorization on all noVNC HTTP and WebSocket upgrade traffic.
+- **Viewer Lifetime**: Server-side WebSocket proxy terminates connection at `min(300, token_exp - now)` seconds (strict 5-minute maximum lifetime).
+- **Preserved Volumes**: `job-applier-data`, `job-applier-output`, `job-applier-browser-profile`, `job-applier-ntfy-data`, `caddy-data`, `caddy-config`.
+
+Keep `JOB_APPLIER_BIND_ADDRESS=127.0.0.1` when using Caddy, Nginx, Traefik, Cloudflare Tunnel, or Tailscale. Terminate HTTPS and require authentication at that layer.
+
+For the Hetzner Nginx alias `aslan.archnet.lol/job-applier/`, proxy to the Docker Compose web port `127.0.0.1:8001` (not the separate development port `8000`). Preserve the `/job-applier/` prefix rewrite and forwarded-prefix header so the alias uses the same authenticated web container and database as the canonical origin.
 
 Do not proxy the dashboard publicly without access control. It can expose resumes, contact details, generated documents, and authenticated browser state.
 
@@ -162,7 +195,7 @@ DEPLOY_ENABLED=true
 
 The workflow contains only secret names. It never contains the host, username, port, or deployment path. Do not enable verbose SSH logging because a resolved IP address may not be covered by GitHub's exact-value masking.
 
-The deploy job runs only for pushes to `main`, pulls the immutable `sha-<full commit>` image, restarts the Compose service, and waits for `/api/health` to respond. Protect the `production` Environment with required reviewers if deployments need approval.
+The deploy job runs only for pushes to `main`, pulls the immutable `sha-<full commit>` image, restarts the Compose service, and waits for a loopback health response. The Compose web healthcheck uses `/api/health/internal`; the native systemd deployment check uses `/api/health` on loopback, while the public `/api/health` route remains Access-protected. Protect the `production` Environment with required reviewers if deployments need approval.
 
 ## Publishing from a fork
 

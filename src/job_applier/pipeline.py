@@ -4,17 +4,15 @@ import os
 import shutil
 import time
 
-import pandas as pd
+import pandas as pd  # type: ignore[import-untyped]
 
 from job_applier.automation.autofill_script import (  # type: ignore[import-not-found]
     save_autofill_assets,
 )
-from job_applier.automation.browser_automator import (  # type: ignore[import-not-found]
-    BrowserAutomator,
-)
 from job_applier.automation.candidate_profile import (  # type: ignore[import-not-found]
     load_candidate_profile,
 )
+from job_applier.automation.queue import enqueue_job  # type: ignore[import-not-found]
 from job_applier.config import (  # type: ignore[import-not-found]
     get_platforms_config,
 )
@@ -36,6 +34,7 @@ from job_applier.scrapers.region_config import (  # type: ignore[import-not-foun
 )
 from job_applier.scrapers.url_resolver import resolve_application_url
 from job_applier.tracker import record_application  # type: ignore[import-not-found]
+from job_applier.db import upsert_application  # type: ignore[import-not-found]
 from job_applier.utils import get_project_root, sanitize_name
 
 
@@ -52,6 +51,7 @@ def run_application_pipeline(
     auto_apply: bool = False,
     autonomous: bool = False,
     headless: bool = False,
+    browser: str | None = None,
 ) -> None:
     """
     Core pipeline service that scrapes job listings, predicts active status,
@@ -97,20 +97,6 @@ def run_application_pipeline(
             log_event(
                 f"Notice reading processed jobs: {e}", level="WARN", category="Pipeline"
             )
-
-    automator: BrowserAutomator | None = None
-    if auto_apply:
-        instance = BrowserAutomator(profile=candidate_profile, headless=headless)
-        try:
-            instance.start()
-            automator = instance
-        except Exception as e:
-            log_event(
-                f"Could not start browser automator: {e}. Continuing without browser.",
-                level="WARN",
-                category="Pipeline",
-            )
-            automator = None
 
     existing_urls, existing_roles = get_existing_applications_index(project_root)
 
@@ -253,6 +239,27 @@ def run_application_pipeline(
                 pdf_output = app_dir / f"CV_{company}_{job_title}.pdf"
                 generate_resume(tailored_json, str(pdf_output))
 
+                # Validate artifacts: check that CV PDF exists and is non-empty
+                # Missing artifacts block enqueueing without deleting unmatched files
+                if not pdf_output.exists() or pdf_output.stat().st_size == 0:
+                    log_event(
+                        f"CV PDF artifact missing or empty for {company} - {job_title}. "
+                        "Blocking enqueueing without deleting application folder.",
+                        level="WARN",
+                        category="Pipeline",
+                    )
+                    record_application(
+                        company=company,
+                        title=job_title,
+                        job_url=job_url,
+                        platform=detected_platform,
+                        status="missing_artifacts",
+                        submission_type="pipeline_generated",
+                        cv_path="",
+                        notes="CV PDF generation failed or empty; enqueueing blocked",
+                    )
+                    continue
+
                 # 3. Generate 1-Click Autofill Assets (Bookmarklet and JS)
                 save_autofill_assets(
                     app_dir=app_dir,
@@ -271,6 +278,36 @@ def run_application_pipeline(
                     submission_type="pipeline_generated",
                     cv_path=str(pdf_output),
                 )
+
+                # Persist to relational DB and enqueue into automation queue
+                norm_adapter = detected_platform.lower()
+                if norm_adapter not in {"greenhouse", "lever", "ashby"}:
+                    norm_adapter = "generic"
+
+                try:
+                    upsert_application(
+                        app_id=app_id,
+                        company=company,
+                        title=job_title,
+                        job_url=job_url,
+                        platform=detected_platform,
+                        status="pending",
+                        submission_type="pipeline_generated",
+                        folder_name=app_id,
+                        cv_filename=pdf_output.name,
+                    )
+                    enqueue_job(
+                        app_id=app_id,
+                        adapter=norm_adapter,
+                        priority=5,
+                        verify_artifacts=True,
+                    )
+                except Exception as eq_err:
+                    log_event(
+                        f"Notice: Could not enqueue {app_id} into queue: {eq_err}",
+                        level="WARN",
+                        category="Pipeline",
+                    )
 
                 # Index for runtime deduplication within the same batch
                 norm_u = normalize_job_url(job_url)
@@ -292,43 +329,9 @@ def run_application_pipeline(
                         category="Pipeline",
                     )
 
-                # 4. If --auto-apply is active, immediately run browser automation!
-                if automator is not None:
-                    if autonomous:
-                        status, msg = automator.run_autonomous_apply(
-                            app_dir=app_dir,
-                            job_url=job_url,
-                            company=company,
-                            job_title=job_title,
-                        )
-                    else:
-                        status, msg = automator.run_assisted_apply(
-                            app_dir=app_dir,
-                            job_url=job_url,
-                            company=company,
-                            job_title=job_title,
-                        )
-
-                    if status == "applied":
-                        target_dir = applied_base / app_dir.name
-                        try:
-                            shutil.move(str(app_dir), str(target_dir))
-                            log_event(
-                                f"Successfully applied! Moved to {target_dir.name}",
-                                level="SUCCESS",
-                                category="Pipeline",
-                            )
-                        except Exception as e:
-                            log_event(
-                                f"Could not move {app_dir}: {e}",
-                                level="WARN",
-                                category="Pipeline",
-                            )
-
                 # Avoid hitting rate limits
                 time.sleep(2)
     finally:
-        if automator is not None:
-            automator.close()
+        pass
 
     log_event("Pipeline run completed!", level="SUCCESS", category="Pipeline")

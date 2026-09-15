@@ -1,6 +1,6 @@
 # Web Dashboard Guide
 
-The Job Applier dashboard is a unified, real-time web application built with FastAPI, Tailwind CSS, and Alpine.js. It runs on `http://127.0.0.1:8000`.
+The Job Applier dashboard is a unified, real-time web application built with FastAPI, Angular 21, and Tailwind CSS. It runs on `http://127.0.0.1:8000`.
 
 ## Launching the Dashboard
 
@@ -62,6 +62,15 @@ Dedicated, full-height streaming terminal:
 ### 5. Candidate Profile
 
 Customize your contact info, location, URLs (LinkedIn, GitHub, Portfolio), current employer, and pre-configured screening answers (notice period, work authorization, salary expectations).
+
+### 6. Real-Time Notifications & Operator Takeover
+
+- **Durable Notification Tray:** Real-time stream over Server-Sent Events (`/api/automation/events`) delivering immediate challenge alerts (CAPTCHA, MFA, screening questions) with cross-tab Web Locks deduplication and unread counter badges.
+- **Direct noVNC Viewer:** The takeover modal controls the noVNC client directly through the authenticated `/browser/websockify` transport; it does not embed a legacy viewer page in an iframe. The gateway protects viewer assets and WebSocket upgrades.
+- **Mobile View Modes:** **Readable Pan (1:1)** keeps the remote desktop at native scale and allows touch dragging of the clipped viewport. **Fit Overview** scales the whole desktop into the available panel. `Page Up`, `Page Down`, and text paste send input to the remote browser when control is authorized.
+- **Exclusive Takeover Lease:** Opening takeover claims a 300-second lease and pauses the worker. Only the current authenticated claimant can send mouse, keyboard, scroll, or clipboard input; other viewers remain read-only. Lease expiry, release, worker replacement, runtime shutdown, or emergency stop revokes input safely.
+- **Safe Resume:** Use `POST /api/automation/takeover/resume` after completing a challenge. It revalidates ownership, page URL security, challenge state, and completion state before handing execution back to the worker. Closing the viewer or releasing control does not resume automation.
+- **Connection recovery:** The client obtains VNC credentials without exposing them in URLs or logs, reports authentication/runtime failures, and retries transient disconnects up to three times. Reauthenticate or explicitly retry after a terminal failure.
 
 ---
 

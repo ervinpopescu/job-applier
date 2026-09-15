@@ -83,6 +83,12 @@ def main() -> None:
         action="store_true",
         help="Run browser in headless mode during auto-apply",
     )
+    parser.add_argument(
+        "--browser",
+        choices=["auto", "chrome", "chromium", "firefox"],
+        default=None,
+        help="Browser engine to use during auto-apply (auto, chrome, chromium, firefox)",
+    )
 
     args = parser.parse_args()
 
@@ -114,6 +120,7 @@ def main() -> None:
         auto_apply=args.auto_apply,
         autonomous=args.autonomous,
         headless=args.headless,
+        browser=args.browser,
     )
 
 

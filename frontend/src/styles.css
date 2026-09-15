@@ -1,3 +1,7 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
 :host {
   display: block;
   min-height: 100%;
@@ -5,9 +9,22 @@
 
 .app-shell {
   min-height: 100dvh;
+  min-width: 0;
+  width: 100%;
+}
+
+.topbar-inner {
+  min-width: 0;
+}
+
+.brand {
+  min-width: 0;
+  flex: 1 1 auto;
 }
 
 .primary-nav {
+  flex: 0 1 auto;
+  min-width: 0;
   scrollbar-width: none;
   -webkit-overflow-scrolling: touch;
 }
@@ -19,9 +36,48 @@
 .primary-nav button,
 .header-actions > button,
 .header-actions > a,
-.header-actions > label {
-  min-height: 40px;
+.header-actions > label,
+.more-actions-trigger,
+.more-actions-item {
+  min-height: 44px;
   touch-action: manipulation;
+}
+
+.more-actions-menu {
+  max-width: calc(100vw - 1.5rem);
+}
+
+@media (max-width: 1439px) {
+  .nav-label,
+  .action-label {
+    display: none !important;
+  }
+
+  .primary-nav button {
+    min-width: 2.75rem;
+  }
+}
+
+@media (min-width: 1024px) and (max-width: 1439px) {
+  .topbar-inner {
+    gap: 0.75rem;
+  }
+
+  .primary-nav {
+    flex: 1 1 auto;
+  }
+
+  .primary-nav button {
+    flex: 1 1 0;
+    justify-content: center;
+    padding-inline: 0.625rem;
+  }
+}
+
+@media (min-width: 1440px) {
+  .primary-nav button {
+    white-space: nowrap;
+  }
 }
 
 @media (max-width: 1023px) {
@@ -43,21 +99,28 @@
   }
 
   .action-label,
-  .action-divider {
+  .action-divider,
+  .more-actions-label {
     display: none;
   }
 
   .header-actions > button,
   .header-actions > a,
-  .header-actions > label {
-    width: 40px;
+  .header-actions > label,
+  .more-actions-trigger {
+    width: 44px;
     justify-content: center;
     padding-inline: 0;
   }
 
+  .more-actions-menu {
+    right: 0;
+  }
+
   .primary-nav button {
-    min-height: 42px;
-    padding-inline: 0.625rem;
+    min-height: 44px;
+    min-width: 0;
+    padding-inline: 0.5rem;
   }
 
   .dashboard-main {
