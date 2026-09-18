@@ -53,7 +53,6 @@ def create_vnc_password_file(password: str) -> Path:
             input=f"{password}\n{password}\ny\n",
             text=True,
             env=env,
-            stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,

@@ -1767,6 +1767,7 @@ def test_vnc_password_validation_and_generated_file_cleanup(
 
     def fake_store(cmd, *, env, input, **kwargs):
         assert cmd == ["x11vnc", "-storepasswd"]
+        assert "stdin" not in kwargs
         assert "secret8!" in input
         assert "VNC_PASSWORD" not in env
         stored = Path(env["HOME"]) / ".vnc" / "passwd"
