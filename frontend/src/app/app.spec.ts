@@ -3,7 +3,7 @@ import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { of, Subject, throwError } from 'rxjs';
 import { App } from './app';
 import { ApiService } from './services/api.service';
-import { classifyHttpError } from './models/types';
+import { classifyHttpError, type TakeoverStatus } from './models/types';
 import { VncClientService, type RfbLike } from './services/vnc-client.service';
 
 describe('Error Classification - classifyHttpError', () => {
@@ -121,6 +121,14 @@ describe('App Component - State & Degraded Mode Recovery', () => {
       getTakeoverStatus: vi.fn().mockReturnValue(of({ is_takeover_active: false })),
       getVncCredentials: vi.fn().mockReturnValue(of({ password: 'testpass' })),
       claimTakeover: vi.fn().mockReturnValue(of({ success: true, lease_seconds: 300 })),
+      renewTakeover: vi.fn().mockReturnValue(
+        of({
+          status: 'success',
+          owner: 'operator',
+          expires_at: new Date(Date.now() + 300_000).toISOString(),
+          lease_seconds: 300,
+        }),
+      ),
       releaseTakeover: vi.fn().mockReturnValue(of({ success: true })),
       resumeTakeover: vi.fn().mockReturnValue(of({ success: true, message: 'Resumed' })),
       reopenAuthSession: vi.fn().mockReturnValue(of({ success: true, message: 'Reopened' })),
@@ -885,7 +893,8 @@ describe('App Component - State & Degraded Mode Recovery', () => {
       mockRfb.viewOnly = false;
       mockApi.getTakeoverStatus = vi.fn().mockReturnValue(throwError(() => new Error('offline')));
       app.refreshTakeoverStatus();
-      expect(app.takeoverStatus()?.is_takeover_active).toBe(false);
+      expect(app.takeoverStatus()?.is_takeover_active).toBe(true);
+      expect(app.takeoverStatusUnknown()).toBe(true);
       expect(app.vncInputEnabled()).toBe(false);
       expect(mockRfb.viewOnly).toBe(true);
     });
@@ -904,7 +913,7 @@ describe('App Component - State & Degraded Mode Recovery', () => {
       expect(app.toast().message).toContain('Unicode characters');
     });
 
-    it('automatically claims takeover on modal open and resumes automation', () => {
+    it('requires an explicit claim after inactive status and resumes automation', () => {
       mockApi.claimTakeover = vi
         .fn()
         .mockReturnValue(of({ success: true, lease_seconds: 300, owner: 'operator' }));
@@ -912,19 +921,19 @@ describe('App Component - State & Degraded Mode Recovery', () => {
         .fn()
         .mockReturnValue(of({ success: true, message: 'Revalidation succeeded' }));
 
-      // Case 1: When takeover is not active, opening modal auto-claims takeover
+      // Case 1: Opening the modal verifies status but never blindly reclaims.
       mockApi.getTakeoverStatus = vi.fn().mockReturnValue(
         of({
-          is_takeover_active: true,
-          is_current_owner: true,
-          expires_at: new Date(Date.now() + 300_000).toISOString(),
+          is_takeover_active: false,
+          is_current_owner: false,
+          expires_at: null,
         }),
       );
       app.takeoverStatus.set({ is_takeover_active: false } as any);
       app.openTakeoverModal();
       expect(app.vncModalOpen()).toBe(true);
-      expect(mockApi.claimTakeover).toHaveBeenCalled();
-      expect(app.takeoverCountdown()).toBe(300);
+      expect(mockApi.claimTakeover).not.toHaveBeenCalled();
+      expect(app.takeoverCountdown()).toBe(0);
 
       // Case 2: When takeover is already active, opening modal does not re-claim
       mockApi.claimTakeover = vi.fn();
@@ -951,6 +960,7 @@ describe('App Component - State & Degraded Mode Recovery', () => {
           throwError(() => ({ status: 409, error: { detail: 'Another operator owns takeover' } })),
         );
       app.openTakeoverModal();
+      app.retryTakeoverClaim();
 
       expect(app.vncClaimError()).toContain('Another operator owns takeover');
       expect(app.vncTakeoverHint()).toContain('Try again');
@@ -1059,6 +1069,177 @@ describe('App Component - State & Degraded Mode Recovery', () => {
       expect(buttons.every((button) => button.className.includes('min-h-11'))).toBe(true);
       expect(buttons.some((button) => button.textContent?.includes('Reopen Auth'))).toBe(true);
       expect(dialog.querySelector('button[aria-label="Close viewer"]')).not.toBeNull();
+    });
+
+    it('renews the current owner before expiry and stops after modal close', () => {
+      const renewedExpiry = new Date(Date.now() + 300_000).toISOString();
+      mockApi.getTakeoverStatus = vi.fn().mockReturnValue(
+        of({
+          status: 'success',
+          is_takeover_active: true,
+          is_current_owner: true,
+          owner: 'operator',
+          expires_at: new Date(Date.now() + 300_000).toISOString(),
+          read_only: false,
+        }),
+      );
+      mockApi.renewTakeover = vi.fn().mockReturnValue(
+        of({
+          status: 'success',
+          owner: 'operator',
+          expires_at: renewedExpiry,
+          lease_seconds: 300,
+        }),
+      );
+
+      app.openTakeoverModal();
+      vi.advanceTimersByTime(60_000);
+
+      expect(mockApi.renewTakeover).toHaveBeenCalledWith(300);
+      expect(app.takeoverStatus()?.expires_at).toBe(renewedExpiry);
+      expect(app.takeoverOwnerActionEnabled()).toBe(true);
+
+      app.closeTakeoverModal();
+      vi.advanceTimersByTime(120_000);
+      expect(mockApi.renewTakeover).toHaveBeenCalledTimes(1);
+    });
+
+    it('stops the takeover countdown on modal close and ignores queued ticks', () => {
+      const expiresAt = new Date(Date.now() + 300_000).toISOString();
+      app.vncModalOpen.set(true);
+      app.takeoverStatus.set({
+        status: 'success',
+        is_takeover_active: true,
+        is_current_owner: true,
+        owner: 'operator',
+        expires_at: expiresAt,
+        is_paused: true,
+        is_stopped: false,
+        read_only: false,
+      } satisfies TakeoverStatus);
+      app.takeoverCountdown.set(300);
+      (app as any).startTakeoverTimer();
+      const markInactive = vi.spyOn(app as any, 'markTakeoverInactive');
+
+      app.closeTakeoverModal();
+      const callsAfterClose = markInactive.mock.calls.length;
+      vi.advanceTimersByTime(2_000);
+
+      expect((app as any).takeoverTimerId).toBeNull();
+      expect(markInactive.mock.calls.length).toBe(callsAfterClose);
+    });
+
+    it('ignores a pre-renewal status response after a successful renewal', () => {
+      const delayedStatus = new Subject<any>();
+      const renewal = new Subject<any>();
+      const originalExpiry = new Date(Date.now() + 120_000).toISOString();
+      const renewedExpiry = new Date(Date.now() + 300_000).toISOString();
+      mockApi.getTakeoverStatus = vi.fn().mockReturnValue(delayedStatus);
+      mockApi.renewTakeover = vi.fn().mockReturnValue(renewal);
+      app.vncModalOpen.set(true);
+      app.takeoverStatus.set({
+        status: 'success',
+        is_takeover_active: true,
+        is_current_owner: true,
+        owner: 'operator',
+        expires_at: originalExpiry,
+        is_paused: true,
+        is_stopped: false,
+        read_only: false,
+      } satisfies TakeoverStatus);
+      (app as any).takeoverInputRevoked = false;
+
+      app.refreshTakeoverStatus();
+      (app as any).renewTakeoverLease();
+      renewal.next({
+        status: 'success',
+        owner: 'operator',
+        expires_at: renewedExpiry,
+        lease_seconds: 300,
+      });
+      delayedStatus.next({
+        status: 'success',
+        is_takeover_active: false,
+        is_current_owner: false,
+        owner: null,
+        expires_at: null,
+        read_only: true,
+      });
+
+      expect(app.takeoverStatus()?.expires_at).toBe(renewedExpiry);
+      expect(app.takeoverStatus()?.is_takeover_active).toBe(true);
+      expect(app.takeoverStatus()?.is_current_owner).toBe(true);
+      expect(app.takeoverOwnerActionEnabled()).toBe(true);
+    });
+
+    it('preserves lease context and requires fresh status after renewal failure', () => {
+      const expiresAt = new Date(Date.now() + 300_000).toISOString();
+      mockApi.getTakeoverStatus = vi.fn().mockReturnValue(
+        of({
+          status: 'success',
+          is_takeover_active: true,
+          is_current_owner: true,
+          owner: 'operator',
+          expires_at: expiresAt,
+          read_only: false,
+        }),
+      );
+      mockApi.renewTakeover = vi
+        .fn()
+        .mockReturnValue(throwError(() => ({ status: 401, error: { detail: 'expired' } })));
+
+      app.openTakeoverModal();
+      (app as any).renewTakeoverLease();
+
+      expect(mockApi.renewTakeover).toHaveBeenCalledWith(300);
+      expect(app.takeoverStatusUnknown()).toBe(true);
+      expect(app.takeoverStatus()?.owner).toBe('operator');
+      expect(app.takeoverStatus()?.expires_at).toBe(expiresAt);
+      expect(app.takeoverOwnerActionEnabled()).toBe(false);
+      expect(mockApi.claimTakeover).not.toHaveBeenCalled();
+      expect(app.vncTakeoverHint()).toContain('Access/session verification failed');
+
+      mockApi.getTakeoverStatus = vi.fn().mockReturnValue(
+        of({
+          status: 'success',
+          is_takeover_active: true,
+          is_current_owner: true,
+          owner: 'operator',
+          expires_at: expiresAt,
+          read_only: false,
+        }),
+      );
+      app.retryTakeoverStatus();
+      expect(app.takeoverStatusUnknown()).toBe(false);
+      expect(app.takeoverOwnerActionEnabled()).toBe(true);
+    });
+
+    it('ignores a stale renewal response after the viewer closes', () => {
+      const renewal = new Subject<any>();
+      const expiresAt = new Date(Date.now() + 300_000).toISOString();
+      mockApi.getTakeoverStatus = vi.fn().mockReturnValue(
+        of({
+          status: 'success',
+          is_takeover_active: true,
+          is_current_owner: true,
+          owner: 'operator',
+          expires_at: expiresAt,
+          read_only: false,
+        }),
+      );
+      mockApi.renewTakeover = vi.fn().mockReturnValue(renewal);
+
+      app.openTakeoverModal();
+      vi.advanceTimersByTime(60_000);
+      app.closeTakeoverModal();
+      renewal.next({
+        status: 'success',
+        owner: 'operator',
+        expires_at: new Date(Date.now() + 300_000).toISOString(),
+        lease_seconds: 300,
+      });
+
+      expect(app.takeoverStatus()?.expires_at).toBe(expiresAt);
     });
 
     it('ignores stale takeover status responses across claim and release generations', () => {
@@ -1246,7 +1427,7 @@ describe('App Component - State & Degraded Mode Recovery', () => {
         .mockReturnValue(of({ is_takeover_active: true, is_current_owner: true }));
 
       app.openTakeoverForJob('job-action-needed');
-      expect(mockApi.claimTakeover).toHaveBeenCalled();
+      expect(mockApi.claimTakeover).not.toHaveBeenCalled();
       expect(app.vncModalOpen()).toBe(true);
       expect(app.activeTakeoverJobId()).toBe('job-action-needed');
 

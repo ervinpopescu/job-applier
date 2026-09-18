@@ -156,7 +156,11 @@ export class App implements OnInit, OnDestroy {
   private takeoverInputRevoked = false;
   private takeoverEpoch = 0;
   private takeoverStatusRequest = 0;
+  private takeoverRenewRequest = 0;
   private takeoverTimerId: ReturnType<typeof setInterval> | null = null;
+  private takeoverRenewTimerId: ReturnType<typeof setInterval> | null = null;
+  takeoverStatusUnknown = signal(false);
+  takeoverStatusError = signal<string | null>(null);
 
   // Queue & Automation Runtime Controls
   isPausingAutomation = signal(false);
@@ -405,6 +409,7 @@ export class App implements OnInit, OnDestroy {
       clearInterval(this.takeoverTimerId);
       this.takeoverTimerId = null;
     }
+    this.stopTakeoverRenewal();
     this.stopResumePolling();
     this.detachVncVisualViewport();
     this.disconnectRfb();
@@ -1934,6 +1939,12 @@ export class App implements OnInit, OnDestroy {
   takeoverLeaseLabel(): string {
     const status = this.takeoverStatus();
     if (!status?.is_takeover_active) return 'Control inactive';
+    if (this.takeoverStatusUnknown()) {
+      const remaining = this.takeoverSecondsUntil(status.expires_at);
+      const expiry =
+        remaining === null ? '' : ` · last known expiry ${this.formatTakeoverSeconds(remaining)}`;
+      return `Lease status unavailable${expiry}`;
+    }
     const serverRemaining = this.takeoverSecondsUntil(status.expires_at);
     const remaining =
       serverRemaining ?? (status.is_current_owner ? this.takeoverCountdown() : null);
@@ -1945,6 +1956,11 @@ export class App implements OnInit, OnDestroy {
 
   vncTakeoverHint(): string {
     if (this.isClaimingTakeover()) return 'Claiming operator control…';
+    if (this.takeoverStatusUnknown()) {
+      return (
+        this.takeoverStatusError() || 'Lease verification unavailable. Reverify access and retry.'
+      );
+    }
     if (this.vncClaimError()) return this.vncClaimError() as string;
     const status = this.takeoverStatus();
     if (!status?.is_takeover_active)
@@ -1984,6 +2000,7 @@ export class App implements OnInit, OnDestroy {
 
   takeoverOwnerActionEnabled(): boolean {
     return (
+      !this.takeoverStatusUnknown() &&
       !this.takeoverInputRevoked &&
       this.takeoverStatus()?.is_takeover_active === true &&
       this.takeoverStatus()?.is_current_owner === true
@@ -2192,6 +2209,10 @@ export class App implements OnInit, OnDestroy {
 
   private markTakeoverInactive() {
     this.takeoverInputRevoked = true;
+    this.takeoverStatusUnknown.set(false);
+    this.takeoverStatusError.set(null);
+    this.takeoverStatusRequest += 1;
+    this.stopTakeoverRenewal();
     const current = this.takeoverStatus();
     this.takeoverStatus.set({
       status: 'inactive',
@@ -2216,41 +2237,135 @@ export class App implements OnInit, OnDestroy {
   refreshTakeoverStatus() {
     const epoch = this.takeoverEpoch;
     const request = ++this.takeoverStatusRequest;
-    this.api
-      .getTakeoverStatus()
-      .pipe(catchError(() => of(null)))
-      .subscribe({
-        next: (status) => {
-          // Ignore responses from before a claim/release, and older requests
-          // superseded by a newer poll. This prevents stale lease state from
-          // changing input permissions after a newer mutation succeeded.
-          if (epoch !== this.takeoverEpoch || request !== this.takeoverStatusRequest) return;
-          if (!status) {
-            this.markTakeoverInactive();
-            return;
-          }
-          // Once a local release/expiry fence is active, an active response
-          // can only be accepted after a new successful claim. Generation
-          // ordering handles old requests; this guard handles a response that
-          // was already in flight when release completed.
-          if (this.takeoverInputRevoked && status.is_takeover_active) return;
-          this.takeoverInputRevoked = !status.is_takeover_active;
-          this.takeoverStatus.set(status);
-          this.syncTakeoverCountdown(status);
-          this.setVncModeProperties();
-          if (status.is_takeover_active) {
-            this.startTakeoverTimer();
-          } else {
-            this.takeoverCountdown.set(0);
-            this.stopTakeoverTimer();
-          }
-        },
-      });
+    this.api.getTakeoverStatus().subscribe({
+      next: (status) => {
+        // Ignore responses from before a claim/release/expiry fence, and older
+        // requests superseded by a newer poll.
+        if (epoch !== this.takeoverEpoch || request !== this.takeoverStatusRequest) return;
+        // A locally fenced lease (release, expiry, or claim failure) can only
+        // be restored by a subsequent explicit claim, not by an old response.
+        if (this.takeoverInputRevoked && !this.takeoverStatusUnknown() && status.is_takeover_active)
+          return;
+
+        this.takeoverStatusUnknown.set(false);
+        this.takeoverStatusError.set(null);
+        this.takeoverStatus.set(status);
+        this.syncTakeoverCountdown(status);
+        this.takeoverInputRevoked = !status.is_takeover_active;
+        this.setVncModeProperties();
+        if (status.is_takeover_active) {
+          this.startTakeoverTimer();
+          if (status.is_current_owner) this.startTakeoverRenewal();
+          else this.stopTakeoverRenewal();
+        } else {
+          this.takeoverCountdown.set(0);
+          this.stopTakeoverTimer();
+          this.stopTakeoverRenewal();
+        }
+      },
+      error: (err) => {
+        if (epoch !== this.takeoverEpoch || request !== this.takeoverStatusRequest) return;
+        this.takeoverStatusUnknown.set(true);
+        this.takeoverStatusError.set(this.takeoverVerificationError(err));
+        this.takeoverInputRevoked = true;
+        this.stopTakeoverRenewal();
+        // Keep the last known status, owner, expiry, and countdown. Only input
+        // is fenced until a fresh authenticated status succeeds.
+        this.setVncModeProperties();
+      },
+    });
+  }
+
+  private takeoverVerificationError(err: unknown): string {
+    const classified = classifyHttpError(err);
+    if (classified.category === 'auth') {
+      return 'Access/session verification failed. Reauthenticate, then retry lease verification.';
+    }
+    return 'Lease status temporarily unavailable. Reverify access and retry.';
+  }
+
+  private startTakeoverRenewal() {
+    if (
+      this.takeoverRenewTimerId ||
+      !this.vncModalOpen() ||
+      this.takeoverStatusUnknown() ||
+      this.takeoverInputRevoked ||
+      !this.takeoverStatus()?.is_takeover_active ||
+      !this.takeoverStatus()?.is_current_owner
+    )
+      return;
+    this.takeoverRenewTimerId = setInterval(() => this.renewTakeoverLease(), 60_000);
+  }
+
+  private stopTakeoverRenewal() {
+    if (this.takeoverRenewTimerId) {
+      clearInterval(this.takeoverRenewTimerId);
+      this.takeoverRenewTimerId = null;
+    }
+  }
+
+  private renewTakeoverLease() {
+    if (
+      !this.vncModalOpen() ||
+      this.takeoverStatusUnknown() ||
+      this.takeoverInputRevoked ||
+      !this.takeoverStatus()?.is_takeover_active ||
+      !this.takeoverStatus()?.is_current_owner
+    ) {
+      this.stopTakeoverRenewal();
+      return;
+    }
+    const epoch = this.takeoverEpoch;
+    const request = ++this.takeoverRenewRequest;
+    this.api.renewTakeover(300).subscribe({
+      next: (res) => {
+        if (
+          epoch !== this.takeoverEpoch ||
+          request !== this.takeoverRenewRequest ||
+          !this.vncModalOpen() ||
+          this.takeoverStatusUnknown() ||
+          this.takeoverInputRevoked
+        )
+          return;
+        const current = this.takeoverStatus();
+        if (
+          !current?.is_takeover_active ||
+          !current.is_current_owner ||
+          current.owner !== res.owner
+        )
+          return;
+        // Invalidate every status request that started before this renewal.
+        // Otherwise a delayed pre-renewal response could overwrite the fresh
+        // expiry and revoke the still-valid owner locally.
+        this.takeoverEpoch += 1;
+        this.takeoverStatusRequest += 1;
+        const renewedStatus = { ...current, expires_at: res.expires_at, read_only: false };
+        this.takeoverStatus.set(renewedStatus);
+        this.takeoverStatusError.set(null);
+        this.syncTakeoverCountdown(renewedStatus);
+        this.setVncModeProperties();
+      },
+      error: (err) => {
+        if (epoch !== this.takeoverEpoch || request !== this.takeoverRenewRequest) return;
+        this.takeoverEpoch += 1;
+        this.takeoverInputRevoked = true;
+        this.takeoverStatusUnknown.set(true);
+        this.takeoverStatusError.set(this.takeoverVerificationError(err));
+        this.stopTakeoverRenewal();
+        this.setVncModeProperties();
+        // The regular status poll is the only recovery path; it is status-only
+        // and never claims or reclaims control.
+      },
+    });
   }
 
   private startTakeoverTimer() {
     if (this.takeoverTimerId) return;
     this.takeoverTimerId = setInterval(() => {
+      if (!this.vncModalOpen()) {
+        this.stopTakeoverTimer();
+        return;
+      }
       const status = this.takeoverStatus();
       const serverRemaining = this.takeoverSecondsUntil(status?.expires_at);
       const current = serverRemaining ?? this.takeoverCountdown();
@@ -2308,14 +2423,15 @@ export class App implements OnInit, OnDestroy {
     this.vncRetryCount.set(0);
     this.vncModalOpen.set(true);
     this.attachVncVisualViewport();
-    if (this.takeoverStatus()?.is_takeover_active && !this.takeoverInputRevoked) {
-      this.refreshTakeoverStatus();
-    } else {
-      this.claimTakeover();
-    }
+    // Opening the viewer only verifies the cached lease. An inactive, expired,
+    // or unknown lease always requires an explicit user claim/retry action.
+    this.refreshTakeoverStatus();
   }
 
   closeTakeoverModal() {
+    this.takeoverEpoch += 1;
+    this.stopTakeoverTimer();
+    this.stopTakeoverRenewal();
     this.disconnectRfb();
     this.detachVncVisualViewport();
     this.vncTarget = undefined;
@@ -2341,6 +2457,8 @@ export class App implements OnInit, OnDestroy {
       next: (res) => {
         if (epoch !== this.takeoverEpoch) return;
         this.takeoverInputRevoked = false;
+        this.takeoverStatusUnknown.set(false);
+        this.takeoverStatusError.set(null);
         this.showToast('Exclusive operator takeover claimed! Automation paused.', 'warning');
         this.isClaimingTakeover.set(false);
         this.takeoverCountdown.set(res.lease_seconds || 300);
@@ -2355,6 +2473,11 @@ export class App implements OnInit, OnDestroy {
         this.isClaimingTakeover.set(false);
       },
     });
+  }
+
+  retryTakeoverStatus() {
+    this.takeoverStatusError.set(null);
+    this.refreshTakeoverStatus();
   }
 
   releaseTakeover() {

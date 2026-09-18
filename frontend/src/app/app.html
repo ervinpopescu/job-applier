@@ -3067,7 +3067,18 @@
         >
           <span>{{ vncTakeoverHint() }}</span>
           <button
-            *ngIf="!takeoverStatus()?.is_takeover_active && !isClaimingTakeover()"
+            *ngIf="takeoverStatusUnknown()"
+            (click)="retryTakeoverStatus()"
+            class="min-h-11 px-4 rounded-xl bg-amber-600 text-white font-semibold"
+          >
+            Reverify lease
+          </button>
+          <button
+            *ngIf="
+              !takeoverStatusUnknown() &&
+              !takeoverStatus()?.is_takeover_active &&
+              !isClaimingTakeover()
+            "
             (click)="retryTakeoverClaim()"
             class="min-h-11 px-4 rounded-xl bg-teal-600 text-white font-semibold"
           >
@@ -3089,7 +3100,18 @@
             Retry connection
           </button>
           <button
-            *ngIf="!takeoverStatus()?.is_takeover_active && !isClaimingTakeover()"
+            *ngIf="takeoverStatusUnknown()"
+            (click)="retryTakeoverStatus()"
+            class="min-h-11 px-4 rounded-xl bg-amber-600 text-white font-semibold"
+          >
+            Reverify lease
+          </button>
+          <button
+            *ngIf="
+              !takeoverStatusUnknown() &&
+              !takeoverStatus()?.is_takeover_active &&
+              !isClaimingTakeover()
+            "
             (click)="retryTakeoverClaim()"
             class="min-h-11 px-4 rounded-xl bg-teal-600 text-white font-semibold"
           >

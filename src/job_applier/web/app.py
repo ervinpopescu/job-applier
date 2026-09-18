@@ -1461,6 +1461,18 @@ class TakeoverReleaseRequest(BaseModel):
     force: bool = False
 
 
+class TakeoverRenewRequest(BaseModel):
+    # Kept for local/operator compatibility; Access mode ignores this field and
+    # always derives ownership from the verified request identity.
+    owner: str = "operator"
+    lease_seconds: StrictInt = Field(
+        default=300,
+        ge=1,
+        le=300,
+        description="Takeover lease duration in seconds (1-300).",
+    )
+
+
 @app.get("/api/notifications")
 def get_notifications_endpoint(
     after: str | None = Query(
@@ -1627,6 +1639,25 @@ def claim_takeover_endpoint(
                 "message", "Takeover is currently active by another user."
             ),
         )
+    return result
+
+
+@app.post("/api/automation/takeover/renew")
+def renew_takeover_endpoint(
+    request: Request, body: TakeoverRenewRequest | None = None
+) -> dict[str, Any]:
+    """Renews the still-valid lease held by the verified current viewer."""
+    from job_applier.automation.queue import renew_manual_takeover
+
+    # In Access mode the owner is always derived from request.state by
+    # _takeover_request_owner; no request body can supply an identity.
+    owner = _takeover_request_owner(request, body.owner if body else "operator")
+    result = renew_manual_takeover(
+        owner=owner,
+        lease_seconds=body.lease_seconds if body else 300,
+    )
+    if result.get("status") == "rejected":
+        raise HTTPException(status_code=409, detail=result.get("message"))
     return result
 
 

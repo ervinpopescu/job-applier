@@ -509,6 +509,17 @@ export class ApiService {
     );
   }
 
+  renewTakeover(
+    leaseSeconds = 300,
+  ): Observable<{ status: string; owner: string; expires_at: string; lease_seconds: number }> {
+    return this.http.post<{
+      status: string;
+      owner: string;
+      expires_at: string;
+      lease_seconds: number;
+    }>(this.resolveUrl('/api/automation/takeover/renew'), { lease_seconds: leaseSeconds });
+  }
+
   resumeTakeover(jobId?: string): Observable<{ status: string; action: string; message: string }> {
     let url = '/api/automation/takeover/resume';
     if (jobId) {

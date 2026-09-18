@@ -2521,12 +2521,19 @@ def is_takeover_active(
     Returns (is_active, owner, expires_at).
     """
     init_db(custom_path)
-    now_dt = datetime.now()
     with _QUEUE_LOCK:
         conn = get_connection(custom_path)
         try:
+            # Use SQLite's clock at the read synchronization point. Sampling
+            # Python time before waiting for the queue lock can report an
+            # expired lease as active after writer contention.
             row = conn.execute(
-                "SELECT manual_takeover_owner, manual_takeover_expires_at FROM runtime_control WHERE id = 1;"
+                """
+                SELECT manual_takeover_owner, manual_takeover_expires_at,
+                       datetime('now', 'localtime') AS current_time
+                FROM runtime_control
+                WHERE id = 1;
+                """
             ).fetchone()
             if (
                 not row
@@ -2535,24 +2542,10 @@ def is_takeover_active(
             ):
                 return False, None, None
 
-            try:
-                expires_dt = datetime.strptime(
-                    row["manual_takeover_expires_at"], "%Y-%m-%d %H:%M:%S"
-                )
-            except ValueError:
-                return False, None, None
-
-            if now_dt < expires_dt:
-                return (
-                    True,
-                    row["manual_takeover_owner"],
-                    row["manual_takeover_expires_at"],
-                )
-            return (
-                False,
-                row["manual_takeover_owner"],
-                row["manual_takeover_expires_at"],
-            )
+            expires_at = row["manual_takeover_expires_at"]
+            if expires_at > row["current_time"]:
+                return True, row["manual_takeover_owner"], expires_at
+            return False, row["manual_takeover_owner"], expires_at
         finally:
             conn.close()
 
@@ -2661,6 +2654,107 @@ def claim_manual_takeover(
         "status": "error",
         "message": "Unable to acquire takeover lease.",
     }
+
+
+def renew_manual_takeover(
+    owner: str,
+    lease_seconds: int = TAKEOVER_DEFAULT_LEASE_SECONDS,
+    custom_path: Path | None = None,
+) -> dict[str, Any]:
+    """Renew an existing takeover lease for its exact, still-valid owner.
+
+    Renewal is deliberately not a claim: the guarded update only succeeds when
+    the stored owner matches exactly and the existing lease is strictly in the
+    future.  It changes only the lease timestamp, so pause/stop state is
+    preserved.  Callers must provide the verified owner identity in Access
+    mode; this function never derives or accepts a replacement claimant.
+    """
+    if (
+        isinstance(lease_seconds, bool)
+        or not isinstance(lease_seconds, int)
+        or not TAKEOVER_MIN_LEASE_SECONDS <= lease_seconds <= TAKEOVER_MAX_LEASE_SECONDS
+    ):
+        raise ValueError(
+            f"lease_seconds must be an integer from {TAKEOVER_MIN_LEASE_SECONDS} "
+            f"through {TAKEOVER_MAX_LEASE_SECONDS}"
+        )
+
+    init_db(custom_path)
+
+    with TAKEOVER_TRANSPORT_LOCK:
+        with _QUEUE_LOCK:
+            conn = get_connection(custom_path)
+            try:
+                with conn:
+                    # Evaluate both expiry and the replacement timestamp using
+                    # SQLite's clock inside the serialized transaction. A
+                    # caller waiting on either lock cannot renew after expiry
+                    # using a stale Python timestamp.
+                    lease_modifier = f"+{lease_seconds} seconds"
+                    cursor = conn.execute(
+                        """
+                        UPDATE runtime_control
+                        SET manual_takeover_expires_at = datetime('now', 'localtime', ?),
+                            updated_at = datetime('now', 'localtime')
+                        WHERE id = 1
+                          AND manual_takeover_owner = ?
+                          AND manual_takeover_expires_at IS NOT NULL
+                          AND manual_takeover_expires_at > datetime('now', 'localtime');
+                        """,
+                        (lease_modifier, owner),
+                    )
+                    if cursor.rowcount != 1:
+                        row = conn.execute(
+                            """
+                            SELECT manual_takeover_owner, manual_takeover_expires_at
+                            FROM runtime_control WHERE id = 1;
+                            """
+                        ).fetchone()
+                        reason = "missing"
+                        if row and row["manual_takeover_owner"]:
+                            reason = (
+                                "owner_mismatch"
+                                if row["manual_takeover_owner"] != owner
+                                else "expired"
+                            )
+                        return {
+                            "status": "rejected",
+                            "reason": reason,
+                            "message": "Takeover lease is no longer owned by this viewer or has expired.",
+                        }
+
+                    renewed = conn.execute(
+                        """
+                        SELECT manual_takeover_expires_at
+                        FROM runtime_control
+                        WHERE id = 1;
+                        """
+                    ).fetchone()
+                    expires_str = renewed["manual_takeover_expires_at"]
+                    record_event(
+                        job_id=None,
+                        app_id=None,
+                        event_type="manual_takeover_renewed",
+                        level="INFO",
+                        step="takeover",
+                        message=f"Manual takeover lease renewed by {owner} for {lease_seconds}s.",
+                        details={
+                            "owner": owner,
+                            "lease_seconds": lease_seconds,
+                            "expires_at": expires_str,
+                        },
+                        custom_path=custom_path,
+                        conn=conn,
+                    )
+                    return {
+                        "status": "success",
+                        "owner": owner,
+                        "lease_seconds": lease_seconds,
+                        "expires_at": expires_str,
+                        "message": "Takeover lease renewed.",
+                    }
+            finally:
+                conn.close()
 
 
 def release_manual_takeover(

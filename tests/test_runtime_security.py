@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 from job_applier.automation.adapters import CaptchaDetectedError
 from job_applier.automation.queue import JobState
 from job_applier.automation.queue import claim_next_job
@@ -47,6 +49,7 @@ from job_applier.automation.profile_lock import (
 )
 from job_applier.automation.queue import (
     _QUEUE_LOCK,
+    TAKEOVER_TRANSPORT_LOCK,
     begin_submit_click_fence,
     claim_manual_takeover,
     clear_automation_state,
@@ -57,6 +60,7 @@ from job_applier.automation.queue import (
     get_browser_owner_job,
     is_takeover_active,
     release_manual_takeover,
+    renew_manual_takeover,
     record_submit_intent,
     requeue_auth_required_job,
     set_runtime_browser_state,
@@ -257,6 +261,142 @@ def test_takeover_lease_api_schema_rejects_invalid_values():
     for invalid in (0, -1, 301, True):
         with pytest.raises(ValidationError):
             TakeoverClaimRequest(lease_seconds=invalid)
+
+
+def test_takeover_renewal_requires_exact_unexpired_owner_and_preserves_controls(
+    tmp_path: Path,
+):
+    db_file = tmp_path / "takeover_renewal.db"
+    init_db(db_file)
+    assert (
+        claim_manual_takeover("owner@example.test", custom_path=db_file)["status"]
+        == "success"
+    )
+    conn = get_connection(db_file)
+    try:
+        conn.execute(
+            "UPDATE runtime_control SET manual_takeover_expires_at = ? WHERE id = 1;",
+            ((datetime.now() + timedelta(seconds=30)).strftime("%Y-%m-%d %H:%M:%S"),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    before = get_runtime_control(custom_path=db_file)
+    renewed = renew_manual_takeover("owner@example.test", custom_path=db_file)
+    assert renewed["status"] == "success"
+    assert renewed["owner"] == "owner@example.test"
+    assert renewed["expires_at"] > before["manual_takeover_expires_at"]
+    after = get_runtime_control(custom_path=db_file)
+    assert after["is_paused"] == before["is_paused"]
+    assert after["is_stopped"] == before["is_stopped"]
+
+    other = renew_manual_takeover("other@example.test", custom_path=db_file)
+    assert other["status"] == "rejected"
+    assert other["reason"] == "owner_mismatch"
+
+    conn = get_connection(db_file)
+    try:
+        conn.execute(
+            "UPDATE runtime_control SET manual_takeover_expires_at = ? WHERE id = 1;",
+            ("2000-01-01 00:00:00",),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    expired = renew_manual_takeover("owner@example.test", custom_path=db_file)
+    assert expired["status"] == "rejected"
+    assert expired["reason"] == "expired"
+
+
+def test_takeover_renewal_samples_time_after_lock_wait(tmp_path: Path):
+    db_file = tmp_path / "takeover_renewal_lock_wait.db"
+    init_db(db_file)
+    assert (
+        claim_manual_takeover("owner@example.test", custom_path=db_file)["status"]
+        == "success"
+    )
+
+    conn = get_connection(db_file)
+    try:
+        conn.execute(
+            "UPDATE runtime_control SET manual_takeover_expires_at = ? WHERE id = 1;",
+            ((datetime.now() + timedelta(seconds=2)).strftime("%Y-%m-%d %H:%M:%S"),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold_takeover_lock() -> None:
+        with TAKEOVER_TRANSPORT_LOCK:
+            acquired.set()
+            release.wait(timeout=10)
+
+    holder = threading.Thread(target=hold_takeover_lock)
+    holder.start()
+    assert acquired.wait(timeout=2)
+
+    result: dict[str, Any] = {}
+
+    def renew() -> None:
+        result.update(renew_manual_takeover("owner@example.test", custom_path=db_file))
+
+    renewal = threading.Thread(target=renew)
+    renewal.start()
+    time.sleep(3)
+    release.set()
+    renewal.join(timeout=5)
+    holder.join(timeout=5)
+
+    assert not renewal.is_alive()
+    assert result["status"] == "rejected"
+    assert result["reason"] == "expired"
+
+
+def test_takeover_status_samples_time_after_queue_lock_wait(tmp_path: Path):
+    db_file = tmp_path / "takeover_status_lock_wait.db"
+    init_db(db_file)
+    assert (
+        claim_manual_takeover("owner@example.test", custom_path=db_file)["status"]
+        == "success"
+    )
+
+    conn = get_connection(db_file)
+    try:
+        conn.execute(
+            "UPDATE runtime_control SET manual_takeover_expires_at = ? WHERE id = 1;",
+            ((datetime.now() + timedelta(seconds=2)).strftime("%Y-%m-%d %H:%M:%S"),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    acquired = threading.Event()
+    release = threading.Event()
+    result: dict[str, Any] = {}
+
+    def hold_queue_lock() -> None:
+        with _QUEUE_LOCK:
+            acquired.set()
+            release.wait(timeout=10)
+
+    def read_status() -> None:
+        result["status"] = is_takeover_active(db_file)
+
+    holder = threading.Thread(target=hold_queue_lock)
+    holder.start()
+    assert acquired.wait(timeout=2)
+    reader = threading.Thread(target=read_status)
+    reader.start()
+    time.sleep(3)
+    release.set()
+    reader.join(timeout=5)
+    holder.join(timeout=5)
+
+    assert not reader.is_alive()
+    assert result["status"][0] is False
 
 
 def test_expired_takeover_owner_is_rejected_by_fenced_mutations(tmp_path: Path):
@@ -1073,6 +1213,35 @@ def test_access_takeover_status_exposes_current_owner():
     assert status["read_only"] is True
 
 
+def test_access_takeover_renewal_uses_verified_identity_not_body():
+    from types import SimpleNamespace
+    from job_applier.web.app import TakeoverRenewRequest, renew_takeover_endpoint
+
+    request = cast(
+        Any,
+        SimpleNamespace(state=SimpleNamespace(user={"email": "verified@example.test"})),
+    )
+    with (
+        patch("job_applier.web.app.edge_config.cf_access_enabled", True),
+        patch(
+            "job_applier.automation.queue.renew_manual_takeover",
+            return_value={
+                "status": "success",
+                "owner": "verified@example.test",
+                "expires_at": "future",
+                "lease_seconds": 300,
+            },
+        ) as renew,
+    ):
+        result = renew_takeover_endpoint(
+            request,
+            TakeoverRenewRequest(owner="attacker@example.test"),
+        )
+
+    assert result["owner"] == "verified@example.test"
+    renew.assert_called_once_with(owner="verified@example.test", lease_seconds=300)
+
+
 def test_access_viewer_cannot_force_release_takeover():
     from types import SimpleNamespace
     from job_applier.web.app import (
@@ -1665,6 +1834,13 @@ def test_web_app_takeover_endpoints(client):
     st_res2 = client.get("/api/automation/takeover/status")
     assert st_res2.json()["is_takeover_active"] is True
     assert st_res2.json()["read_only"] is False
+
+    renew_res = client.post(
+        "/api/automation/takeover/renew",
+        json={"owner": "operator@aslan.net", "lease_seconds": 300},
+    )
+    assert renew_res.status_code == 200
+    assert renew_res.json()["owner"] == "operator@aslan.net"
 
     # Release takeover
     rel_res = client.post(
