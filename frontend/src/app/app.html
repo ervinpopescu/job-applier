@@ -3013,65 +3013,96 @@
     role="dialog"
     aria-modal="true"
     aria-labelledby="vnc-viewer-title"
+    aria-describedby="vnc-viewer-description"
   >
     <div
       #vncDialog
+      (keydown)="onVncDialogKeydown($event)"
       class="vnc-dialog bg-slate-900 border-0 sm:border border-slate-800 w-full max-w-6xl h-[100dvh] max-h-[100dvh] sm:h-[94vh] rounded-none sm:rounded-3xl overflow-hidden shadow-2xl flex flex-col"
+      [class.vnc-keyboard-open]="vncKeyboardOpen()"
+      [style.--vnc-viewport-height.px]="vncViewportHeight()"
       tabindex="-1"
     >
-      <div
-        class="p-2 sm:px-4 border-b border-slate-800 bg-slate-950 shrink-0 space-y-2 safe-area-top"
-      >
-        <div class="flex flex-wrap items-center gap-2">
-          <div class="flex min-w-0 flex-1 items-center gap-2">
-            <app-icon name="monitor" className="w-5 h-5 text-teal-400 shrink-0"></app-icon>
+      <header class="vnc-viewer-header shrink-0 safe-area-top">
+        <div class="flex min-w-0 items-center gap-2">
+          <app-icon name="monitor" className="w-5 h-5 text-teal-400 shrink-0"></app-icon>
+          <div class="min-w-0 flex-1">
             <h3 id="vnc-viewer-title" class="text-xs sm:text-sm font-bold text-white truncate">
               Browser Automation
             </h3>
-            <span class="text-[11px] font-semibold text-slate-300" role="status" aria-live="polite">
-              {{ vncConnectionLabel() }}
-            </span>
+            <div class="flex flex-wrap items-center gap-x-2 text-[11px]">
+              <span class="font-semibold text-slate-200" role="status" aria-live="polite">
+                {{ vncConnectionLabel() }}
+              </span>
+              <span class="text-slate-400">{{ takeoverLeaseLabel() }}</span>
+            </div>
           </div>
-          <div
-            class="flex w-full flex-wrap items-center gap-1.5 sm:w-auto sm:justify-end"
-            aria-label="Takeover actions"
+          <button
+            (click)="closeTakeoverModal()"
+            class="min-h-11 min-w-11 shrink-0 px-2 text-slate-300 hover:text-white rounded-xl hover:bg-slate-800"
+            title="Close viewer without resuming automation"
+            aria-label="Close viewer"
           >
-            <button
-              *ngIf="isAuthenticationWaiting()"
-              (click)="reopenAuthSession()"
-              [disabled]="isReopeningAuth() || !takeoverOwnerActionEnabled()"
-              class="min-h-11 flex-1 whitespace-nowrap px-3 bg-sky-600 hover:bg-sky-500 text-white font-bold text-xs rounded-xl disabled:opacity-50 sm:flex-none"
-              title="Start a fresh controlled browser session for operator authentication"
-            >
-              Reopen Authentication
-            </button>
-            <button
-              (click)="releaseTakeover()"
-              [disabled]="isReleasingTakeover() || !takeoverOwnerActionEnabled()"
-              class="min-h-11 flex-1 whitespace-nowrap px-3 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs rounded-xl disabled:opacity-50 sm:flex-none"
-              title="Release operator input without resuming automation"
-            >
-              {{ isReleasingTakeover() ? 'Releasing...' : 'Release Control' }}
-            </button>
-            <button
-              (click)="resumeFromTakeover()"
-              [disabled]="isResumingTakeover() || !takeoverOwnerActionEnabled()"
-              class="min-h-11 flex-1 whitespace-nowrap px-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl disabled:opacity-50 sm:flex-none"
-              title="Revalidate page domain, challenge completion, and resume automation"
-            >
-              {{ isResumingTakeover() ? 'Resuming...' : 'Resume Automation' }}
-            </button>
-            <button
-              (click)="closeTakeoverModal()"
-              class="min-h-11 min-w-11 px-2 text-slate-300 hover:text-white rounded-xl hover:bg-slate-800"
-              title="Close viewer without resuming automation"
-              aria-label="Close viewer"
-            >
-              <app-icon name="x" className="w-5 h-5"></app-icon>
-            </button>
-          </div>
+            <app-icon name="x" className="w-5 h-5"></app-icon>
+          </button>
         </div>
-        <div class="flex flex-wrap items-center gap-2 text-xs" aria-label="Remote browser controls">
+      </header>
+
+      <div
+        class="vnc-target-shell flex-1 min-h-0 bg-black relative overflow-hidden"
+        style="touch-action: none; overscroll-behavior: contain"
+      >
+        <div
+          #vncTarget
+          class="vnc-target w-full h-full min-h-0"
+          aria-label="Remote browser display"
+          [attr.data-pointer-enabled]="vncInputEnabled()"
+          (pointerdown)="onVncPointerDown($event)"
+        ></div>
+        <div
+          *ngIf="vncConnection() === 'connected' && !vncInputEnabled()"
+          class="vnc-readonly-overlay"
+          role="status"
+          aria-live="polite"
+        >
+          <span>{{ vncTakeoverHint() }}</span>
+          <button
+            *ngIf="!takeoverStatus()?.is_takeover_active && !isClaimingTakeover()"
+            (click)="retryTakeoverClaim()"
+            class="min-h-11 px-4 rounded-xl bg-teal-600 text-white font-semibold"
+          >
+            Claim control
+          </button>
+        </div>
+        <div
+          *ngIf="vncConnection() !== 'connected'"
+          class="vnc-target-status"
+          role="status"
+          aria-live="polite"
+        >
+          <span>{{ vncTakeoverHint() }}</span>
+          <button
+            *ngIf="vncConnection() === 'disconnected' || vncConnection() === 'error'"
+            (click)="retryVncConnection()"
+            class="min-h-11 px-4 rounded-xl bg-amber-600 text-white font-semibold"
+          >
+            Retry connection
+          </button>
+          <button
+            *ngIf="!takeoverStatus()?.is_takeover_active && !isClaimingTakeover()"
+            (click)="retryTakeoverClaim()"
+            class="min-h-11 px-4 rounded-xl bg-teal-600 text-white font-semibold"
+          >
+            Try again / Claim control
+          </button>
+        </div>
+      </div>
+
+      <section class="vnc-operator-dock safe-area-bottom" aria-label="Mobile remote controls">
+        <p id="vnc-viewer-description" class="vnc-dock-status" role="status" aria-live="polite">
+          {{ vncTakeoverHint() }}
+        </p>
+        <div class="vnc-control-row" aria-label="Remote viewport controls">
           <button
             (click)="setVncMode('pan')"
             [attr.aria-pressed]="vncMode() === 'pan'"
@@ -3082,7 +3113,7 @@
                 : 'bg-slate-900 border-slate-700 text-slate-300'
             "
           >
-            Readable Pan (1:1)
+            Touch Navigate
           </button>
           <button
             (click)="setVncMode('fit')"
@@ -3097,69 +3128,94 @@
             Fit Overview
           </button>
           <button
-            (click)="sendRemotePage('up')"
+            (click)="focusRemote()"
             [disabled]="!vncInputEnabled()"
-            aria-label="Remote Page Up"
             class="min-h-11 px-3 rounded-xl bg-slate-800 text-white font-semibold disabled:opacity-40"
           >
-            Page Up
+            Focus Remote
+          </button>
+          <button
+            (click)="sendRemotePage('up')"
+            [disabled]="!vncInputEnabled()"
+            class="min-h-11 px-3 rounded-xl bg-slate-800 text-white font-semibold disabled:opacity-40"
+          >
+            Scroll Up
           </button>
           <button
             (click)="sendRemotePage('down')"
             [disabled]="!vncInputEnabled()"
-            aria-label="Remote Page Down"
             class="min-h-11 px-3 rounded-xl bg-slate-800 text-white font-semibold disabled:opacity-40"
           >
-            Page Down
+            Scroll Down
           </button>
           <button
             *ngIf="vncConnection() === 'disconnected' || vncConnection() === 'error'"
             (click)="retryVncConnection()"
             class="min-h-11 px-3 rounded-xl bg-amber-600 text-white font-semibold"
           >
-            Retry connection
+            Retry
           </button>
         </div>
-        <div class="flex flex-wrap gap-2 items-end">
+
+        <div class="vnc-text-row">
           <label class="sr-only" for="remote-text-input">Text to send to remote browser</label>
           <textarea
             id="remote-text-input"
             rows="1"
             [(ngModel)]="vncInputText"
             [disabled]="!vncInputEnabled()"
-            placeholder="Text to send to remote browser"
-            class="w-full min-w-0 min-h-11 bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white disabled:opacity-40 sm:flex-1"
+            placeholder="Tap here to type, then send to remote"
+            inputmode="text"
+            enterkeyhint="send"
+            autocomplete="off"
+            autocapitalize="sentences"
+            class="min-h-11 flex-1 min-w-[10rem] bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white disabled:opacity-40"
           ></textarea>
           <button
             (click)="pasteTextToRemote()"
             [disabled]="!vncInputEnabled() || !vncInputText()"
-            class="min-h-11 flex-1 whitespace-nowrap px-3 rounded-xl bg-indigo-600 text-white font-semibold disabled:opacity-40 sm:flex-none"
+            class="min-h-11 px-3 rounded-xl bg-indigo-600 text-white font-semibold disabled:opacity-40"
           >
-            Paste text to remote
+            Send text
           </button>
           <button
             (click)="sendRemoteEnter()"
             [disabled]="!vncInputEnabled()"
-            class="min-h-11 flex-1 whitespace-nowrap px-3 rounded-xl bg-slate-800 text-white font-semibold disabled:opacity-40 sm:flex-none"
+            class="min-h-11 px-3 rounded-xl bg-slate-800 text-white font-semibold disabled:opacity-40"
           >
             Enter
           </button>
         </div>
+
+        <div class="vnc-action-row" aria-label="Takeover actions">
+          <button
+            *ngIf="isAuthenticationWaiting()"
+            (click)="reopenAuthSession()"
+            [disabled]="isReopeningAuth() || !takeoverOwnerActionEnabled()"
+            class="min-h-11 flex-1 px-3 bg-sky-600 hover:bg-sky-500 text-white font-bold text-xs rounded-xl disabled:opacity-50"
+          >
+            {{ isReopeningAuth() ? 'Opening...' : 'Reopen Auth' }}
+          </button>
+          <button
+            (click)="releaseTakeover()"
+            [disabled]="isReleasingTakeover() || !takeoverOwnerActionEnabled()"
+            class="min-h-11 flex-1 px-3 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs rounded-xl disabled:opacity-50"
+          >
+            {{ isReleasingTakeover() ? 'Releasing...' : 'Release' }}
+          </button>
+          <button
+            (click)="resumeFromTakeover()"
+            [disabled]="isResumingTakeover() || !takeoverOwnerActionEnabled()"
+            class="min-h-11 flex-1 px-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl disabled:opacity-50"
+          >
+            {{ isResumingTakeover() ? 'Resuming...' : 'Resume' }}
+          </button>
+        </div>
         <p class="text-[11px] text-slate-400">
-          Readable Pan keeps the remote desktop at 1:1 and lets noVNC drag the clipped viewport. Fit
-          Overview shows the whole desktop smaller. Text is sent to the connected remote browser.
+          Touch Navigate keeps the remote desktop readable at 1:1; drag to pan, then use Send text
+          or Scroll for remote fields. Fit Overview is for orientation only.
         </p>
-      </div>
-      <div
-        class="flex-1 min-h-0 bg-black relative overflow-hidden"
-        style="touch-action: none; overscroll-behavior: contain"
-      >
-        <div
-          #vncTarget
-          class="vnc-target w-full h-full min-h-0"
-          aria-label="Remote browser display"
-        ></div>
-      </div>
+      </section>
     </div>
   </div>
 

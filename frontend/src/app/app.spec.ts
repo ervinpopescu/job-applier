@@ -792,6 +792,36 @@ describe('App Component - State & Degraded Mode Recovery', () => {
       expect(mockRfb.sendKey).toHaveBeenNthCalledWith(3, 0xff0d, 'Enter');
     });
 
+    it('enables pointer input for the current owner without swallowing a Touch Navigate tap', () => {
+      (app as any).rfb = mockRfb;
+      app.vncConnection.set('connected');
+      app.takeoverStatus.set({ is_takeover_active: true, is_current_owner: true } as any);
+      (app as any).takeoverInputRevoked = false;
+      mockRfb.viewOnly = true;
+
+      app.setVncMode('pan');
+      app.onVncPointerDown(new Event('pointerdown') as PointerEvent);
+
+      expect(app.vncInputEnabled()).toBe(true);
+      expect(mockRfb.viewOnly).toBe(false);
+      expect(mockRfb.focus).toHaveBeenCalledWith({ preventScroll: true });
+      expect(mockRfb.dragViewport).toBe(true);
+    });
+
+    it('keeps pointer input read-only and exposes the lease explanation for a non-owner', () => {
+      (app as any).rfb = mockRfb;
+      app.vncConnection.set('connected');
+      app.takeoverStatus.set({ is_takeover_active: true, is_current_owner: false } as any);
+      (app as any).takeoverInputRevoked = false;
+
+      app.onVncPointerDown(new Event('pointerdown') as PointerEvent);
+
+      expect(app.vncInputEnabled()).toBe(false);
+      expect(mockRfb.viewOnly).toBe(true);
+      expect(app.vncTakeoverHint()).toContain('another operator');
+      expect(mockRfb.focus).not.toHaveBeenCalled();
+    });
+
     it('keeps remote controls disabled when another viewer owns the active lease', () => {
       (app as any).rfb = mockRfb;
       app.vncConnection.set('connected');
@@ -802,6 +832,30 @@ describe('App Component - State & Degraded Mode Recovery', () => {
       app.sendRemotePage('up');
       app.sendRemoteEnter();
       expect(mockRfb.sendKey).not.toHaveBeenCalled();
+    });
+
+    it('derives takeover expiry from the server lease for every viewer', () => {
+      vi.setSystemTime(new Date('2026-09-15T12:00:00.000Z'));
+      mockApi.getTakeoverStatus = vi.fn().mockReturnValue(
+        of({
+          is_takeover_active: true,
+          is_current_owner: false,
+          owner: 'another-operator',
+          expires_at: '2026-09-15T12:02:05.000Z',
+        }),
+      );
+
+      app.refreshTakeoverStatus();
+
+      expect(app.takeoverCountdown()).toBe(125);
+      expect(app.takeoverLeaseLabel()).toBe(
+        'Another operator controls this session · expires in 2:05',
+      );
+
+      vi.setSystemTime(new Date('2026-09-15T12:01:05.000Z'));
+      expect(app.takeoverLeaseLabel()).toBe(
+        'Another operator controls this session · expires in 1:00',
+      );
     });
 
     it('revokes remote input immediately when release, expiry, or status refresh fails', () => {
@@ -859,6 +913,13 @@ describe('App Component - State & Degraded Mode Recovery', () => {
         .mockReturnValue(of({ success: true, message: 'Revalidation succeeded' }));
 
       // Case 1: When takeover is not active, opening modal auto-claims takeover
+      mockApi.getTakeoverStatus = vi.fn().mockReturnValue(
+        of({
+          is_takeover_active: true,
+          is_current_owner: true,
+          expires_at: new Date(Date.now() + 300_000).toISOString(),
+        }),
+      );
       app.takeoverStatus.set({ is_takeover_active: false } as any);
       app.openTakeoverModal();
       expect(app.vncModalOpen()).toBe(true);
@@ -883,6 +944,53 @@ describe('App Component - State & Degraded Mode Recovery', () => {
       expect(app.toast().message).toContain('Revalidation succeeded');
     });
 
+    it('offers a recoverable claim state and keeps remote focus explicit', () => {
+      mockApi.claimTakeover = vi
+        .fn()
+        .mockReturnValue(
+          throwError(() => ({ status: 409, error: { detail: 'Another operator owns takeover' } })),
+        );
+      app.openTakeoverModal();
+
+      expect(app.vncClaimError()).toContain('Another operator owns takeover');
+      expect(app.vncTakeoverHint()).toContain('Try again');
+      expect(app.takeoverOwnerActionEnabled()).toBe(false);
+
+      mockApi.claimTakeover = vi.fn().mockReturnValue(of({ success: true, lease_seconds: 300 }));
+      app.retryTakeoverClaim();
+      expect(mockApi.claimTakeover).toHaveBeenCalledTimes(1);
+      expect(app.vncClaimError()).toBeNull();
+
+      (app as any).rfb = mockRfb;
+      app.vncConnection.set('connected');
+      app.takeoverStatus.set({ is_takeover_active: true, is_current_owner: true } as any);
+      (app as any).takeoverInputRevoked = false;
+      app.focusRemote();
+      expect(mockRfb.focus).toHaveBeenCalledWith({ preventScroll: true });
+    });
+
+    it('traps reverse tab from the initially focused dialog container', () => {
+      const dialog = document.createElement('div');
+      dialog.tabIndex = -1;
+      const first = document.createElement('button');
+      const last = document.createElement('button');
+      dialog.append(first, last);
+      document.body.append(dialog);
+      (app as any).vncDialog = { nativeElement: dialog };
+      dialog.focus();
+
+      const event = new KeyboardEvent('keydown', {
+        key: 'Tab',
+        shiftKey: true,
+        cancelable: true,
+      });
+      app.onVncDialogKeydown(event);
+
+      expect(event.defaultPrevented).toBe(true);
+      expect(document.activeElement).toBe(last);
+      dialog.remove();
+    });
+
     it('renders a readable mobile takeover dialog with remote controls and no iframe', () => {
       mockApi.claimTakeover = vi
         .fn()
@@ -904,9 +1012,9 @@ describe('App Component - State & Degraded Mode Recovery', () => {
       expect(dialog.className).toContain('sm:rounded-3xl');
 
       expect(fixture.nativeElement.querySelector('.touch-assist-bar')).toBeNull();
-      expect(fixture.nativeElement.textContent).toContain('Readable Pan (1:1)');
+      expect(fixture.nativeElement.textContent).toContain('Touch Navigate');
       expect(fixture.nativeElement.textContent).toContain('Fit Overview');
-      expect(fixture.nativeElement.textContent).toContain('Paste text to remote');
+      expect(fixture.nativeElement.textContent).toContain('Send text');
       expect(fixture.nativeElement.textContent).not.toContain('pinch-to-zoom');
 
       // Clean header elements
@@ -915,11 +1023,12 @@ describe('App Component - State & Degraded Mode Recovery', () => {
       expect(headerTitle?.textContent).toContain('Browser Automation');
       expect(dialog.getAttribute('tabindex')).toBe('-1');
 
-      const resumeBtn = dialog.querySelector('button[title*="Revalidate page domain"]');
-      expect(resumeBtn).not.toBeNull();
-      expect(resumeBtn?.textContent).toContain('Resume Automation');
+      const resumeBtn = Array.from(dialog.querySelectorAll('button')).find((button) =>
+        (button as HTMLButtonElement).textContent?.includes('Resume'),
+      );
+      expect(resumeBtn).not.toBeUndefined();
 
-      const targetContainer = dialog.querySelector('.flex-1.bg-black');
+      const targetContainer = dialog.querySelector('.vnc-target-shell');
       expect(targetContainer).not.toBeNull();
       expect(targetContainer?.getAttribute('style')).toContain('touch-action: none');
       expect(
@@ -945,16 +1054,11 @@ describe('App Component - State & Degraded Mode Recovery', () => {
       const actions = dialog.querySelector('[aria-label="Takeover actions"]') as HTMLElement;
       const buttons = Array.from(actions.querySelectorAll('button')) as HTMLButtonElement[];
 
-      expect(actions.className).toContain('w-full');
-      expect(actions.className).toContain('flex-wrap');
-      expect(buttons).toHaveLength(4);
+      expect(actions.className).toContain('vnc-action-row');
+      expect(buttons).toHaveLength(3);
       expect(buttons.every((button) => button.className.includes('min-h-11'))).toBe(true);
-      expect(buttons.some((button) => button.textContent?.includes('Reopen Authentication'))).toBe(
-        true,
-      );
-      expect(buttons.some((button) => button.getAttribute('aria-label') === 'Close viewer')).toBe(
-        true,
-      );
+      expect(buttons.some((button) => button.textContent?.includes('Reopen Auth'))).toBe(true);
+      expect(dialog.querySelector('button[aria-label="Close viewer"]')).not.toBeNull();
     });
 
     it('ignores stale takeover status responses across claim and release generations', () => {

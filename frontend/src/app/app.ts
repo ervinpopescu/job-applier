@@ -138,10 +138,15 @@ export class App implements OnInit, OnDestroy {
     'idle' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected' | 'error'
   >('idle');
   vncError = signal<string | null>(null);
+  vncClaimError = signal<string | null>(null);
   vncRetryCount = signal(0);
   vncInputText = signal('');
+  vncKeyboardOpen = signal(false);
+  vncViewportHeight = signal<number | null>(null);
   private vncTarget?: ElementRef<HTMLDivElement>;
   private rfb?: RfbLike;
+  private vncPreviouslyFocused?: HTMLElement;
+  private vncVisualViewport?: VisualViewport;
   private vncRetryTimerId: ReturnType<typeof setTimeout> | null = null;
   private vncIntentionalDisconnect = false;
   private vncSecurityFailure = false;
@@ -401,6 +406,7 @@ export class App implements OnInit, OnDestroy {
       this.takeoverTimerId = null;
     }
     this.stopResumePolling();
+    this.detachVncVisualViewport();
     this.disconnectRfb();
   }
 
@@ -1429,8 +1435,38 @@ export class App implements OnInit, OnDestroy {
 
   @HostListener('document:keydown.escape')
   onEscapeKey() {
+    if (this.vncModalOpen()) {
+      this.closeTakeoverModal();
+      return;
+    }
     if (this.moreActionsOpen()) {
       this.closeMoreActions(true);
+    }
+  }
+
+  onVncDialogKeydown(event: KeyboardEvent) {
+    if (event.key !== 'Tab' || !this.vncDialog) return;
+    const focusable = Array.from(
+      this.vncDialog.nativeElement.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), textarea:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ),
+    );
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const activeElement = document.activeElement;
+    if (
+      event.shiftKey &&
+      (activeElement === first || activeElement === this.vncDialog.nativeElement)
+    ) {
+      event.preventDefault();
+      last.focus();
+    } else if (
+      !event.shiftKey &&
+      (activeElement === last || activeElement === this.vncDialog.nativeElement)
+    ) {
+      event.preventDefault();
+      first.focus();
     }
   }
 
@@ -1876,6 +1912,54 @@ export class App implements OnInit, OnDestroy {
 
   // --- noVNC Viewer & Operator Takeover Controls ---
 
+  private takeoverSecondsUntil(expiresAt: string | null | undefined): number | null {
+    if (!expiresAt) return null;
+    const expires = Date.parse(expiresAt);
+    if (!Number.isFinite(expires)) return null;
+    return Math.max(0, Math.ceil((expires - Date.now()) / 1000));
+  }
+
+  private formatTakeoverSeconds(seconds: number): string {
+    const minutes = Math.floor(seconds / 60);
+    const remainder = seconds % 60;
+    return `${minutes}:${remainder.toString().padStart(2, '0')}`;
+  }
+
+  private syncTakeoverCountdown(status: TakeoverStatus): number | null {
+    const remaining = this.takeoverSecondsUntil(status.expires_at);
+    if (remaining !== null) this.takeoverCountdown.set(remaining);
+    return remaining;
+  }
+
+  takeoverLeaseLabel(): string {
+    const status = this.takeoverStatus();
+    if (!status?.is_takeover_active) return 'Control inactive';
+    const serverRemaining = this.takeoverSecondsUntil(status.expires_at);
+    const remaining =
+      serverRemaining ?? (status.is_current_owner ? this.takeoverCountdown() : null);
+    const expiry =
+      remaining === null ? '' : ` · expires in ${this.formatTakeoverSeconds(remaining)}`;
+    if (!status.is_current_owner) return `Another operator controls this session${expiry}`;
+    return `Your control${expiry}`;
+  }
+
+  vncTakeoverHint(): string {
+    if (this.isClaimingTakeover()) return 'Claiming operator control…';
+    if (this.vncClaimError()) return this.vncClaimError() as string;
+    const status = this.takeoverStatus();
+    if (!status?.is_takeover_active)
+      return 'Control is not active. Claim control to enable remote input.';
+    if (!status.is_current_owner) return 'Read-only: another operator controls this browser.';
+    if (this.vncConnection() === 'error')
+      return this.vncError() || 'Connection failed. Retry when ready.';
+    if (this.vncConnection() === 'disconnected')
+      return 'Disconnected. Retry the remote connection.';
+    if (this.vncConnection() === 'reconnecting') return 'Reconnecting to the remote browser…';
+    if (this.vncConnection() === 'connecting' || this.vncConnection() === 'idle')
+      return 'Connecting to the remote browser…';
+    return 'Drag in Touch Navigate to pan. Use the dock to send text or scroll remotely.';
+  }
+
   vncConnectionLabel(): string {
     switch (this.vncConnection()) {
       case 'connecting':
@@ -1930,6 +2014,7 @@ export class App implements OnInit, OnDestroy {
       this.rfb.scaleViewport = true;
     }
     this.rfb.resizeSession = false;
+    this.rfb.focusOnClick = true;
     this.rfb.viewOnly = !this.vncInputEnabled();
   }
 
@@ -1944,6 +2029,19 @@ export class App implements OnInit, OnDestroy {
     this.vncModeManuallySelected.set(true);
     this.vncMode.set(mode);
     this.setVncModeProperties();
+  }
+
+  onVncPointerDown(_event: PointerEvent) {
+    if (!this.rfb) return;
+    // Keep the event available to noVNC: a tap remains a click, while a moved
+    // pointer is interpreted by noVNC as viewport panning in Touch Navigate.
+    this.rfb.viewOnly = !this.vncInputEnabled();
+    if (this.vncInputEnabled()) this.rfb.focus({ preventScroll: true });
+  }
+
+  focusRemote() {
+    if (!this.vncInputEnabled() || !this.rfb) return;
+    this.rfb.focus({ preventScroll: true });
   }
 
   private clearVncRetryTimer() {
@@ -2089,7 +2187,7 @@ export class App implements OnInit, OnDestroy {
     }
     this.rfb.clipboardPasteFrom(text);
     this.vncInputText.set('');
-    this.rfb.focus({ preventScroll: true });
+    // Keep focus in the local textarea so the mobile keyboard stays open for the next field.
   }
 
   private markTakeoverInactive() {
@@ -2138,10 +2236,12 @@ export class App implements OnInit, OnDestroy {
           if (this.takeoverInputRevoked && status.is_takeover_active) return;
           this.takeoverInputRevoked = !status.is_takeover_active;
           this.takeoverStatus.set(status);
+          this.syncTakeoverCountdown(status);
           this.setVncModeProperties();
           if (status.is_takeover_active) {
             this.startTakeoverTimer();
           } else {
+            this.takeoverCountdown.set(0);
             this.stopTakeoverTimer();
           }
         },
@@ -2151,7 +2251,9 @@ export class App implements OnInit, OnDestroy {
   private startTakeoverTimer() {
     if (this.takeoverTimerId) return;
     this.takeoverTimerId = setInterval(() => {
-      const current = this.takeoverCountdown();
+      const status = this.takeoverStatus();
+      const serverRemaining = this.takeoverSecondsUntil(status?.expires_at);
+      const current = serverRemaining ?? this.takeoverCountdown();
       if (current <= 1) {
         this.takeoverEpoch += 1;
         this.markTakeoverInactive();
@@ -2169,12 +2271,43 @@ export class App implements OnInit, OnDestroy {
     }
   }
 
+  private updateVncVisualViewport = () => {
+    if (typeof window === 'undefined') return;
+    const viewport = window.visualViewport;
+    if (!viewport) return;
+    this.vncViewportHeight.set(Math.round(viewport.height));
+    this.vncKeyboardOpen.set(window.innerHeight - viewport.height > 120);
+  };
+
+  private attachVncVisualViewport() {
+    if (typeof window === 'undefined' || !window.visualViewport) return;
+    this.vncVisualViewport = window.visualViewport;
+    this.vncVisualViewport.addEventListener('resize', this.updateVncVisualViewport);
+    this.vncVisualViewport.addEventListener('scroll', this.updateVncVisualViewport);
+    this.updateVncVisualViewport();
+  }
+
+  private detachVncVisualViewport() {
+    if (this.vncVisualViewport) {
+      this.vncVisualViewport.removeEventListener('resize', this.updateVncVisualViewport);
+      this.vncVisualViewport.removeEventListener('scroll', this.updateVncVisualViewport);
+      this.vncVisualViewport = undefined;
+    }
+    this.vncViewportHeight.set(null);
+    this.vncKeyboardOpen.set(false);
+  }
+
   openTakeoverModal() {
+    if (typeof document !== 'undefined' && document.activeElement instanceof HTMLElement) {
+      this.vncPreviouslyFocused = document.activeElement;
+    }
     this.chooseDefaultVncMode();
     this.vncConnection.set('idle');
     this.vncError.set(null);
+    this.vncClaimError.set(null);
     this.vncRetryCount.set(0);
     this.vncModalOpen.set(true);
+    this.attachVncVisualViewport();
     if (this.takeoverStatus()?.is_takeover_active && !this.takeoverInputRevoked) {
       this.refreshTakeoverStatus();
     } else {
@@ -2184,14 +2317,25 @@ export class App implements OnInit, OnDestroy {
 
   closeTakeoverModal() {
     this.disconnectRfb();
+    this.detachVncVisualViewport();
     this.vncTarget = undefined;
     this.vncModeManuallySelected.set(false);
     this.vncModalOpen.set(false);
     this.activeTakeoverJobId.set(null);
+    const previous = this.vncPreviouslyFocused;
+    this.vncPreviouslyFocused = undefined;
+    queueMicrotask(() => previous?.focus({ preventScroll: true }));
+  }
+
+  retryTakeoverClaim() {
+    if (this.takeoverStatus()?.is_takeover_active || this.isClaimingTakeover()) return;
+    this.vncClaimError.set(null);
+    this.claimTakeover();
   }
 
   claimTakeover() {
     const epoch = ++this.takeoverEpoch;
+    this.vncClaimError.set(null);
     this.isClaimingTakeover.set(true);
     this.api.claimTakeover('operator', 300).subscribe({
       next: (res) => {
@@ -2204,8 +2348,10 @@ export class App implements OnInit, OnDestroy {
       },
       error: (err) => {
         if (epoch !== this.takeoverEpoch) return;
+        const message = classifyHttpError(err).message || 'Failed to claim takeover lease';
         this.markTakeoverInactive();
-        this.showToast(classifyHttpError(err).message || 'Failed to claim takeover lease', 'error');
+        this.vncClaimError.set(`${message}. Tap Try again / Claim control when ready.`);
+        this.showToast(message, 'error');
         this.isClaimingTakeover.set(false);
       },
     });

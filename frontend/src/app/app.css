@@ -8,3 +8,157 @@
 .safe-area-top {
   padding-top: max(0.5rem, env(safe-area-inset-top));
 }
+
+.safe-area-bottom {
+  padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+}
+
+@media (max-width: 639px), (max-height: 560px) {
+  .vnc-dialog {
+    height: var(--vnc-viewport-height, 100dvh) !important;
+    max-height: var(--vnc-viewport-height, 100dvh) !important;
+  }
+}
+
+.vnc-viewer-header {
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid rgb(30 41 59);
+  background: rgb(2 6 23);
+}
+
+.vnc-target-shell {
+  isolation: isolate;
+}
+
+.vnc-target-status {
+  position: absolute;
+  inset: 1rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  align-content: center;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  text-align: center;
+  color: rgb(226 232 240);
+  pointer-events: none;
+}
+
+.vnc-target-status > * {
+  pointer-events: auto;
+}
+
+.vnc-target-status > span {
+  width: 100%;
+  padding: 0.75rem;
+  border-radius: 0.75rem;
+  background: rgb(15 23 42 / 0.9);
+  border: 1px solid rgb(51 65 85);
+}
+
+.vnc-readonly-overlay {
+  position: absolute;
+  left: 0.75rem;
+  right: 0.75rem;
+  top: 0.75rem;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  padding: 0.5rem 0.75rem;
+  color: rgb(226 232 240);
+  text-align: center;
+  background: rgb(15 23 42 / 0.9);
+  border: 1px solid rgb(71 85 105);
+  border-radius: 0.75rem;
+  pointer-events: none;
+}
+
+.vnc-readonly-overlay > button {
+  pointer-events: auto;
+}
+
+.vnc-operator-dock {
+  flex: 0 1 auto;
+  max-height: min(38dvh, 21rem);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: grid;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: rgb(2 6 23);
+  border-top: 1px solid rgb(30 41 59);
+}
+
+.vnc-dock-status {
+  margin: 0;
+  color: rgb(148 163 184);
+  font-size: 0.6875rem;
+  line-height: 1.2;
+}
+
+.vnc-control-row,
+.vnc-text-row,
+.vnc-action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.vnc-control-row {
+  overflow-x: auto;
+  flex-wrap: nowrap;
+  padding-bottom: 0.125rem;
+  scrollbar-width: none;
+}
+
+.vnc-control-row::-webkit-scrollbar {
+  display: none;
+}
+
+.vnc-control-row > button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.vnc-text-row textarea {
+  resize: none;
+}
+
+@media (max-height: 560px) {
+  .vnc-viewer-header {
+    padding-top: max(0.25rem, env(safe-area-inset-top));
+    padding-bottom: 0.25rem;
+  }
+
+  .vnc-operator-dock {
+    max-height: 46dvh;
+    gap: 0.25rem;
+    padding-top: 0.25rem;
+  }
+
+  .vnc-dock-status,
+  .vnc-operator-dock > p:last-child {
+    display: none;
+  }
+}
+
+@media (min-width: 640px) {
+  .vnc-viewer-header {
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+
+  .vnc-operator-dock {
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vnc-dialog * {
+    scroll-behavior: auto !important;
+  }
+}
