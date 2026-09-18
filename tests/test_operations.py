@@ -62,12 +62,13 @@ def age_keypair():
 
 
 def test_online_backup_snapshot_consistency(tmp_path: Path):
-    """Verifies that create_backup captures active SQLite WAL records cleanly."""
-    db_file = tmp_path / "data" / "job_applier.db"
+    """Verifies an online snapshot using only a controlled project fixture."""
+    project_root = tmp_path / "project"
+    db_file = project_root / "data" / "job_applier.db"
     db_file.parent.mkdir(parents=True)
     init_db(custom_path=db_file)
 
-    # Insert test data
+    # Insert test data and create the artifact tree referenced by this fixture.
     upsert_application(
         app_id="app-1",
         company="Snapshot Inc",
@@ -75,28 +76,46 @@ def test_online_backup_snapshot_consistency(tmp_path: Path):
         job_url="https://example.com/job/1",
         custom_path=db_file,
     )
+    app_dir = project_root / "output" / "applications" / "controlled-app"
+    app_dir.mkdir(parents=True)
+    (app_dir / "application_manifest.json").write_text(
+        json.dumps({"app_id": "app-1", "artifact": "submission_fill_only.png"})
+    )
+    (app_dir / "submission_fill_only.png").write_bytes(b"controlled screenshot")
 
     out_dir = tmp_path / "backups"
-    backup_file = create_backup(
-        output_dir=out_dir,
-        include_profile=False,
-        quiesce_worker=True,
-        custom_db_path=db_file,
-    )
+    with patch("job_applier.ops.backup.get_project_root", return_value=project_root):
+        backup_file = create_backup(
+            output_dir=out_dir,
+            include_profile=False,
+            quiesce_worker=True,
+            custom_db_path=db_file,
+        )
 
     assert backup_file.exists()
     assert backup_file.name.endswith(".zip")
 
-    # Inspect manifest inside ZIP
+    # Inspect manifest inside ZIP and prove artifact discovery stayed in tmp_path.
     import zipfile
 
     with zipfile.ZipFile(str(backup_file), "r") as zf:
-        namelist = zf.namelist()
+        namelist = set(zf.namelist())
         assert "manifest.json" in namelist
         assert "data/job_applier.db" in namelist
+        assert (
+            "output/applications/controlled-app/application_manifest.json" in namelist
+        )
+        assert "output/applications/controlled-app/submission_fill_only.png" in namelist
+        assert not any(
+            name.startswith("output/applications/") and "controlled-app" not in name
+            for name in namelist
+        )
         manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
         assert manifest["schema_version"] == CURRENT_SCHEMA_VERSION
-        assert manifest["applications_count"] >= 0
+        assert manifest["applications_count"] == 1
+        assert zf.read(
+            "output/applications/controlled-app/submission_fill_only.png"
+        ) == (b"controlled screenshot")
 
 
 def test_quiesced_artifact_snapshot(tmp_path: Path):
