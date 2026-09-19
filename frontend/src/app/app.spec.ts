@@ -1071,6 +1071,46 @@ describe('App Component - State & Degraded Mode Recovery', () => {
       expect(dialog.querySelector('button[aria-label="Close viewer"]')).not.toBeNull();
     });
 
+    it('parses legacy naive, UTC, and offset lease timestamps as the same instant', () => {
+      vi.setSystemTime(new Date('2026-09-19T19:54:55Z'));
+      const parse = vi.spyOn(Date, 'parse');
+      const secondsUntil = (value: string) => (app as any).takeoverSecondsUntil(value);
+
+      expect(secondsUntil('2026-09-19 19:59:55')).toBe(300);
+      expect(secondsUntil('2026-09-19T19:59:55Z')).toBe(300);
+      expect(secondsUntil('2026-09-19T21:59:55+02:00')).toBe(300);
+      expect(parse).toHaveBeenNthCalledWith(1, '2026-09-19T19:59:55Z');
+      expect(parse).toHaveBeenNthCalledWith(2, '2026-09-19T19:59:55Z');
+      expect(parse).toHaveBeenNthCalledWith(3, '2026-09-19T21:59:55+02:00');
+    });
+
+    it('keeps a freshly claimed legacy UTC lease active and arms renewal', () => {
+      vi.setSystemTime(new Date('2026-09-19T19:54:55Z'));
+      mockApi.getTakeoverStatus = vi.fn().mockReturnValue(
+        of({
+          status: 'success',
+          is_takeover_active: true,
+          is_current_owner: true,
+          owner: 'operator',
+          expires_at: '2026-09-19 19:59:55',
+          is_paused: true,
+          is_stopped: false,
+          read_only: false,
+        }),
+      );
+      mockApi.claimTakeover = vi.fn().mockReturnValue(of({ success: true, lease_seconds: 300 }));
+      app.vncModalOpen.set(true);
+
+      app.claimTakeover();
+
+      expect(app.takeoverCountdown()).toBe(300);
+      expect((app as any).takeoverRenewTimerId).not.toBeNull();
+      vi.advanceTimersByTime(1_000);
+      expect(app.takeoverStatus()?.is_takeover_active).toBe(true);
+      vi.advanceTimersByTime(59_000);
+      expect(mockApi.renewTakeover).toHaveBeenCalledWith(300);
+    });
+
     it('renews the current owner before expiry and stops after modal close', () => {
       const renewedExpiry = new Date(Date.now() + 300_000).toISOString();
       mockApi.getTakeoverStatus = vi.fn().mockReturnValue(

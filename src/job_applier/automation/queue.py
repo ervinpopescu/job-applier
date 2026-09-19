@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import uuid
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -30,6 +30,11 @@ TAKEOVER_MAX_LEASE_SECONDS = 300
 # renewed every 10 seconds, two heartbeat intervals leave a conservative 20s
 # margin while still permitting the normal 60s lease to submit.
 SUBMIT_LEASE_MARGIN_SECONDS = 20
+
+
+def _takeover_now_naive() -> datetime:
+    """Return UTC wall-clock time for the legacy naive takeover DB fields."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 @dataclass
@@ -63,7 +68,6 @@ def begin_submit_click_fence(
         conn = get_connection(custom_path)
         conn.execute("BEGIN IMMEDIATE;")
         now = datetime.now()
-        now_str = now.strftime("%Y-%m-%d %H:%M:%S")
         cutoff = (now + timedelta(seconds=SUBMIT_LEASE_MARGIN_SECONDS)).strftime(
             "%Y-%m-%d %H:%M:%S"
         )
@@ -85,10 +89,11 @@ def begin_submit_click_fence(
         ).fetchone()
         if not row:
             raise RuntimeError("Physical submit fence rejected: job disappeared.")
+        takeover_now_str = _takeover_now_naive().strftime("%Y-%m-%d %H:%M:%S")
         takeover_active = bool(
             row["manual_takeover_owner"]
             and row["manual_takeover_expires_at"]
-            and row["manual_takeover_expires_at"] > now_str
+            and row["manual_takeover_expires_at"] > takeover_now_str
         )
         if (
             row["state"] != JobState.SUBMIT_INTENT.value
@@ -139,7 +144,7 @@ def takeover_owner_matches(owner: str, custom_path: Path | None = None) -> bool:
     ``TAKEOVER_TRANSPORT_LOCK``. The re-entrant lock here also keeps direct
     callers safe and makes the expiry check part of the same relay fence.
     """
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_str = _takeover_now_naive().strftime("%Y-%m-%d %H:%M:%S")
     with TAKEOVER_TRANSPORT_LOCK:
         conn = get_connection(custom_path)
         try:
@@ -2530,7 +2535,7 @@ def is_takeover_active(
             row = conn.execute(
                 """
                 SELECT manual_takeover_owner, manual_takeover_expires_at,
-                       datetime('now', 'localtime') AS current_time
+                       datetime('now') AS current_time
                 FROM runtime_control
                 WHERE id = 1;
                 """
@@ -2574,7 +2579,7 @@ def claim_manual_takeover(
         )
 
     init_db(custom_path)
-    now_dt = datetime.now()
+    now_dt = _takeover_now_naive()
     now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
     expires_dt = now_dt + timedelta(seconds=lease_seconds)
     expires_str = expires_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -2694,12 +2699,12 @@ def renew_manual_takeover(
                     cursor = conn.execute(
                         """
                         UPDATE runtime_control
-                        SET manual_takeover_expires_at = datetime('now', 'localtime', ?),
-                            updated_at = datetime('now', 'localtime')
+                        SET manual_takeover_expires_at = datetime('now', ?),
+                            updated_at = datetime('now')
                         WHERE id = 1
                           AND manual_takeover_owner = ?
                           AND manual_takeover_expires_at IS NOT NULL
-                          AND manual_takeover_expires_at > datetime('now', 'localtime');
+                          AND manual_takeover_expires_at > datetime('now');
                         """,
                         (lease_modifier, owner),
                     )

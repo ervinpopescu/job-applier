@@ -9,7 +9,7 @@ import shutil
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from contextlib import asynccontextmanager
@@ -86,6 +86,28 @@ from job_applier.utils import get_project_root, parse_app_folder_info
 load_dotenv()
 
 edge_config = EdgeAuthConfig.from_env()
+
+
+def _format_takeover_expiry(expires_at: str | None) -> str | None:
+    """Render takeover lease expiry as an unambiguous UTC API timestamp."""
+    if expires_at is None:
+        return None
+    parsed = datetime.fromisoformat(expires_at.strip().replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (
+        parsed.astimezone(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _present_takeover_response(response: dict[str, Any]) -> dict[str, Any]:
+    """Apply the public timestamp contract without changing durable values."""
+    presented = dict(response)
+    if "expires_at" in presented:
+        presented["expires_at"] = _format_takeover_expiry(presented["expires_at"])
+    return presented
 
 
 class SafeStaticFiles(StaticFiles):
@@ -1596,7 +1618,7 @@ def takeover_status_endpoint(request: Request) -> dict[str, Any]:
         "status": "success",
         "is_takeover_active": is_active,
         "owner": owner if is_active else None,
-        "expires_at": expires_at if is_active else None,
+        "expires_at": _format_takeover_expiry(expires_at) if is_active else None,
         "is_current_owner": is_current_owner,
         "is_paused": ctrl.get("is_paused", False),
         "is_stopped": ctrl.get("is_stopped", False),
@@ -1633,13 +1655,16 @@ def claim_takeover_endpoint(
         lease_seconds=body.lease_seconds,
     )
     if result.get("status") == "conflict":
-        raise HTTPException(
-            status_code=409,
-            detail=result.get(
+        conflict_owner = result.get("owner")
+        conflict_expiry = _format_takeover_expiry(result.get("expires_at"))
+        if isinstance(conflict_owner, str) and conflict_expiry is not None:
+            detail = f"Takeover is currently active by {conflict_owner} until {conflict_expiry}."
+        else:
+            detail = result.get(
                 "message", "Takeover is currently active by another user."
-            ),
-        )
-    return result
+            )
+        raise HTTPException(status_code=409, detail=detail)
+    return _present_takeover_response(result)
 
 
 @app.post("/api/automation/takeover/renew")
@@ -1658,7 +1683,7 @@ def renew_takeover_endpoint(
     )
     if result.get("status") == "rejected":
         raise HTTPException(status_code=409, detail=result.get("message"))
-    return result
+    return _present_takeover_response(result)
 
 
 @app.post("/api/automation/takeover/release")

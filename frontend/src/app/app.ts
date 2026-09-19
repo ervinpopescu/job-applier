@@ -1919,7 +1919,12 @@ export class App implements OnInit, OnDestroy {
 
   private takeoverSecondsUntil(expiresAt: string | null | undefined): number | null {
     if (!expiresAt) return null;
-    const expires = Date.parse(expiresAt);
+    const value = expiresAt.trim();
+    // API timestamps with no zone are legacy UTC wall-clock values. Explicit
+    // offsets and Z timestamps are passed through for normal Date parsing.
+    const hasExplicitTimezone = /(?:Z|[+-]\d{2}(?::?\d{2})?)$/i.test(value);
+    const normalized = hasExplicitTimezone ? value : `${value.replace(' ', 'T')}Z`;
+    const expires = Date.parse(normalized);
     if (!Number.isFinite(expires)) return null;
     return Math.max(0, Math.ceil((expires - Date.now()) / 1000));
   }

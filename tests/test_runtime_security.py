@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from job_applier.automation.adapters import CaptchaDetectedError
 from job_applier.automation.queue import JobState
@@ -276,7 +276,11 @@ def test_takeover_renewal_requires_exact_unexpired_owner_and_preserves_controls(
     try:
         conn.execute(
             "UPDATE runtime_control SET manual_takeover_expires_at = ? WHERE id = 1;",
-            ((datetime.now() + timedelta(seconds=30)).strftime("%Y-%m-%d %H:%M:%S"),),
+            (
+                (datetime.now(timezone.utc) + timedelta(seconds=30)).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+            ),
         )
         conn.commit()
     finally:
@@ -320,7 +324,11 @@ def test_takeover_renewal_samples_time_after_lock_wait(tmp_path: Path):
     try:
         conn.execute(
             "UPDATE runtime_control SET manual_takeover_expires_at = ? WHERE id = 1;",
-            ((datetime.now() + timedelta(seconds=2)).strftime("%Y-%m-%d %H:%M:%S"),),
+            (
+                (datetime.now(timezone.utc) + timedelta(seconds=2)).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+            ),
         )
         conn.commit()
     finally:
@@ -367,7 +375,11 @@ def test_takeover_status_samples_time_after_queue_lock_wait(tmp_path: Path):
     try:
         conn.execute(
             "UPDATE runtime_control SET manual_takeover_expires_at = ? WHERE id = 1;",
-            ((datetime.now() + timedelta(seconds=2)).strftime("%Y-%m-%d %H:%M:%S"),),
+            (
+                (datetime.now(timezone.utc) + timedelta(seconds=2)).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+            ),
         )
         conn.commit()
     finally:
@@ -1201,7 +1213,7 @@ def test_access_takeover_status_exposes_current_owner():
         patch("job_applier.web.app.edge_config.cf_access_enabled", True),
         patch(
             "job_applier.automation.queue.is_takeover_active",
-            return_value=(True, "owner@example.test", "future"),
+            return_value=(True, "owner@example.test", "2026-09-19 19:54:55"),
         ),
         patch("job_applier.automation.queue.get_runtime_control", return_value={}),
     ):
@@ -1211,6 +1223,59 @@ def test_access_takeover_status_exposes_current_owner():
     assert status["owner"] == "owner@example.test"
     assert status["is_current_owner"] is False
     assert status["read_only"] is True
+
+
+def test_takeover_api_presents_status_claim_and_renew_expiry_as_utc_iso8601():
+    from types import SimpleNamespace
+    from job_applier.web.app import (
+        TakeoverClaimRequest,
+        TakeoverRenewRequest,
+        claim_takeover_endpoint,
+        renew_takeover_endpoint,
+        takeover_status_endpoint,
+    )
+
+    request = cast(Any, SimpleNamespace(state=SimpleNamespace(user=None)))
+    with patch("job_applier.web.app.edge_config.cf_access_enabled", False):
+        with (
+            patch(
+                "job_applier.automation.queue.is_takeover_active",
+                return_value=(True, "operator", "2026-09-19 19:54:55"),
+            ),
+            patch("job_applier.automation.queue.get_runtime_control", return_value={}),
+        ):
+            status = takeover_status_endpoint(request)
+
+        with patch(
+            "job_applier.automation.queue.claim_manual_takeover",
+            return_value={
+                "status": "success",
+                "owner": "operator",
+                "lease_seconds": 300,
+                "expires_at": "2026-09-19 19:54:55",
+            },
+        ):
+            claim = claim_takeover_endpoint(
+                TakeoverClaimRequest(owner="operator", lease_seconds=300), request
+            )
+
+        with patch(
+            "job_applier.automation.queue.renew_manual_takeover",
+            return_value={
+                "status": "success",
+                "owner": "operator",
+                "lease_seconds": 300,
+                "expires_at": "2026-09-19T21:54:55+02:00",
+            },
+        ):
+            renew = renew_takeover_endpoint(
+                request, TakeoverRenewRequest(owner="operator", lease_seconds=300)
+            )
+
+    expected = "2026-09-19T19:54:55Z"
+    assert status["expires_at"] == expected
+    assert claim["expires_at"] == expected
+    assert renew["expires_at"] == expected
 
 
 def test_access_takeover_renewal_uses_verified_identity_not_body():
@@ -1228,7 +1293,7 @@ def test_access_takeover_renewal_uses_verified_identity_not_body():
             return_value={
                 "status": "success",
                 "owner": "verified@example.test",
-                "expires_at": "future",
+                "expires_at": "2026-09-19T21:54:55+02:00",
                 "lease_seconds": 300,
             },
         ) as renew,
@@ -1829,6 +1894,16 @@ def test_web_app_takeover_endpoints(client):
     )
     assert claim_res.status_code == 200
     assert claim_res.json()["owner"] == "operator@aslan.net"
+    assert claim_res.json()["expires_at"].endswith("Z")
+
+    conflict_res = client.post(
+        "/api/automation/takeover/claim",
+        json={"owner": "other-operator@aslan.net", "lease_seconds": 300},
+    )
+    assert conflict_res.status_code == 409
+    conflict_detail = conflict_res.json()["detail"]
+    assert "until " in conflict_detail
+    assert conflict_detail.rsplit(" until ", 1)[1].endswith("Z.")
 
     # Status shows active takeover
     st_res2 = client.get("/api/automation/takeover/status")

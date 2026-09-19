@@ -10,7 +10,7 @@ Provides:
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +22,10 @@ from job_applier.automation.queue import (
     record_event,
 )
 from job_applier.db import get_connection, init_db
+
+
+def _takeover_now_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _owner_matches_on_conn(conn: Any, owner: str, now_str: str) -> bool:
@@ -57,7 +61,7 @@ def emergency_stop(
             conn.execute("BEGIN IMMEDIATE;")
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             if expected_owner is not None and not _owner_matches_on_conn(
-                conn, expected_owner, now_str
+                conn, expected_owner, _takeover_now_str()
             ):
                 conn.rollback()
                 return {
@@ -97,7 +101,7 @@ def emergency_stop(
             # also rejects a claimant whose short lease expired during projection.
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             if expected_owner is not None and not _owner_matches_on_conn(
-                conn, expected_owner, now_str
+                conn, expected_owner, _takeover_now_str()
             ):
                 conn.rollback()
                 return {
@@ -158,7 +162,7 @@ def emergency_stop(
             # Validate once more so an expired lease cannot commit a partial stop.
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             if expected_owner is not None and not _owner_matches_on_conn(
-                conn, expected_owner, now_str
+                conn, expected_owner, _takeover_now_str()
             ):
                 conn.rollback()
                 return {
@@ -205,7 +209,7 @@ def clear_emergency_stop(
         try:
             with conn:
                 if expected_owner is not None and not _owner_matches_on_conn(
-                    conn, expected_owner, now_str
+                    conn, expected_owner, _takeover_now_str()
                 ):
                     return {
                         "status": "rejected",
