@@ -72,7 +72,7 @@ _just() {
         local -a dyn_items
         dyn_items=("${(@f)$(python3 -c '
 import json, sys, subprocess
-res = subprocess.run(["just", "--json"], capture_output=True, text=True)
+res = subprocess.run(["just", "--dump", "--dump-format", "json"], capture_output=True, text=True)
 if res.returncode == 0:
     data = json.loads(res.stdout)
     rec_name = "'"$recipe"'"
@@ -88,10 +88,12 @@ if res.returncode == 0:
         param = params[p_idx] if p_idx < len(params) else (params[-1] if params and params[-1].get("kind") in ("star", "plus") else None)
         if param:
             patterns = param.get("pattern") or []
+            if isinstance(patterns, str):
+                patterns = [patterns]
             help_text = param.get("help") or param.get("name") or "choice"
             for p in patterns:
+                p = p.removeprefix("^(?:").removesuffix(")$").strip("^$")
                 for opt in p.split("|"):
-                    opt = opt.strip("^$")
                     if opt:
                         print(f"{opt}:{help_text}")
 ' 2>/dev/null)}")

@@ -85,14 +85,22 @@ def test_justfile_service_management_recipes() -> None:
         assert invalid_run.returncode != 0
         assert "does not match pattern" in (invalid_run.stderr + invalid_run.stdout)
 
-        # Verify usage documentation displays allowed service patterns
+        # Verify recipe metadata displays allowed service patterns (--usage on 1.46+, --show on 1.45)
         usage_run = subprocess.run(
             ["just", "--usage", "services-restart"],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
-            check=True,
+            check=False,
         )
+        if usage_run.returncode != 0:
+            usage_run = subprocess.run(
+                ["just", "--show", "services-restart"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
         assert "web|gateway|runtime|cloudflared|ntfy" in usage_run.stdout
 
 
